@@ -4943,7 +4943,22 @@ L_08985BBC:
       goto L_08985BCC;
     }
 L_08985BCC:
-    rt.unsupported(0x08985BCCu, 0x0000000Du, "special? not lowered yet"); return;
+    // NOT unreachable padding, despite appearances: L_08985A74 calls
+    // recomp_unit_0077 entry 250 (0x08938F04, a free-list pop-or-grow pool
+    // allocator delegating to recomp_unit_0044 entry 196) and falls straight
+    // through into this `break` when that allocation returns NULL/0 -- i.e.
+    // this is the game's own compiler-emitted `if (!ptr) trap();` assertion.
+    // Faking success here (an earlier attempt at that) only turns the crash
+    // into an infinite retry that burns the dispatch cap, because the real
+    // bug is upstream: something is exhausting or mis-sizing that pool.
+    // Surface it distinctly rather than resuming with the previous
+    // catch-all "special?" wording, so it isn't re-confused with a truly
+    // undecoded instruction elsewhere.
+    rt.unsupported(0x08985BCCu, 0x0000000Du,
+                    "pool-allocator assertion tripped (recomp_unit_0077 entry "
+                    "250/0x08938F04 returned NULL) -- see generated_unit_0096.cpp "
+                    "L_08985BCC");
+    return;
 L_08985BE8:
     ctx.gpr[2] = (0u | 0u);
     goto L_08985BEC;

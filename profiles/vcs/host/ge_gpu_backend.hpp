@@ -12,6 +12,11 @@ namespace vcs {
 enum class GeGpuBackendKind : std::uint8_t {
     Software,
     DirectX12,
+    // MoltenVK-backed bring-up path used on macOS (and, prospectively, other
+    // non-Windows targets). Mirrors the DirectX12 kind's role: an optional,
+    // opt-in native path with the bit-exact software rasterizer as the
+    // permanent fallback. See ge_gpu_backend_vulkan.cpp.
+    Vulkan,
 };
 
 struct GeGpuDrawDescriptor {
@@ -283,6 +288,10 @@ struct GeGpuBackendReport {
     std::uint64_t texture_decode_requests{};
     std::uint64_t texture_cache_hits{};
     std::uint64_t decoded_texture_uploads{};
+    // Vulkan backend only: entries reclaimed by LRU eviction once the cache
+    // hit Rendering.TextureCacheEntries, so a long session keeps uploading
+    // new textures instead of every upload past the cap silently failing.
+    std::uint64_t texture_cache_evictions{};
     std::uint64_t decoded_texture_bytes{};
     std::uint64_t decoded_t4_textures{};
     std::uint64_t decoded_t8_textures{};
@@ -299,6 +308,10 @@ struct GeGpuBackendReport {
     bool depth_image_memory_bound{};
     bool depth_image_view_created{};
     bool depth_attachment_active{};
+    // Bits of the depth format actually selected at init (16, 24, or 32).
+    // The Vulkan backend picks the highest the device supports; only
+    // meaningful when depth_attachment_active is true.
+    std::uint32_t depth_bits{};
     std::uint64_t depth_pipeline_variants_created{};
     std::uint64_t depth_tested_game_draw_calls{};
     std::uint64_t depth_writing_game_draw_calls{};
@@ -407,6 +420,31 @@ struct GeGpuBackendReport {
 // rendering remains authoritative during bring-up.
 [[nodiscard]] bool initialize_ge_gpu_backend(std::string &error);
 void shutdown_ge_gpu_backend() noexcept;
+
+// Neither backend's internal state (command buffers/lists, pipeline/texture
+// caches, the single in-flight fence) was ever built for concurrent access --
+// there is no synchronization anywhere inside either .cpp file. That was fine
+// as long as exactly one thread ever called into this interface. It stopped
+// being fine the moment PSPRECOMP_GE_ASYNC handed display-list execution to
+// its own real worker thread while the main thread continues calling
+// ge_gpu_backend_finish_color_frame()/ge_gpu_backend_mark_window_presented()
+// once per vblank on its own: those two call paths now genuinely race on the
+// same backend state. Confirmed directly -- PSPRECOMP_GE_ASYNC=1 combined
+// with the Vulkan backend hung completely (audio submission counters frozen,
+// not just a visual stall) the first time it was tried live.
+//
+// These two calls are the fix: every call site that enters this interface
+// from either the main thread's present path or the GE async worker thread
+// (see ge_async_worker_main() in vcs_profile.cpp) holds this lock for the
+// duration, so the two threads' backend calls are serialized against each
+// other instead of racing. This does not add real parallelism inside the
+// backend itself -- it makes concurrent use of it safe, which is the
+// prerequisite for the worker thread doing anything at all. The actual
+// latency win async is meant to provide is the main thread staying free to
+// do non-backend work (audio submission among it) while the worker holds
+// this lock executing a display list, not true simultaneous Vulkan/DX12 use.
+void ge_gpu_backend_lock() noexcept;
+void ge_gpu_backend_unlock() noexcept;
 
 [[nodiscard]] bool ge_gpu_backend_active() noexcept;
 [[nodiscard]] bool ge_gpu_backend_transfer_ready() noexcept;
@@ -581,6 +619,19 @@ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept;
 // backend presents its own image this surface never reaches the screen, so the
 // composition VCS rasterizes into it is only needed by whatever samples it back.
 [[nodiscard]] std::uint32_t ge_gpu_backend_display_framebuffer() noexcept;
+
+// The GPU-selected target address the *previous* completed frame actually
+// drew as "the frame" (finish_color_frame()'s most-vertices-wins bucket,
+// sticky across frames -- see VulkanGeState::last_winner_address). VCS
+// composites through more than one GE render target per frame (a working
+// buffer the HUD draws into, then a plain quad that copies it into the real
+// display buffer), and the backend picks whichever one actually carries the
+// frame's geometry -- which is routinely NOT the raw sceDisplaySetFrameBuf
+// address (ge_gpu_backend_display_framebuffer() above). Something injecting
+// its own draw for the CURRENT frame (the FPS overlay) needs to target this
+// address, not the raw display one, or its draw lands in a bucket nothing
+// ever selects and is never composited in. 0 when no frame has completed yet.
+[[nodiscard]] std::uint32_t ge_gpu_backend_last_winner_target() noexcept;
 
 // Borrowed view of the last readback, valid until the next finished frame.
 // Presenting through this avoids allocating and copying a desktop-sized RGBA

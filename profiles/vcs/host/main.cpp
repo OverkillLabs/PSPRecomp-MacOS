@@ -14,13 +14,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <limits>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
+#include <string>
+#include <thread>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -175,7 +179,16 @@ int main(int argc, char **argv) {
         validate_vcs_game_root(root);
 
         psprecomp::Elf32Image elf = psprecomp::Elf32Image::from_file(executable);
-        psprecomp::Runtime runtime(32u * 1024u * 1024u);
+        // GTA: Vice City Stories requires the 64MB PSP-2000 ("Slim") memory
+        // configuration -- it does not run on the original 32MB PSP-1000 on
+        // real hardware either. The 32MB figure here was just the base
+        // recompiler's generic default, inherited unchanged by this profile.
+        // Running the guest with only half its expected RAM starves its own
+        // internal heap arena; that is the root cause of the pool/table
+        // allocation failing partway into gameplay and tripping the game's
+        // own null-check assertion (see generated_unit_0096.cpp L_08985BCC
+        // and its trace through generated_unit_0077.cpp / _0174.cpp).
+        psprecomp::Runtime runtime(64u * 1024u * 1024u);
         runtime.set_game_root(root);
         const auto relocations = elf.load_and_relocate(runtime.memory(), psprecomp::kDefaultPspUserLoadBase);
         std::uint64_t image_end = 0u;
@@ -185,7 +198,13 @@ int main(int argc, char **argv) {
             const std::uint64_t start = elf.segment_runtime_address(index, psprecomp::kDefaultPspUserLoadBase);
             image_end = std::max(image_end, start + segment.memory_size);
         }
-        if (image_end == 0u || image_end > 0x0A000000ull)
+        // The ELF's own load image must fit under the configured RAM's top
+        // address, not a hardcoded 32MB-based literal (see the matching fix
+        // in vcs_profile.cpp's install_profile() for why that literal was
+        // wrong once guest RAM is 64MB).
+        const std::uint64_t user_ram_top =
+            static_cast<std::uint64_t>(psprecomp::GuestMemory::kPhysicalBase) + runtime.memory().size();
+        if (image_end == 0u || image_end > user_ram_top)
             throw psprecomp::Error("Invalid PSP ELF load image extent");
         const std::uint32_t user_arena_start =
             static_cast<std::uint32_t>((image_end + 0xFFu) & ~0xFFull);
@@ -254,6 +273,16 @@ int main(int argc, char **argv) {
                       << gpu_start.offscreen_height << " | actual MSAA "
                       << gpu_start.dx12_msaa_samples << "x\n";
         }
+        if (gpu_start.requested == vcs::GeGpuBackendKind::Vulkan) {
+            std::cout << "Vulkan GE target:     "
+                      << (gpu_start.active == vcs::GeGpuBackendKind::Vulkan ? "active" : "inactive")
+                      << " (" << gpu_start.offscreen_width << 'x' << gpu_start.offscreen_height
+                      << " offscreen, devices=" << gpu_start.physical_device_count
+                      << ", depth=" << (gpu_start.depth_attachment_active
+                                            ? ("D" + std::to_string(gpu_start.depth_bits))
+                                            : std::string("none"))
+                      << ")\n";
+        }
         std::cout << "Anisotropic filter:   ";
         if (configuration.rendering.anisotropic_filtering <= 1u)
             std::cout << "off (PSP isotropic sampling)\n";
@@ -298,6 +327,11 @@ int main(int argc, char **argv) {
         vcs::display_window_start();
         vcs::install_display_heartbeat();
         vcs::install_starvation_preemption();
+
+        // Wrapped in a lambda so it can run either inline (existing behavior)
+        // or on a worker thread (Apple; see below) without duplicating the
+        // reporting/shutdown sequence for each case.
+        const auto run_and_report = [&]() -> int {
         runtime.run(elf.runtime_entry(), max_dispatches);
         const bool shutdown_diag = std::getenv("PSPRECOMP_SHUTDOWN_DIAG") != nullptr;
         if (shutdown_diag) std::cerr << "[shutdown] runtime-run-returned\n";
@@ -311,6 +345,28 @@ int main(int argc, char **argv) {
         if (shutdown_diag) std::cerr << "[shutdown] disc-stats-reported\n";
         const vcs::GeGpuBackendReport gpu_final = vcs::ge_gpu_backend_report();
         if (shutdown_diag) std::cerr << "[shutdown] gpu-report-copied\n";
+        if (gpu_final.requested == vcs::GeGpuBackendKind::Vulkan) {
+            // Diagnostic ordering matters here: captured_draws counts what the
+            // renderer offered, game_draw_calls what this backend accepted, and
+            // the rejection counters say why the difference exists.
+            std::cout << "GE Vulkan: frames=" << gpu_final.game_frames
+                      << " draws=" << gpu_final.game_draw_calls
+                      << " triangles=" << gpu_final.game_triangles
+                      << " vertices=" << gpu_final.game_vertices
+                      << " captured=" << gpu_final.captured_draws
+                      << " pipelines=" << gpu_final.unique_pipeline_keys
+                      << " textures=" << gpu_final.unique_texture_keys
+                      << " textured_draws=" << gpu_final.textured_game_draw_calls
+                      << " textured_pending=" << gpu_final.game_textured_draws_without_texture
+                      << " rejected=" << gpu_final.rejected_gpu_draws
+                      << " off_target=" << gpu_final.frames_without_displayed_target
+                      << " tex_uploads=" << gpu_final.decoded_texture_uploads
+                      << " tex_rejected=" << gpu_final.rejected_texture_decodes
+                      << " overflows=" << gpu_final.game_vertex_overflows
+                      << " readback_bytes=" << gpu_final.game_frame_readback_bytes
+                      << "\n";
+            std::cout << "GE Vulkan status: " << gpu_final.message << "\n";
+        }
         if (gpu_final.active == vcs::GeGpuBackendKind::DirectX12) {
             std::cout << "GE DirectX12: frames=" << gpu_final.game_frames
                       << " draws=" << gpu_final.game_draw_calls
@@ -450,6 +506,31 @@ int main(int argc, char **argv) {
         vcs::shutdown_ge_gpu_backend();
         if (shutdown_diag) std::cerr << "[shutdown] after-gpu-shutdown\n";
         return runtime.stop_reason().empty() ? 0 : 4;
+        };  // run_and_report
+
+#if defined(__APPLE__)
+        // Cocoa/SDL2 require the window and its event loop to live on the
+        // process's real main thread (see display_window_pump_events() in
+        // display_window.hpp for the full reasoning), so on Apple the
+        // interpreter and everything above run on a worker thread instead,
+        // and this thread's only job is to keep servicing window events --
+        // including through display_window_shutdown()'s own wait-for-close
+        // -- until that worker has completely finished.
+        int result = 0;
+        std::atomic<bool> worker_done{false};
+        std::thread worker([&]() {
+            result = run_and_report();
+            worker_done.store(true, std::memory_order_release);
+        });
+        while (!worker_done.load(std::memory_order_acquire)) {
+            vcs::display_window_pump_events();
+            std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        }
+        worker.join();
+        return result;
+#else
+        return run_and_report();
+#endif
     } catch (const std::exception &e) {
         std::cerr << "VCSNative error: " << e.what() << "\n";
         return 1;

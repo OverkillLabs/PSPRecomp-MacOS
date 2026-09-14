@@ -50,3 +50,8 @@ SAVEDATA/
 # Python
 __pycache__/
 *.pyc
+.DS_Store
+
+# Built by CMake (profiles/vcs/CMakeLists.txt's vcs_launcher target), not
+# checked in -- a compiled swiftc binary for whatever machine last built it
+profiles/vcs/launcher/VCSLauncher

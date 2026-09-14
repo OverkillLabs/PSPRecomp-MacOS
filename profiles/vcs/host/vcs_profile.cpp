@@ -10,6 +10,7 @@
 #include "ge_renderer.hpp"
 #include "ge_gpu_backend.hpp"
 #include "vcs_project2dfx.hpp"
+#include "vcs_fps_overlay.hpp"
 
 #include "psprecomp/common.hpp"
 #include "psprecomp/deflate.hpp"
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
 #include <cstdio>
 #include <iostream>
 #include <cstdint>
@@ -509,8 +511,10 @@ bool event_diag_stall_reported{};
 struct ThreadTable {
     std::int32_t next_uid{1};
     std::int32_t current_uid{0};
-    // PSP user RAM ends at 0x0A000000.  User thread stacks are allocated
-    // downward from the real partition top with 256-byte granularity.
+    // Overwritten with the real top of configured guest RAM during profile
+    // install (see install_profile()); this 32MB-based literal only matters
+    // before that runs. User thread stacks are allocated downward from the
+    // real partition top with 256-byte granularity.
     std::uint32_t next_stack_top{0x0A000000u};
     std::uint64_t next_ready_sequence{1u};
     std::uint64_t next_delay_sequence{1u};
@@ -776,8 +780,27 @@ bool read_video_frame(MpegContextState &state, std::span<std::uint8_t> frame) {
     return true;
 }
 
+// Same synchronous scan-and-reopen-every-candidate shape as
+// identify_atrac_source() above, and the same fix: memoize by (expected
+// size, header-prefix hash) since the PSP_DATA asset set is static for the
+// whole session, so a resolution never changes once made.
 std::filesystem::path identify_pmf_source(std::span<const std::uint8_t> header, const ParsedPsmfHeader &parsed) {
     const std::uint64_t expected_size = static_cast<std::uint64_t>(parsed.stream_offset) + parsed.stream_size;
+    const std::size_t compare_size = std::min<std::size_t>(header.size(), 2048u);
+    std::uint64_t hash = 1469598103934665603ull;  // FNV-1a
+    for (std::size_t i = 0u; i < compare_size; ++i) {
+        hash ^= header[i];
+        hash *= 1099511628211ull;
+    }
+    const std::uint64_t cache_key = hash ^ (expected_size << 1u);
+
+    static std::unordered_map<std::uint64_t, std::filesystem::path> resolved_source_cache;
+    if (const auto cached = resolved_source_cache.find(cache_key);
+        cached != resolved_source_cache.end()) {
+        return cached->second;
+    }
+
+    std::filesystem::path resolved;
     for (const auto &[key, file] : file_table.virtual_files_by_path) {
         if (file.size != expected_size) continue;
         std::string extension = file.native_path.extension().string();
@@ -789,9 +812,13 @@ std::filesystem::path identify_pmf_source(std::span<const std::uint8_t> header, 
         if (!input) continue;
         input.read(reinterpret_cast<char *>(candidate.data()), static_cast<std::streamsize>(candidate.size()));
         if (input.gcount() == static_cast<std::streamsize>(candidate.size()) &&
-            std::equal(candidate.begin(), candidate.end(), header.begin())) return file.native_path;
+            std::equal(candidate.begin(), candidate.end(), header.begin())) {
+            resolved = file.native_path;
+            break;
+        }
     }
-    return {};
+    resolved_source_cache.emplace(cache_key, resolved);
+    return resolved;
 }
 
 
@@ -864,22 +891,70 @@ bool parse_atrac_header(std::span<const std::uint8_t> bytes, ParsedAtracHeader &
     return true;
 }
 
+// Every call here means a new audio stream is starting -- a vehicle sound
+// loop, an ambient track, a radio station change, a NEWS bulletin -- which
+// happens constantly during normal play, not just once at boot. The scan
+// below opens and reads every AT3/AA3/OMA file of the right size on the main
+// (guest CPU) thread, synchronously, each time; with more than a couple of
+// same-sized candidates this is a real, repeated stutter source, not a rare
+// one. Since the PSP_DATA asset set is static for the whole session, the
+// resolved path for a given (size, header-prefix) pair never changes, so
+// memoize it: only the very first time a given track is started pays for the
+// scan, and it and every subsequent time (which for a looping vehicle sound
+// or a repeated radio station is most of them) is an instant map lookup.
 std::filesystem::path identify_atrac_source(std::span<const std::uint8_t> header, const ParsedAtracHeader &parsed) {
     const std::size_t compare_size = std::min<std::size_t>(header.size(), 256u);
+    std::uint64_t hash = 1469598103934665603ull;  // FNV-1a
+    for (std::size_t i = 0u; i < compare_size; ++i) {
+        hash ^= header[i];
+        hash *= 1099511628211ull;
+    }
+    const std::uint64_t cache_key = hash ^ (static_cast<std::uint64_t>(parsed.file_size) << 32u);
+
+    static std::unordered_map<std::uint64_t, std::filesystem::path> resolved_source_cache;
+    if (const auto cached = resolved_source_cache.find(cache_key);
+        cached != resolved_source_cache.end()) {
+        return cached->second;
+    }
+
+    // Filtering by size and extension alone touches no files. Most tracks in
+    // this asset set have a size that no other AT3/AA3/OMA file shares, so
+    // the common case -- including a track's very first play, which the
+    // cache above can't help with -- resolves right here with zero file
+    // I/O. The open-and-compare step below only has to run at all when two
+    // or more same-sized candidates genuinely need disambiguating.
+    std::vector<const std::filesystem::path *> size_matches;
     for (const auto &[key, file] : file_table.virtual_files_by_path) {
         if (file.size != parsed.file_size) continue;
         std::string extension = file.native_path.extension().string();
         std::transform(extension.begin(), extension.end(), extension.begin(),
                        [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
         if (extension != ".AT3" && extension != ".AA3" && extension != ".OMA") continue;
-        std::vector<std::uint8_t> candidate(compare_size);
-        std::ifstream input(file.native_path, std::ios::binary);
-        if (!input) continue;
-        input.read(reinterpret_cast<char *>(candidate.data()), static_cast<std::streamsize>(candidate.size()));
-        if (input.gcount() == static_cast<std::streamsize>(candidate.size()) &&
-            std::equal(candidate.begin(), candidate.end(), header.begin())) return file.native_path;
+        size_matches.push_back(&file.native_path);
     }
-    return {};
+
+    std::filesystem::path resolved;
+    if (size_matches.size() == 1u) {
+        resolved = *size_matches.front();
+    } else {
+        for (const std::filesystem::path *candidate_path : size_matches) {
+            std::vector<std::uint8_t> candidate(compare_size);
+            std::ifstream input(*candidate_path, std::ios::binary);
+            if (!input) continue;
+            input.read(reinterpret_cast<char *>(candidate.data()), static_cast<std::streamsize>(candidate.size()));
+            if (input.gcount() == static_cast<std::streamsize>(candidate.size()) &&
+                std::equal(candidate.begin(), candidate.end(), header.begin())) {
+                resolved = *candidate_path;
+                break;
+            }
+        }
+    }
+    // Cache the miss too (an empty path): a track that doesn't resolve now
+    // won't resolve later either, since the asset set doesn't change mid
+    // session, and a miss is exactly the case that pays for the full scan
+    // with nothing to show for it otherwise.
+    resolved_source_cache.emplace(cache_key, resolved);
+    return resolved;
 }
 
 // sceAtracDecodeData always hands the caller two interleaved channels: the PSP
@@ -2489,6 +2564,76 @@ std::uint64_t audio_queue_buffer(AudioChannelState &channel, std::uint32_t frame
     return start;
 }
 
+// The guest submits one fixed-size audio buffer and then blocks for exactly
+// its own real-time duration, which leaves nothing queued on the host mixer
+// by the moment it is actually needed -- confirmed with real diagnostics
+// (host/audio_output.cpp's per-channel underrun counter climbing steadily
+// through a cutscene, most on the continuous music/dialogue channel). Any
+// transient scheduling hitch on this thread -- contention with the GE render
+// thread, a heavier cutscene frame -- then shows up as real, audible silence,
+// because there is no lookahead buffer to absorb it.
+//
+// audio_queue_buffer above tracks each buffer's true scheduled playback
+// position from an accumulated frame count, independent of how long this
+// thread actually blocks for, so shortening the real wait here is safe: it
+// only lets the guest decode and submit further ahead of real time, which
+// the host mixer can now hold safely (it is a plain per-channel FIFO with no
+// "too far ahead" failure mode, just a generous 1 s cap). Subtracting a fixed
+// target from the wait -- rather than a fixed fraction, or removing the wait
+// outright -- keeps the achievable lead bounded and self-regulating: the
+// guest is free to race ahead only until it is kAudioLookaheadTargetUs ahead
+// of schedule, at which point the wait stops shrinking and it settles back
+// into blocking the full remaining duration each call, holding that lead
+// rather than growing it further.
+//
+// This was raised to 500 ms at one point chasing a machine-precise, 2048-
+// frames-silent-every-3072-frames dropout that turned out to have nothing to
+// do with audio at all: the CPU software rasterizer was redundantly
+// re-drawing every frame's full-screen targets even with the Vulkan GPU
+// backend active (see software_raster_skipped() in ge_renderer.cpp), costing
+// ~10 ms of every ~19 ms cutscene frame and capping the whole game -- guest
+// logic and audio decode included -- around 50 fps instead of 60. Once that
+// real bottleneck was fixed, a large audio lookahead was pure downside with
+// nothing left to buy: this channel runs single-file into a FIFO with no
+// resync to picture, so racing ahead of "now" plays dialogue audibly before
+// the mouth animation that goes with it -- confirmed directly ("their mouths
+// are moving when they're not speaking"). Even 60 ms was still reported as
+// perceptible drift. A live instrumented session with per-channel push/pull
+// accounting (audio_output.cpp's ChannelQueue::pushed_frames/pulled_frames)
+// confirmed the underlying fix actually holds: over 108 continuous seconds
+// spanning the exact moment a stutter was reported live, the dialogue
+// channel's underrun counter never moved past its first few seconds, and its
+// push/pull balance stayed at exactly 0 throughout -- the cushion has not
+// been the thing standing between this channel and an underrun since the
+// rasterizer fix landed. What is left is ordinary submission jitter of a few
+// milliseconds, not the multi-hundred-millisecond throughput deficit this
+// constant used to cover for.
+//
+// Zeroing this out entirely was wrong. It was based on a live capture that
+// showed the Output2/SRC channel's underrun counter never moving -- but a
+// fresh capture through an actually-reproduced stutter, taken directly
+// against this exact channel (channel 8, the one dialogue rides), tells the
+// opposite story: underrun=52620 frames (~1.19 s of dead air) and
+// trimmed=26508, both climbing steadily across the cutscene rather than
+// stopping after the first few seconds. Zero lookahead means this channel's
+// decode-and-submit call has no lead at all to spend when a frame's CPU cost
+// spikes (cutscene rendering gets heavier as a scene goes on), so any stall
+// comes straight out of the speaker as a gap -- which is exactly the
+// "starts fine, gets progressively worse" shape that was reported.
+//
+// The lip-sync/backlog concern that motivated zeroing it is still real, but
+// it no longer requires zero lookahead to avoid: the host FIFO
+// (audio_output.cpp) now hard-caps queued backlog at kMaxQueuedFrames
+// (200 ms) regardless of how much lead this constant manufactures, so a
+// modest lookahead here cannot balloon into the old unbounded-backlog/mouths-
+// move-before-audio problem the way it could before that cap existed. Kept
+// small and well under that cap so it only ever absorbs ordinary per-frame
+// jitter, not systemic drift.
+constexpr std::uint64_t kAudioLookaheadTargetUs = 30'000u;
+std::uint64_t audio_blocking_wait_us(std::uint64_t scheduled_wait_us) {
+    return scheduled_wait_us > kAudioLookaheadTargetUs ? scheduled_wait_us - kAudioLookaheadTargetUs : 0u;
+}
+
 void set_success(psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, 0u); }
 
 class O32VarArgs {
@@ -4003,13 +4148,30 @@ bool gpu_color_preview_enabled() noexcept {
 }
 
 void dump_gpu_internal_frame_if_requested(std::uint64_t vblank) {
-    static bool dumped = false;
+    // Two independent triggers: PSPRECOMP_GE_GPU_DUMP_VBLANK fires once at a
+    // guessed vblank count (a coin flip on whether that lands on whatever
+    // you actually wanted to see), and F9 fires on demand, re-armable every
+    // press, for capturing the exact moment something looks wrong on
+    // screen instead of guessing.
+    static bool dumped_via_vblank = false;
     const std::uint64_t requested = gpu_dump_vblank();
-    if (dumped || requested == 0u || vblank < requested) return;
+    const bool vblank_trigger = !dumped_via_vblank && requested != 0u && vblank >= requested;
+    const bool key_trigger = display_window_debug_dump_requested();
+    if (!vblank_trigger && !key_trigger) return;
+    if (vblank_trigger) dumped_via_vblank = true;
     const GeGpuBackendReport report = ge_gpu_backend_report();
     if (report.game_frame_vblank == 0u || report.offscreen_width == 0u ||
         report.offscreen_height == 0u || report.game_frame_readback_bytes == 0u) return;
-    std::vector<std::byte> rgba(report.game_frame_readback_bytes);
+    // game_frame_readback_bytes accumulates across every frame rendered this
+    // session (see ge_gpu_backend_vulkan.cpp's finish_color_frame(): it uses
+    // += ), so it is not this frame's size -- that was one real frame's
+    // worth of pixels followed by however much zero-initialized padding this
+    // session had accumulated by the requested vblank, silently bloating the
+    // dump to hundreds of MB/GB. The real per-frame size is always exactly
+    // width * height * 4 (RGBA8).
+    const std::uint64_t frame_bytes =
+        static_cast<std::uint64_t>(report.offscreen_width) * report.offscreen_height * 4u;
+    std::vector<std::byte> rgba(frame_bytes);
     if (!ge_gpu_backend_copy_game_frame_rgba(rgba)) return;
     std::filesystem::path output_path;
     if (const char *path = std::getenv("PSPRECOMP_GE_GPU_DUMP_PATH");
@@ -4034,7 +4196,6 @@ void dump_gpu_internal_frame_if_requested(std::uint64_t vblank) {
         output.write(rgb, sizeof(rgb));
     }
     if (output.good()) {
-        dumped = true;
         std::cerr << "[gpu-internal-frame] vblank=" << report.game_frame_vblank
                   << " resolution=" << report.offscreen_width << 'x' << report.offscreen_height
                   << " changed_pixels=" << report.game_frame_changed_pixels
@@ -4189,6 +4350,28 @@ void write_diag_line(const std::ostringstream &line) {
 //
 // PSPRECOMP_FRAME_LIMIT=0 disables it, which is what performance measurement
 // needs -- with the limiter on, frame_us just reads back the target period.
+//
+// A guest-time/audio-clock leash was tried here once (nudging virtual_time_us
+// directly to track audio_output_frames_played()). It made things measurably
+// worse: virtual_time_us is this function's own input, so jumping it was
+// immediately read back as "we're now ahead/behind schedule" against a
+// wall_anchor that had no idea a correction had just happened, and the two
+// fought each other -- a live test confirmed worse framerate and audio
+// stuttering from the very start. That version was reverted.
+//
+// The version below corrects wall_anchor instead of virtual_time_us. Only
+// this function ever reads wall_anchor, so the correction and the pacing
+// decision are the same piece of state -- there is nothing left outside this
+// function to read the adjustment as a surprise gap. Once a second it
+// compares real elapsed wall-clock time since the last audio-anchor point
+// against how much the physical audio device has actually played
+// (audio_output_frames_played(), a second, independent hardware clock), and
+// nudges wall_anchor by a small fraction of that drift so the vblank clock
+// this function paces drifts back toward the clock the speaker is actually
+// bound to, instead of drifting apart from it unchecked for the length of a
+// scene. The correction is heavily damped (12.5% of measured drift per
+// second) and clamped (max 6ms/s) specifically so it cannot outrun normal
+// sleep/catch-up pacing and cannot itself become a source of stutter.
 void limit_frame_rate() {
     static const bool enabled = [] {
         const char *text = std::getenv("PSPRECOMP_FRAME_LIMIT");
@@ -4204,6 +4387,50 @@ void limit_frame_rate() {
         wall_anchor = std::chrono::steady_clock::now();
         guest_anchor = virtual_time_us;
         return;
+    }
+
+    // Audio-clock drift correction (see the comment above). Runs once a
+    // second so each nudge is measured against a large enough window that
+    // normal scheduling jitter can't be mistaken for real drift.
+    {
+        static std::chrono::steady_clock::time_point audio_check_anchor{};
+        static std::uint64_t audio_frames_anchor = 0u;
+        static bool audio_anchored = false;
+        const auto now_for_audio = std::chrono::steady_clock::now();
+        const std::uint64_t frames_played = vcs::audio_output_frames_played();
+        if (!audio_anchored) {
+            // A silent/inactive audio device reports 0 forever; don't anchor
+            // until it has actually started playing, or the first real frame
+            // reads as a huge false "behind" drift.
+            if (frames_played > 0u) {
+                audio_anchored = true;
+                audio_check_anchor = now_for_audio;
+                audio_frames_anchor = frames_played;
+            }
+        } else {
+            const auto elapsed_wall = std::chrono::duration_cast<std::chrono::microseconds>(
+                now_for_audio - audio_check_anchor).count();
+            if (elapsed_wall >= 1'000'000) {
+                const std::uint64_t frames_delta = frames_played >= audio_frames_anchor
+                    ? frames_played - audio_frames_anchor : 0u;
+                const std::int64_t audio_elapsed_us =
+                    static_cast<std::int64_t>(frames_delta) * 1'000'000 / 44100;
+                // Positive drift: wall clock has moved further than the
+                // audio device has actually played -- the device is behind,
+                // so slow the vblank clock down slightly (push wall_anchor
+                // later) to let it catch up. Negative: the device is ahead;
+                // speed the vblank clock up slightly (pull wall_anchor
+                // earlier).
+                const std::int64_t drift_us = elapsed_wall - audio_elapsed_us;
+                constexpr std::int64_t kMaxCorrectionUs = 6'000;
+                std::int64_t correction_us = drift_us / 8; // 12.5% of measured drift
+                if (correction_us > kMaxCorrectionUs) correction_us = kMaxCorrectionUs;
+                if (correction_us < -kMaxCorrectionUs) correction_us = -kMaxCorrectionUs;
+                wall_anchor += std::chrono::microseconds(correction_us);
+                audio_check_anchor = now_for_audio;
+                audio_frames_anchor = frames_played;
+            }
+        }
     }
 
     const auto target = wall_anchor + std::chrono::microseconds(virtual_time_us - guest_anchor);
@@ -4229,8 +4456,30 @@ void limit_frame_rate() {
         const auto behind = std::chrono::duration_cast<std::chrono::microseconds>(
             now - target).count();
         if (behind > 0) {
-            const std::uint64_t cap = virtual_vblank_period_us() * 4u;
-            virtual_time_us += std::min(static_cast<std::uint64_t>(behind), cap);
+            const std::uint64_t vblank_period = virtual_vblank_period_us();
+            const std::uint64_t cap = vblank_period * 4u;
+            const std::uint64_t jump = std::min(static_cast<std::uint64_t>(behind), cap);
+            virtual_time_us += jump;
+            // Shift active audio channels' schedule anchors forward by a
+            // stall's catch-up jump so a hitch doesn't leave the guest's
+            // "now" (and whatever dialogue/lip-sync it drives) stepped ahead
+            // of audio that is still correctly mid-playback of an earlier
+            // moment -- confirmed directly: a 36ms GE stall measured right at
+            // a reported desync, with audio otherwise proven gapless.
+            //
+            // Gated to jumps of at least a full vblank period. A first,
+            // ungated version touched the anchor on every nonzero "behind",
+            // which at a 120 Hz target is nearly every frame from ordinary
+            // sub-frame present/GE variance, not just real stalls -- that
+            // compounded far faster than intended and was a confirmed,
+            // immediate regression (stuttering from the very start). A real
+            // hitch worth correcting for is a multi-frame stall, not a few
+            // hundred microseconds of routine jitter.
+            if (jump >= vblank_period) {
+                for (auto &channel : audio_channels) {
+                    if (channel.queue_active) channel.queue_anchor_us += jump;
+                }
+            }
         }
         wall_anchor = now;
         guest_anchor = virtual_time_us;
@@ -4719,7 +4968,13 @@ void ge_async_worker_main() {
         }
 
         std::vector<GuestCallbackInvocation> callbacks;
+        // Serialize against the main thread's own backend calls (present,
+        // once per vblank -- see the lock around that call site). See
+        // ge_gpu_backend_lock()'s comment in ge_gpu_backend.hpp for why this
+        // is required, not optional, once this worker thread exists.
+        ge_gpu_backend_lock();
         const bool ok = execute_ge_list(*runtime, local, callbacks, task.stall.get());
+        ge_gpu_backend_unlock();
 
         {
             std::lock_guard lock(ge_async.mutex);
@@ -5281,7 +5536,19 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     // Keep the loader/module stack at the top of user RAM.  The game arena grows
     // upward from the aligned end of the ELF, and subsequent thread stacks grow
     // downward below this reserved loader stack.
-    module_thread.stack_top = 0x0A000000u;
+    //
+    // This used to be the hardcoded literal 0x0A000000 -- correct only for
+    // exactly 32MB of guest RAM (0x08000000 physical base + 0x02000000).
+    // Vice City Stories requires the 64MB PSP-2000 "Slim" memory
+    // configuration and does not run on a 32MB PSP at all on real hardware;
+    // with the literal left in place, bumping Runtime's guest RAM to 64MB
+    // left this boundary (and therefore sceKernelMaxFreeMemSize's reported
+    // free space, and every partition/stack allocation above it) still
+    // pinned to the old 32MB ceiling, so the extra RAM was invisible to the
+    // game. Deriving it from the actual configured size fixes that for any
+    // RAM size, not just 64MB.
+    module_thread.stack_top =
+        psprecomp::GuestMemory::kPhysicalBase + runtime.memory().size();
     module_thread.stack_bottom = module_thread.stack_top - module_thread.stack_size;
     module_thread.kernel_context = module_thread.stack_top - 0x100u;
     thread_table.next_stack_top = module_thread.stack_bottom;
@@ -7043,7 +7310,34 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         };
         capture_frame_if_requested(rt.memory(), displayed);
         dump_ram_if_requested(rt.memory());
+        // Serializes against the GE async worker thread's own backend calls
+        // (see the lock around execute_ge_list() in ge_async_worker_main()
+        // and ge_gpu_backend_lock()'s comment in ge_gpu_backend.hpp). This
+        // present sequence and that worker both call into backend state --
+        // a single in-flight command buffer/fence and unsynchronized
+        // pipeline/texture caches -- with nothing else protecting it.
+        ge_gpu_backend_lock();
         ge_gpu_backend_set_display_framebuffer(display_state.frame_buffer);
+        // Display.ShowFPS: fps_overlay_render_frame()/fps_overlay_observe_draw()
+        // (ge_renderer.cpp's two accumulate_color_triangles call sites) were
+        // both fully implemented already but never wired to anything -- the
+        // option did nothing at all, in either the launcher or the raw .ini,
+        // no matter what was selected. Must run after this frame's draws are
+        // accumulated (so fps_overlay_observe_draw() has already seen the
+        // displayed target) and before finish_color_frame() below (so the
+        // overlay's own draw is still part of this frame's submission).
+        //
+        // Targets the previous frame's GPU-selected winning bucket
+        // (ge_gpu_backend_last_winner_target()), not display_state.frame_
+        // buffer (the raw sceDisplaySetFrameBuf address): VCS composites HUD
+        // gameplay frames through more than one GE render target, and the
+        // backend's own bucket selection routinely picks a different one as
+        // "the frame" than the raw display address. Passing the raw address
+        // put the overlay's draw in a bucket nothing ever selects, so it
+        // rendered on simple single-buffer screens (loading screens) and
+        // silently vanished the moment real gameplay's multi-pass
+        // compositing started -- confirmed live, exactly that split.
+        fps_overlay_render_frame(ge_gpu_backend_last_winner_target());
         project2dfx_render_frame(
             rt.memory(), ctx.gpr[28], display_vblank_index, display_state.frame_buffer);
         // A movie frame is a finished 480x272 picture with no more image at the
@@ -7055,6 +7349,11 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         const auto present_entry = frame_time_diag_enabled()
             ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const bool gpu_frame_ready = ge_gpu_backend_finish_color_frame(display_vblank_index);
+        // Counts toward Display.ShowFPS's measured rate only when this vblank
+        // actually produced a new frame -- see fps_overlay_note_presented_
+        // frame()'s comment for why counting every vblank tick instead read
+        // well above the real, vsync-locked on-screen rate.
+        if (gpu_frame_ready) fps_overlay_note_presented_frame();
         // VCS only fills the displayed framebuffer on every other vblank, so the
         // GPU path produces a frame at half the vblank rate. Presenting the
         // software framebuffer in between alternated two differently scaled
@@ -7086,6 +7385,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 presented_gpu_frame = true;
             }
         }
+        ge_gpu_backend_unlock();
         if (!presented_gpu_frame) {
             holding_gpu_frame = false;
             // The window is showing the guest framebuffer that the software GE
@@ -7356,7 +7656,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                       << " blocking=" << blocking << " start_us=" << start_us
                       << " wait_us=" << wait_us << "\n";
         if (blocking) {
-            (void)delay_current_thread(rt, ctx, static_cast<std::uint32_t>(wait_us),
+            (void)delay_current_thread(rt, ctx, static_cast<std::uint32_t>(audio_blocking_wait_us(wait_us)),
                                        state.sample_count);
         } else {
             ctx.set_gpr(2, state.sample_count);
@@ -7474,7 +7774,41 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                           << " channels=" << state.channel_count
                           << " freq=" << state.frequency
                           << " start_us=" << start_us << " wait_us=" << wait_us << "\n";
-            (void)delay_current_thread(rt, ctx, static_cast<std::uint32_t>(wait_us),
+            // Real-time submission-cadence probe, independent of
+            // virtual_time_us/limit_frame_rate entirely: tracks actual
+            // std::chrono wall-clock elapsed time since this channel's first
+            // call against how many samples worth of real-time (at the
+            // stream's own rate) have been submitted since. If this channel
+            // is simply not being fed fast enough in real life -- a decode or
+            // scheduling bottleneck upstream of all the guest-clock pacing
+            // logic -- this is the one measurement that would show it
+            // directly, with nothing else able to hide or explain it away.
+            if (std::getenv("PSPRECOMP_SRC_REALTIME_DIAG") != nullptr) {
+                static std::chrono::steady_clock::time_point first_call{};
+                static bool anchored = false;
+                static std::uint64_t submitted_samples = 0u;
+                const auto now = std::chrono::steady_clock::now();
+                // audio_queue_buffer just rebuilt the queue from empty (a
+                // genuine stream restart, e.g. this cutscene's dialogue
+                // beginning) -- re-anchor so a prior stream's bias doesn't
+                // leak into this measurement.
+                if (state.queued_frames <= state.sample_count) anchored = false;
+                if (!anchored) {
+                    anchored = true;
+                    first_call = now;
+                    submitted_samples = 0u;
+                }
+                submitted_samples += state.sample_count;
+                const auto real_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    now - first_call).count();
+                const std::int64_t submitted_us =
+                    static_cast<std::int64_t>(submitted_samples) * 1000000 / state.frequency;
+                const std::int64_t behind_realtime_us = real_elapsed_us - submitted_us;
+                std::cerr << "[src-realtime] real_elapsed_us=" << real_elapsed_us
+                          << " submitted_us=" << submitted_us
+                          << " behind_realtime_us=" << behind_realtime_us << "\n";
+            }
+            (void)delay_current_thread(rt, ctx, static_cast<std::uint32_t>(audio_blocking_wait_us(wait_us)),
                                        state.sample_count);
         };
     runtime.register_hle("sceAudio", 0x2D53F36Eu, audio_src_output);
@@ -9064,8 +9398,16 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             // game list shows the modification time, so leaving these zero put
             // every save in the year zero.
             const auto written = std::filesystem::last_write_time(native, error);
-            const auto system_time = std::chrono::clock_cast<std::chrono::system_clock>(written);
-            const std::time_t seconds = std::chrono::system_clock::to_time_t(system_time);
+            // Turn that into seconds since the Unix epoch.  The original code used
+            // std::chrono::clock_cast (a C++26 feature AppleClang does not provide
+            // in C++20 mode), and this newer libc++ has also dropped the C++17-era
+            // std::filesystem::clock_cast, so instead use the one part of time_point
+            // that every standard library provides: time_since_epoch().  On this
+            // platform both the filesystem clock and system_clock are anchored at
+            // the Unix epoch, so that duration is exactly the seconds count that
+            // std::chrono::system_clock::to_time_t() would have returned.
+            const std::time_t seconds = static_cast<std::time_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(written.time_since_epoch()).count());
             std::tm parts{};
 #if defined(_WIN32)
             localtime_s(&parts, &seconds);

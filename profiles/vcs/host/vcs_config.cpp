@@ -22,6 +22,14 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+// CGDisplayPixelsWide/High are plain C, no Objective-C++ needed. This is the
+// real monitor query the "Headless/non-Windows builds cannot query a monitor
+// here" comment below used to claim didn't exist -- it does, and not having
+// it meant InternalResolutionMode::Desktop silently fell back to whatever
+// InternalWidth/InternalHeight happened to be in the .ini (1920x1080 in the
+// shipped default) on every Mac, regardless of the machine's actual display.
+#include <CoreGraphics/CoreGraphics.h>
 #endif
 
 namespace vcs {
@@ -581,6 +589,32 @@ DisplaySurfaceDimensions resolve_display_surface_dimensions(
 #if defined(_WIN32)
         return {static_cast<std::uint32_t>(std::max(320, GetSystemMetrics(SM_CXSCREEN))),
                 static_cast<std::uint32_t>(std::max(180, GetSystemMetrics(SM_CYSCREEN)))};
+#elif defined(__APPLE__)
+        {
+            // Same bug, same fix, as resolve_internal_resolution()'s Desktop
+            // case above: this used to silently fall back to Display.Width/
+            // Height (1920x1080 in the shipped .ini) on every Mac regardless
+            // of the real display. This is what widescreen_stretch_factor()
+            // computes the HUD shrink amount from, so an aspect ratio this
+            // wrong under-corrected the interface enough to leave the radar
+            // and weapon HUD (near the far corners, where the error compounds
+            // most) still cut off even after resolve_internal_resolution()
+            // was fixed -- confirmed directly, this is a second, separate
+            // function with the identical unfixed bug, not a leftover from
+            // the same one.
+            const CGDirectDisplayID display = CGMainDisplayID();
+            std::uint32_t display_width = 0u;
+            std::uint32_t display_height = 0u;
+            if (CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display)) {
+                display_width = static_cast<std::uint32_t>(CGDisplayModeGetPixelWidth(mode));
+                display_height = static_cast<std::uint32_t>(CGDisplayModeGetPixelHeight(mode));
+                CGDisplayModeRelease(mode);
+            }
+            if (display_width >= 320u && display_height >= 180u)
+                return {display_width, display_height};
+            return {std::clamp(configuration.custom_width, 320u, 16384u),
+                    std::clamp(configuration.custom_height, 180u, 16384u)};
+        }
 #else
         return {std::clamp(configuration.custom_width, 320u, 16384u),
                 std::clamp(configuration.custom_height, 180u, 16384u)};
@@ -657,9 +691,36 @@ InternalResolutionDimensions resolve_internal_resolution(
         // which is not what "desktop resolution" is asked for.
         return {static_cast<std::uint32_t>(std::max(480, GetSystemMetrics(SM_CXSCREEN))),
                 static_cast<std::uint32_t>(std::max(272, GetSystemMetrics(SM_CYSCREEN)))};
+#elif defined(__APPLE__)
+        {
+            // CGDisplayPixelsWide/High report the *logical* (HiDPI-scaled)
+            // point size on a Retina display -- e.g. 1440x900 for a panel
+            // whose actual backing store is 2880x1800 -- not the real pixel
+            // count a render target needs to look sharp. CGDisplayModeGetPixelWidth/
+            // Height (from the display's current CGDisplayMode) reports the
+            // true backing-store pixel count regardless of HiDPI scaling,
+            // confirmed directly against this exact machine (2560x1600
+            // native panel, scaled desktop). Falls back to the .ini's Custom
+            // values only if no display/mode is available at all (e.g. a
+            // headless CI runner), matching the Windows branch's own
+            // "clamp to something sane" behavior on failure.
+            const CGDirectDisplayID display = CGMainDisplayID();
+            std::uint32_t display_width = 0u;
+            std::uint32_t display_height = 0u;
+            if (CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display)) {
+                display_width = static_cast<std::uint32_t>(CGDisplayModeGetPixelWidth(mode));
+                display_height = static_cast<std::uint32_t>(CGDisplayModeGetPixelHeight(mode));
+                CGDisplayModeRelease(mode);
+            }
+            if (display_width >= 480u && display_height >= 272u)
+                return {display_width, display_height};
+            return {std::clamp(configuration.internal_width, 480u, 16384u),
+                    std::clamp(configuration.internal_height, 272u, 16384u)};
+        }
 #else
-        // Headless/non-Windows builds cannot query a monitor here. Custom
-        // values provide a deterministic fallback for CI and proof tooling.
+        // Headless/non-Windows, non-Apple builds cannot query a monitor here.
+        // Custom values provide a deterministic fallback for CI and proof
+        // tooling.
         return {std::clamp(configuration.internal_width, 480u, 16384u),
                 std::clamp(configuration.internal_height, 272u, 16384u)};
 #endif
@@ -871,7 +932,40 @@ float widescreen_stretch_factor(const VcsConfiguration &configuration,
     // A ratio far from the game's own is a configuration mistake, not a wish.
     // Clamping keeps a typo in ForceAspectRatio from collapsing the interface
     // into a sliver or pushing it entirely off screen.
-    return std::clamp(factor, 0.5f, 4.0f);
+    //
+    // The floor used to be 0.5, which is backwards for any surface narrower
+    // than kGameNativeAspectRatio (16:9) -- factor comes out below 1.0 there,
+    // and the caller's correction is vertex.x = center + (vertex.x - center)
+    // / shrink, so a shrink below 1.0 divides by a fraction and EXPANDS the
+    // HUD outward instead of pulling it in. Confirmed directly on a 1.6:1
+    // MacBook display (narrower than 16:9): the money counter and radar got
+    // MORE cut off, not less, once resolve_display_surface_dimensions()
+    // started reporting the real (narrower) aspect instead of a fake 16:9-
+    // ish default that happened to keep factor above 1.0 by accident. A
+    // surface at or narrower than 16:9 needs no *extra* outward correction --
+    // 16:9 is the baseline the HUD is already sized for -- but the floor
+    // below is not 1.0 (a true no-op): even a plain 16:9, 1:1-scale render
+    // (PSP-native 480x272, no widescreen stretch involved at all) still
+    // shows the interface running past the true right/bottom edge with no
+    // correction whatsoever. VCS composites its HUD into a GE framebuffer
+    // allocated at the PSP's routine 512-wide VRAM stride (480 visible + 32
+    // padding columns -- confirmed live from the GE draw state itself, not
+    // inferred) rather than exactly 480 wide, and nothing upstream of this
+    // crops that padding away before it reaches the screen. 512/480 is that
+    // same, real ratio -- not a tuned fudge factor -- pulling every
+    // interface element in by exactly the fraction of the buffer that was
+    // never meant to be visible. Below this floor is the DX12-matching
+    // wider-than-16:9 case computed above; this is the floor under it.
+    // 512/480 (1.0667) was the VRAM-stride-derived first estimate; live
+    // measurement against the reference layout showed it was not enough --
+    // the widest interface element (the money-counter frame, vertices
+    // reaching x=520 in native space) needs (520-240)/240 =~ 1.167 to land
+    // back at the true edge, not 1.0667. The frame's own 520 is itself
+    // already past the 512 stride, so 512 was never the whole story; 1.2
+    // covers that element (and the minimap, symmetric at the opposite
+    // corner) with a little room rather than landing exactly on the edge.
+    constexpr float kHudSafeAreaFloor = 1.15f;
+    return std::clamp(factor, kHudSafeAreaFloor, 4.0f);
 }
 
 } // namespace vcs

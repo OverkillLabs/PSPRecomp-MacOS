@@ -67,6 +67,16 @@ DecodedInstruction decode_allegrex(std::uint32_t word) {
         case 0x0A: d.kind = OpcodeKind::Movz; d.mnemonic = "movz"; break;
         case 0x0B: d.kind = OpcodeKind::Movn; d.mnemonic = "movn"; break;
         case 0x0C: d.kind = OpcodeKind::Syscall; d.mnemonic = "syscall"; break;
+        // `break` (funct 0x0D) is retained by compilers for things like a
+        // failed assertion or an unreachable-default trap; the PSP kernel's
+        // exception handler for it is not implemented here, and this was
+        // previously undecoded entirely (falling into the `default:` case
+        // below as "special?", which halted the runtime unconditionally on
+        // the first hit -- including deterministically during ordinary
+        // gameplay, unrelated to any GE/rendering backend). Decoding it
+        // explicitly lets codegen choose how to handle it instead of always
+        // stopping cold.
+        case 0x0D: d.kind = OpcodeKind::Break; d.mnemonic = "break"; break;
         case 0x0F: d.kind = OpcodeKind::Sync; d.mnemonic = "sync"; break;
         case 0x10: d.kind = OpcodeKind::Mfhi; d.mnemonic = "mfhi"; break;
         case 0x11: d.kind = OpcodeKind::Mthi; d.mnemonic = "mthi"; break;

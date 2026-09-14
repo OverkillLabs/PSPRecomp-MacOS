@@ -89,6 +89,14 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
     std::ostringstream out;
     switch (d.kind) {
     case psprecomp::OpcodeKind::Nop: out << "    // nop\n"; break;
+    case psprecomp::OpcodeKind::Break:
+        // No kernel exception handler exists for a breakpoint trap here.
+        // Treating it as a no-op keeps a compiler-inserted assertion/trap
+        // from halting the whole runtime; if it turns out to gate real
+        // control flow, that will show up as visibly wrong behavior right
+        // after this point, which is more diagnosable than a hard stop.
+        out << "    // break (unhandled trap; treated as a no-op)\n";
+        break;
     case psprecomp::OpcodeKind::Sync:
     case psprecomp::OpcodeKind::Cache:
         out << psprecomp::codegen::memory_ordering_statement(d.kind);

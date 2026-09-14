@@ -1,0 +1,6 @@
+# profiles/*/generated is machine-emitted AOT recompiler output (one .cpp
+# per translated PSP function unit, produced by psp_recomp/vcs_recomp, never
+# hand-written) -- marking it linguist-generated keeps GitHub's language
+# stats and diffs reflecting the actual hand-written code (C++, Swift, GLSL,
+# Python tooling, ...) instead of being drowned out by ~230 generated units.
+profiles/*/generated/*.cpp linguist-generated=true

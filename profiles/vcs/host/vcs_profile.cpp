@@ -509,8 +509,10 @@ bool event_diag_stall_reported{};
 struct ThreadTable {
     std::int32_t next_uid{1};
     std::int32_t current_uid{0};
-    // PSP user RAM ends at 0x0A000000.  User thread stacks are allocated
-    // downward from the real partition top with 256-byte granularity.
+    // Overwritten with the real top of configured guest RAM during profile
+    // install (see install_profile()); this 32MB-based literal only matters
+    // before that runs. User thread stacks are allocated downward from the
+    // real partition top with 256-byte granularity.
     std::uint32_t next_stack_top{0x0A000000u};
     std::uint64_t next_ready_sequence{1u};
     std::uint64_t next_delay_sequence{1u};
@@ -5287,7 +5289,19 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     // Keep the loader/module stack at the top of user RAM.  The game arena grows
     // upward from the aligned end of the ELF, and subsequent thread stacks grow
     // downward below this reserved loader stack.
-    module_thread.stack_top = 0x0A000000u;
+    //
+    // This used to be the hardcoded literal 0x0A000000 -- correct only for
+    // exactly 32MB of guest RAM (0x08000000 physical base + 0x02000000).
+    // Vice City Stories requires the 64MB PSP-2000 "Slim" memory
+    // configuration and does not run on a 32MB PSP at all on real hardware;
+    // with the literal left in place, bumping Runtime's guest RAM to 64MB
+    // left this boundary (and therefore sceKernelMaxFreeMemSize's reported
+    // free space, and every partition/stack allocation above it) still
+    // pinned to the old 32MB ceiling, so the extra RAM was invisible to the
+    // game. Deriving it from the actual configured size fixes that for any
+    // RAM size, not just 64MB.
+    module_thread.stack_top =
+        psprecomp::GuestMemory::kPhysicalBase + runtime.memory().size();
     module_thread.stack_bottom = module_thread.stack_top - module_thread.stack_size;
     module_thread.kernel_context = module_thread.stack_top - 0x100u;
     thread_table.next_stack_top = module_thread.stack_bottom;

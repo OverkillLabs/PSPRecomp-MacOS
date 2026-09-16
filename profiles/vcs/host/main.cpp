@@ -175,7 +175,15 @@ int main(int argc, char **argv) {
         validate_vcs_game_root(root);
 
         psprecomp::Elf32Image elf = psprecomp::Elf32Image::from_file(executable);
-        psprecomp::Runtime runtime(32u * 1024u * 1024u);
+        // GTA: Vice City Stories requires the 64MB PSP-2000 ("Slim") memory
+        // configuration -- it does not run on the original 32MB PSP-1000 on
+        // real hardware either. The 32MB figure here was just the base
+        // recompiler's generic default, inherited unchanged by this profile.
+        // Running the guest with only half its expected RAM starves its own
+        // internal heap arena, which is the root cause of pool/table
+        // allocation failing partway into gameplay and tripping the game's
+        // own null-check assertion.
+        psprecomp::Runtime runtime(64u * 1024u * 1024u);
         runtime.set_game_root(root);
         const auto relocations = elf.load_and_relocate(runtime.memory(), psprecomp::kDefaultPspUserLoadBase);
         std::uint64_t image_end = 0u;
@@ -185,7 +193,13 @@ int main(int argc, char **argv) {
             const std::uint64_t start = elf.segment_runtime_address(index, psprecomp::kDefaultPspUserLoadBase);
             image_end = std::max(image_end, start + segment.memory_size);
         }
-        if (image_end == 0u || image_end > 0x0A000000ull)
+        // The ELF's own load image must fit under the configured RAM's top
+        // address, not a hardcoded 32MB-based literal (see the matching fix
+        // in vcs_profile.cpp's install_profile() for why that literal was
+        // wrong once guest RAM is 64MB).
+        const std::uint64_t user_ram_top =
+            static_cast<std::uint64_t>(psprecomp::GuestMemory::kPhysicalBase) + runtime.memory().size();
+        if (image_end == 0u || image_end > user_ram_top)
             throw psprecomp::Error("Invalid PSP ELF load image extent");
         const std::uint32_t user_arena_start =
             static_cast<std::uint32_t>((image_end + 0xFFu) & ~0xFFull);

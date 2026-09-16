@@ -34,6 +34,13 @@
 #define PSPRECOMP_GE_X86_SIMD 0
 #endif
 
+#if defined(__aarch64__) || defined(__ARM_NEON) || defined(_M_ARM64)
+#include <arm_neon.h>
+#define PSPRECOMP_GE_ARM_SIMD 1
+#else
+#define PSPRECOMP_GE_ARM_SIMD 0
+#endif
+
 namespace vcs {
 
 namespace {
@@ -945,29 +952,82 @@ Vec3 normalized_or_001(Vec3 value) noexcept {
     return value * inverse_length;
 }
 
+// These three are called for every single vertex the game draws (world/view
+// transform, normal transform, and the final projection) -- confirmed live
+// this session (PSPRECOMP_GE_PHASE_DIAG) as a real, measurable share of the
+// CPU cost in dense scenes (170k+ vertices/frame). NEON is always available
+// on Apple Silicon (unlike x86 SSE, which needs a runtime/compile-time
+// check), so this mirrors the existing PSPRECOMP_GE_X86_SIMD precedent
+// (lerp_color above) exactly: same signature, same inputs/outputs, just the
+// arithmetic itself vectorized. Matrix columns are 3 floats each (not
+// 4-padded in memory), so each column is loaded via vld1_f32 (2 lanes) +
+// one scalar lane instead of a single vld1q_f32, to avoid reading past the
+// 12-float array into unrelated memory.
+#if PSPRECOMP_GE_ARM_SIMD
+[[nodiscard]] float32x4_t load_matrix_column(const float *column3) noexcept {
+    float32x4_t v = vsetq_lane_f32(column3[2], vcombine_f32(vld1_f32(column3), vdup_n_f32(0.0f)), 2u);
+    return vsetq_lane_f32(0.0f, v, 3u);
+}
+#endif
+
 Vec3 transform_4x3(const std::array<float, 12> &matrix, Vec3 value) noexcept {
+#if PSPRECOMP_GE_ARM_SIMD
+    const float32x4_t col0 = load_matrix_column(&matrix[0]);
+    const float32x4_t col1 = load_matrix_column(&matrix[3]);
+    const float32x4_t col2 = load_matrix_column(&matrix[6]);
+    const float32x4_t col3 = load_matrix_column(&matrix[9]);
+    float32x4_t result = vfmaq_n_f32(col3, col0, value.x);
+    result = vfmaq_n_f32(result, col1, value.y);
+    result = vfmaq_n_f32(result, col2, value.z);
+    return {vgetq_lane_f32(result, 0u), vgetq_lane_f32(result, 1u), vgetq_lane_f32(result, 2u)};
+#else
     return {
         matrix[0] * value.x + matrix[3] * value.y + matrix[6] * value.z + matrix[9],
         matrix[1] * value.x + matrix[4] * value.y + matrix[7] * value.z + matrix[10],
         matrix[2] * value.x + matrix[5] * value.y + matrix[8] * value.z + matrix[11],
     };
+#endif
 }
 
 Vec3 transform_normal_4x3(const std::array<float, 12> &matrix, Vec3 value) noexcept {
+#if PSPRECOMP_GE_ARM_SIMD
+    const float32x4_t col0 = load_matrix_column(&matrix[0]);
+    const float32x4_t col1 = load_matrix_column(&matrix[3]);
+    const float32x4_t col2 = load_matrix_column(&matrix[6]);
+    float32x4_t result = vmulq_n_f32(col0, value.x);
+    result = vfmaq_n_f32(result, col1, value.y);
+    result = vfmaq_n_f32(result, col2, value.z);
+    return {vgetq_lane_f32(result, 0u), vgetq_lane_f32(result, 1u), vgetq_lane_f32(result, 2u)};
+#else
     return {
         matrix[0] * value.x + matrix[3] * value.y + matrix[6] * value.z,
         matrix[1] * value.x + matrix[4] * value.y + matrix[7] * value.z,
         matrix[2] * value.x + matrix[5] * value.y + matrix[8] * value.z,
     };
+#endif
 }
 
 Vec4 transform_4x4(const std::array<float, 16> &matrix, Vec3 value) noexcept {
+#if PSPRECOMP_GE_ARM_SIMD
+    // 4x4 columns are already contiguous (4 floats each), unlike the 4x3
+    // case above -- a plain vld1q_f32 is exact, no padding needed.
+    const float32x4_t col0 = vld1q_f32(&matrix[0]);
+    const float32x4_t col1 = vld1q_f32(&matrix[4]);
+    const float32x4_t col2 = vld1q_f32(&matrix[8]);
+    const float32x4_t col3 = vld1q_f32(&matrix[12]);
+    float32x4_t result = vfmaq_n_f32(col3, col0, value.x);
+    result = vfmaq_n_f32(result, col1, value.y);
+    result = vfmaq_n_f32(result, col2, value.z);
+    return {vgetq_lane_f32(result, 0u), vgetq_lane_f32(result, 1u), vgetq_lane_f32(result, 2u),
+            vgetq_lane_f32(result, 3u)};
+#else
     return {
         matrix[0] * value.x + matrix[4] * value.y + matrix[8] * value.z + matrix[12],
         matrix[1] * value.x + matrix[5] * value.y + matrix[9] * value.z + matrix[13],
         matrix[2] * value.x + matrix[6] * value.y + matrix[10] * value.z + matrix[14],
         matrix[3] * value.x + matrix[7] * value.y + matrix[11] * value.z + matrix[15],
     };
+#endif
 }
 
 
@@ -4914,6 +4974,17 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         // above the minimap.  Keep those auxiliary primitives in PSP coordinates
         // and only correct filled geometry (triangles/strips/fans/sprites).
         const bool widescreen_surface_primitive = primitive >= 3u && primitive <= 6u;
+        // Same three exclusions widescreen_hud already needed (see the long
+        // comments below, unchanged) -- but computed independent of whether
+        // widescreen shrink is active, since "is this real 2D interface" is a
+        // question worth answering even with widescreen off. Feeds
+        // gpu_draw.hud_candidate (see ge_gpu_backend.hpp) for the experimental
+        // HUD-at-output-resolution path; does not itself alter any vertex.
+        const bool hud_world_effect_exclusion =
+            !(setup.depth_test_enabled && !setup.depth_write_enabled) &&
+            !(setup.texture_enabled && ge_gpu_backend_is_framebuffer_feedback_texture(gpu_draw));
+        gpu_draw.hud_candidate = widescreen_surface_primitive && !setup.clear_mode && !full_width &&
+            hud_world_effect_exclusion;
         if (widescreen_surface_primitive && hud.shrink != 1.0f && !setup.clear_mode && !full_width &&
             // Additive depth-tested 2D is not interface, it is the world drawn
             // in screen space: coronas, headlight glows, lens flares. The guest
@@ -4927,11 +4998,11 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             // it left the map unshrunk inside a shrunk frame. What separates the
             // two is the blend: a glow adds light with a fixed destination
             // factor, while the radar composites with ordinary source alpha.
-            !(setup.depth_test_enabled && !setup.depth_write_enabled) &&
+            //
             // The composition quads are through-mode too, and they carry the
             // world. Shrinking them would pillarbox the picture and undo the
             // widened frustum instead of complementing it.
-            !(setup.texture_enabled && ge_gpu_backend_is_framebuffer_feedback_texture(gpu_draw))) {
+            hud_world_effect_exclusion) {
             // ThirteenAG's original correction is X-only and symmetric around
             // the screen's centre -- his target was PC monitors, which widen
             // a 4:3/16:9 game horizontally (and only ever that direction).

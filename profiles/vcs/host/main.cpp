@@ -32,6 +32,12 @@
 #include <windows.h>
 #endif
 
+// vcs_draw_distance_patch.cpp is self-contained by design (see its own
+// header comment) and ships with no .hpp of its own.
+namespace vcs {
+void install_draw_distance_patch(psprecomp::Runtime &runtime, const std::filesystem::path &ini_path);
+}
+
 namespace {
 
 #ifdef _WIN32
@@ -213,6 +219,10 @@ int main(int argc, char **argv) {
         // Reads [SimulateHDR] out of the same ini. The effect itself is built
         // lazily on the first frame the Vulkan backend records.
         vcs::hdr_post_configure(configuration.source_path);
+        // Must run after register_generated_functions(): it overwrites AOT
+        // entry points for the LOD/range guest functions it patches. Reads
+        // [DrawDistance] out of the same ini; no-ops entirely if Enabled=0.
+        vcs::install_draw_distance_patch(runtime, configuration.source_path);
         vcs::install_profile(runtime, user_arena_start);
 
         std::string gpu_backend_error;

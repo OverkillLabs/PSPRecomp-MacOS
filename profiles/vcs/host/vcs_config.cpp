@@ -383,6 +383,11 @@ void apply_rendering_key(VcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.SMAA expects true/false");
         return;
     }
+    if (key == "sharpen" || key == "sharpness") {
+        if (!parse_float(value, 0.0f, 2.0f, config.rendering.sharpen))
+            warning(config, line, "Rendering.Sharpen must be between 0.0 and 2.0");
+        return;
+    }
     if (key == "anisotropicfiltering" || key == "anisotropy") {
         if (!parse_u32(value, 1u, 16u, config.rendering.anisotropic_filtering))
             warning(config, line, "Rendering.AnisotropicFiltering must be between 1 and 16");
@@ -507,14 +512,81 @@ void apply_widescreen_key(VcsConfiguration &config, const std::string &key,
     warning(config, line, "unknown [Widescreen] key '" + key + "'");
 }
 
+void apply_color_grading_key(VcsConfiguration &config, const std::string &key,
+                             const std::string &value, std::size_t line) {
+    if (key == "enabled") {
+        if (!parse_bool(value, config.color_grading.enabled))
+            warning(config, line, "ColorGrading.Enabled expects true/false");
+        return;
+    }
+    if (key == "saturation") {
+        if (!parse_float(value, 0.0f, 3.0f, config.color_grading.saturation))
+            warning(config, line, "ColorGrading.Saturation must be between 0.0 and 3.0");
+        return;
+    }
+    if (key == "contrast") {
+        if (!parse_float(value, 0.0f, 3.0f, config.color_grading.contrast))
+            warning(config, line, "ColorGrading.Contrast must be between 0.0 and 3.0");
+        return;
+    }
+    if (key == "brightness") {
+        if (!parse_float(value, -1.0f, 1.0f, config.color_grading.brightness))
+            warning(config, line, "ColorGrading.Brightness must be between -1.0 and 1.0");
+        return;
+    }
+    if (key == "tintr") {
+        if (!parse_float(value, 0.0f, 3.0f, config.color_grading.tint_r))
+            warning(config, line, "ColorGrading.TintR must be between 0.0 and 3.0");
+        return;
+    }
+    if (key == "tintg") {
+        if (!parse_float(value, 0.0f, 3.0f, config.color_grading.tint_g))
+            warning(config, line, "ColorGrading.TintG must be between 0.0 and 3.0");
+        return;
+    }
+    if (key == "tintb") {
+        if (!parse_float(value, 0.0f, 3.0f, config.color_grading.tint_b))
+            warning(config, line, "ColorGrading.TintB must be between 0.0 and 3.0");
+        return;
+    }
+    warning(config, line, "unknown [ColorGrading] key '" + key + "'");
+}
+
+void apply_simulate_hdr_key(VcsConfiguration &config, const std::string &key,
+                           const std::string &value, std::size_t line) {
+    if (key == "enabled") {
+        if (!parse_bool(value, config.bloom.enabled))
+            warning(config, line, "SimulateHDR.Enabled expects true/false");
+        return;
+    }
+    if (key == "threshold") {
+        if (!parse_float(value, 0.0f, 1.0f, config.bloom.threshold))
+            warning(config, line, "SimulateHDR.Threshold must be between 0.0 and 1.0");
+        return;
+    }
+    if (key == "intensity") {
+        if (!parse_float(value, 0.0f, 4.0f, config.bloom.intensity))
+            warning(config, line, "SimulateHDR.Intensity must be between 0.0 and 4.0");
+        return;
+    }
+    // Ignore unknown keys silently here rather than warning: this section
+    // still doubles as home for whatever DX12's own hdr_post_configure()
+    // eventually needs, once it is more than a permanent no-op stub.
+}
+
 void apply_timing_key(VcsConfiguration &config, const std::string &key,
                       const std::string &value, std::size_t line) {
     if (key == "framerate" || key == "fps" || key == "targetfps") {
+        // Locked to 60 -- this is the baseline this port targets and tunes
+        // for (batch coalescing, GPU timestamp diagnostics, the whole
+        // optimization pass this session), not an arbitrary default. Any
+        // other value is a config mistake, not a supported mode: warn and
+        // fall back to 60 rather than silently letting the game run
+        // uncapped or at a rate nothing has been tuned or verified against.
         std::uint32_t frame_rate = 0u;
-        if (!parse_u32(value, 30u, 240u, frame_rate) ||
-            (frame_rate != 30u && frame_rate != 60u && frame_rate != 120u &&
-             frame_rate != 200u && frame_rate != 240u)) {
-            warning(config, line, "Timing.FrameRate expects 30, 60, 120, 200 or 240");
+        if (!parse_u32(value, 30u, 240u, frame_rate) || frame_rate != 60u) {
+            warning(config, line, "Timing.FrameRate is locked to 60 in this build");
+            config.timing.frame_rate = 60u;
             return;
         }
         config.timing.frame_rate = frame_rate;
@@ -778,15 +850,18 @@ VcsConfiguration load_vcs_configuration(const std::filesystem::path &path) {
         // deliberately owns its parser so it can be compiled independently of
         // the core display/input configuration. They are nevertheless valid
         // VCSNative.ini sections and must not be reported as unknown here.
+        else if (section == "simulatehdr" || section == "simulate hdr")
+            apply_simulate_hdr_key(config, key, value, line_number);
+        else if (section == "colorgrading" || section == "color grading")
+            apply_color_grading_key(config, key, value, line_number);
         else if (section == "project2dfx" || section == "project 2dfx" ||
                  section == "lodlights" || section == "lod lights" ||
                  section == "trafficlights" || section == "traffic lights" ||
                  section == "blinkinglights" || section == "blinking lights" ||
                  section == "skygfx" || section == "heliheight" ||
                  section == "heli height" || section == "drawdistance" ||
-                 section == "draw distance" || section == "simulatehdr" ||
-                 section == "simulate hdr") {
-            // Parsed by install_project2dfx() or hdr_post_configure().
+                 section == "draw distance") {
+            // Parsed by install_project2dfx() or vcs_draw_distance_patch.cpp.
         }
         else if (section.empty())
             warning(config, line_number, "key outside a section");

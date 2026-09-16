@@ -1092,6 +1092,16 @@ struct GeStackEntry {
 };
 
 struct GeListRecord {
+    // Which vblank's guest logic enqueued this list. Stamped once at
+    // sceGeListEnQueue time from the same display_vblank_index the main
+    // thread's wait_vblank()/finish_color_frame() advance. This is the
+    // frame-identity tag frame_buckets itself does not otherwise carry (see
+    // ge_gpu_backend_vulkan.cpp's FrameBucket) -- required so a bounded,
+    // cross-vblank-overlapped async worker can be told "finish everything
+    // tagged for vblank N" instead of "finish everything queued, whenever
+    // it was queued," which is what let one frame's draws leak into
+    // another's when this was first tried without any tagging at all.
+    std::uint64_t vblank{};
     std::uint32_t guest_id{};
     std::uint32_t start_pc{};
     std::uint32_t pc{};
@@ -1170,6 +1180,11 @@ struct GeAsyncTask {
     std::uint32_t id{};
     std::int32_t submitter_uid{};
     std::shared_ptr<std::atomic<std::uint32_t>> stall;
+    // Mirrors GeListRecord::vblank -- carried on the task itself (not just
+    // looked up from ge_list_table) so ge_async_wait_for_vblank() below can
+    // check queued-but-not-yet-dequeued tasks too, without needing the table
+    // lookup under a second lock.
+    std::uint64_t vblank{};
 };
 struct GeAsyncCompletion {
     std::int32_t submitter_uid{};
@@ -5117,6 +5132,7 @@ void enqueue_ge_display_list(psprecomp::Runtime &runtime, psprecomp::AllegrexCon
     }
 
     GeListRecord record{};
+    record.vblank = display_vblank_index;
     record.start_pc = list_address;
     record.pc = list_address;
     record.stall = stall_address;
@@ -5194,7 +5210,7 @@ void enqueue_ge_display_list(psprecomp::Runtime &runtime, psprecomp::AllegrexCon
 
             auto stall = std::make_shared<std::atomic<std::uint32_t>>(found->second.stall);
             ge_async.live_stalls[guest_id] = stall;
-            GeAsyncTask task{guest_id, thread_table.current_uid, stall};
+            GeAsyncTask task{guest_id, thread_table.current_uid, stall, record.vblank};
             if (head)
                 ge_async.pending.push_front(std::move(task));
             else
@@ -6889,7 +6905,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                         auto stall = std::make_shared<std::atomic<std::uint32_t>>(new_stall);
                         ge_async.live_stalls[id] = stall;
                         found->second.state = GeListState::Queued;
-                        ge_async.pending.push_back(GeAsyncTask{id, thread_table.current_uid, stall});
+                        ge_async.pending.push_back(
+                            GeAsyncTask{id, thread_table.current_uid, stall, found->second.vblank});
                         ge_async.outstanding.fetch_add(1u, std::memory_order_release);
                         ++ge_async.submitted;
                         resumed = true;

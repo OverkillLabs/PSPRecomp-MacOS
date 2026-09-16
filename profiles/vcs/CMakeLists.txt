@@ -112,9 +112,13 @@ if(MSVC AND PSPRECOMP_NATIVE_AVX2)
         COMPILE_OPTIONS "/arch:AVX")
 endif()
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    set_source_files_properties("${VCS_PROFILE_DIR}/host/vcs_profile.cpp" PROPERTIES COMPILE_OPTIONS "-O2")
-endif()
+        # vcs_profile.cpp used to be force-built at -O2 here (undocumented,
+        # no comment explaining why) even in Release, silently downgrading
+        # the exact file containing the hot GE display-list interpreter
+        # (execute_ge_list, the per-vertex/per-command switch loop) below
+        # whatever CMAKE_BUILD_TYPE=Release would otherwise give it (-O3 for
+        # Clang/GCC). Confirmed building fine at Release's normal level;
+        # removed rather than kept as a stale, unexplained downgrade.
 
 # The DX12 backend is Windows-only (its non-Windows branch is a stub that
 # always reports Software active); everywhere else, the default is the
@@ -159,9 +163,22 @@ else()
     # (model->clip transform done on the GPU instead of ge_renderer.cpp's CPU
     # loop); both share psp_ge.frag unchanged, so only new vertex stages are
     # needed here.
-    set(VCS_SHADER_STEMS psp_ge psp_ge psp_ge_hw psp_ge_hw_packed0115)
-    set(VCS_SHADER_EXTS vert frag vert vert)
-    set(VCS_SHADER_SYMBOLS kPspGeVertSpv kPspGeFragSpv kPspGeHwVertSpv kPspGeHwPacked0115VertSpv)
+    # bloom.vert/frag: the experimental single-pass bright-pass/blur post
+    # process (see [SimulateHDR] in the .ini and ge_gpu_backend_vulkan.cpp's
+    # bloom_* state) -- same build-time GLSL->SPIR-V->header pipeline as the
+    # GE shaders above, just two more entries.
+    # present.frag: the native-swapchain migration's plain blit/upscale
+    # fragment shader (see ge_gpu_backend_vulkan.cpp's swapchain_* state) --
+    # shares bloom.vert's fullscreen-triangle vertex stage, no new one needed.
+    # fxaa.frag: single-pass FXAA anti-aliasing (Rendering.SMAA/AntiAliasing
+    # in the .ini), same fullscreen-triangle vertex stage too.
+    # color_grade.frag: parametric color grading ([ColorGrading] in the
+    # .ini), same fullscreen-triangle vertex stage.
+    set(VCS_SHADER_STEMS psp_ge psp_ge psp_ge_hw psp_ge_hw_packed0115 bloom bloom present fxaa
+        color_grade)
+    set(VCS_SHADER_EXTS vert frag vert vert vert frag frag frag frag)
+    set(VCS_SHADER_SYMBOLS kPspGeVertSpv kPspGeFragSpv kPspGeHwVertSpv kPspGeHwPacked0115VertSpv
+        kBloomVertSpv kBloomFragSpv kPresentFragSpv kFxaaFragSpv kColorGradeFragSpv)
     list(LENGTH VCS_SHADER_STEMS VCS_SHADER_COUNT)
     math(EXPR VCS_SHADER_LAST "${VCS_SHADER_COUNT} - 1")
     foreach(VCS_SHADER_INDEX RANGE ${VCS_SHADER_LAST})

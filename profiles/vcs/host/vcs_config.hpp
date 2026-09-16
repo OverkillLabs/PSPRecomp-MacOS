@@ -120,9 +120,24 @@ struct RenderingConfiguration {
     // PSP textures, persistent framebuffer feedback, direct swapchain present,
     // depth precision selection and native MSAA/resolve.
     bool dx12_ge_color{false};
-    // SMAA 1x, the spatial variant. The temporal ones need per-pixel motion
-    // vectors, which this port has no way to produce. Off keeps PSP parity.
+    // Confirmed a permanent no-op on the Vulkan backend previously (DX12-
+    // only, and DX12's own implementation was never real either -- see
+    // ge_gpu_backend_vulkan.cpp's SMAA comment history). Now drives a real,
+    // working single-pass FXAA implementation instead -- genuinely simpler
+    // and safer than true SMAA (which needs precomputed area/search lookup
+    // textures and three render passes), for a similar practical result
+    // (smoothed jagged polygon edges). Kept under the same key/field name
+    // for config compatibility; the .ini and launcher UI both label it FXAA
+    // now so it isn't misrepresented as the real SMAA algorithm.
     bool smaa{false};
+    // Unsharp-mask sharpening of the final composited frame (see the same
+    // shaders/color_grade.frag pass ColorGrading uses -- this and color
+    // grading share one GPU pass; either alone is enough to trigger it,
+    // and each is applied independent of the other being on). 0 = off/
+    // identity. Real, but PSP textures being genuinely low-resolution
+    // means this can only sharpen existing detail, not invent missing
+    // detail that was never captured.
+    float sharpen{0.0f};
     bool experimental_gpu_color_preview{false};
     bool gpu_geometry_debug_colors{false};
     std::uint64_t dump_gpu_frame_vblank{0u};
@@ -146,7 +161,8 @@ struct TimingConfiguration {
     // Native VCS renders every other 59.94 Hz vblank (30 FPS). 60 removes that
     // skip; 120/240 also raise the virtual display cadence so they are real
     // game-frame targets rather than duplicated presentation frames.
-    std::uint32_t frame_rate{240u};
+    // Locked to 60 -- see apply_timing_key() in vcs_config.cpp.
+    std::uint32_t frame_rate{60u};
     bool realtime_speed_diagnostics{false};
     std::uint64_t realtime_speed_interval_vblanks{120u};
 };
@@ -171,6 +187,38 @@ struct WidescreenConfiguration {
     // 0/0 means "auto": derive the ratio from the presentation surface.
     std::uint32_t aspect_x{0u};
     std::uint32_t aspect_y{0u};
+};
+
+// Experimental single-pass bloom on the Vulkan backend (see
+// ge_gpu_backend_vulkan.cpp's bloom_* state). [SimulateHDR] previously only
+// existed as a DX12 placeholder (vcs_hdr_post_dx12_stub.cpp is a permanent
+// no-op there) -- Threshold/Intensity are new keys, parsed here rather than
+// through hdr_post_configure() so a genuinely working implementation isn't
+// gated behind a stub that always reports disabled.
+struct BloomConfiguration {
+    bool enabled{false};
+    // Fraction of luminance (0..1) above which a pixel starts contributing
+    // to the glow; higher = only the brightest highlights bloom.
+    float threshold{0.8f};
+    // Multiplies the extracted/blurred glow before it's added back. Kept
+    // moderate by default -- this is additive light, easy to blow out.
+    float intensity{0.6f};
+};
+
+// Parametric color grading (see shaders/color_grade.frag) -- not a real
+// LUT-texture lookup (no .cube/strip asset exists in this project), but
+// reaches the same practical goal via brightness/contrast/saturation/tint
+// math. Defaults are all identity (no visual change) so turning Enabled on
+// with no other tuning is a genuine no-op, same convention has_saved
+// elsewhere in this file.
+struct ColorGradingConfiguration {
+    bool enabled{false};
+    float saturation{1.0f};
+    float contrast{1.0f};
+    float brightness{0.0f};
+    float tint_r{1.0f};
+    float tint_g{1.0f};
+    float tint_b{1.0f};
 };
 
 // Standalone ProperShaders.ini feature. Values normally supplied by the San
@@ -249,6 +297,8 @@ struct VcsConfiguration {
     TimingConfiguration timing{};
     DiagnosticsConfiguration diagnostics{};
     WidescreenConfiguration widescreen{};
+    BloomConfiguration bloom{};
+    ColorGradingConfiguration color_grading{};
     VolumetricCloudsConfiguration volumetric_clouds{};
     std::filesystem::path source_path{};
     // Where the executable lives. Saves go beside it rather than into the game

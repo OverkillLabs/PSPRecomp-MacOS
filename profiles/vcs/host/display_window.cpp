@@ -1160,18 +1160,54 @@ void display_window_start() {
     Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
     if (fullscreen_desktop) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 
+    // Native-swapchain present-path migration (PSPRECOMP_VULKAN_SWAPCHAIN=1):
+    // the SDL_Renderer is now ALWAYS created, unconditionally, same as the
+    // default path -- earlier this used SDL_Metal_CreateView to get a
+    // CAMetalLayer, which attaches its OWN new content view and broke intro
+    // videos/the software-raster fallback (nothing left to draw them into,
+    // since state.renderer was skipped entirely in that mode). Fixed by
+    // pulling the CAMetalLayer back OUT of the renderer SDL already created
+    // (SDL_RenderGetMetalLayer, a real SDL2 API for exactly this -- SDL's
+    // own Metal renderer already owns a CAMetalLayer when created on
+    // macOS), instead of creating a second, competing one. Both the SDL
+    // renderer (video/software-raster path) and the Vulkan swapchain
+    // (direct 3D gameplay present) now share the same underlying layer,
+    // never used at the same time (ge_gpu_backend_presents_directly()
+    // already decides which path handles a given vblank before the other
+    // even runs).
+    // Default ON now that the intro-video/software-present regression is
+    // fixed (see the comment above) and the real present-cost win is
+    // confirmed (CPU present cost dropped to ~0 in live testing). Set
+    // PSPRECOMP_VULKAN_SWAPCHAIN=0 to opt back out to the CPU-readback/SDL
+    // present path if this ever needs bisecting against.
+    static const bool vulkan_swapchain_migration = [] {
+        const char *value = std::getenv("PSPRECOMP_VULKAN_SWAPCHAIN");
+        return value == nullptr || (*value != '\0' && std::strcmp(value, "0") != 0);
+    }();
+
     SDL_Window *window = SDL_CreateWindow("VCSNative", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, width,
                                           height, flags);
     if (window == nullptr) {
         std::cerr << "[display] SDL_CreateWindow failed: " << SDL_GetError() << "\n";
         return;
     }
+
     // SDL hints only take effect before the renderer is created, so the scale
     // quality hint has to land here rather than after SDL_CreateRenderer.
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,
                 state.configuration.upscale_filter == DisplayUpscaleFilter::Bilinear ? "1" : "0");
     SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (renderer == nullptr) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+
+    if (vulkan_swapchain_migration && renderer != nullptr) {
+        void *metal_layer = SDL_RenderGetMetalLayer(renderer);
+        if (metal_layer == nullptr) {
+            std::cerr << "[swapchain-migration] SDL_RenderGetMetalLayer returned null (renderer "
+                         "may not be Metal-backed) -- staying on the existing present path\n";
+        } else {
+            ge_gpu_backend_set_native_window(metal_layer);
+        }
+    }
 
     // A call here once forced this renderer's CAMetalLayer.drawableSize to
     // match Rendering.InternalResolutionMode instead of the window's own

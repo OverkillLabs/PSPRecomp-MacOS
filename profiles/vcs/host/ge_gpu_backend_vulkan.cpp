@@ -29,14 +29,23 @@
 #include "vcs_runtime_log.hpp"
 
 #include <vulkan/vulkan.h>
+#if defined(__APPLE__)
+#include <vulkan/vulkan_metal.h>
+#endif
 
 #include "psp_ge_vert_spv.h"
 #include "psp_ge_frag_spv.h"
 #include "psp_ge_hw_vert_spv.h"
 #include "psp_ge_hw_packed0115_vert_spv.h"
+#include "bloom_vert_spv.h"
+#include "bloom_frag_spv.h"
+#include "present_frag_spv.h"
+#include "fxaa_frag_spv.h"
+#include "color_grade_frag_spv.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -100,6 +109,30 @@ constexpr VkDeviceSize kInitialVertexBytes = 8u * 1024u * 1024u;
 struct PushConstants {
     float inverse_viewport[2];
     std::uint32_t framebuffer_format;
+};
+
+// Matches shaders/bloom.frag's push_constant block exactly.
+struct BloomPushConstants {
+    float texel_size[2];
+    float threshold;
+    float intensity;
+};
+
+// Matches shaders/fxaa.frag's push_constant block exactly.
+struct FxaaPushConstants {
+    float texel_size[2];
+};
+
+// Matches shaders/color_grade.frag's push_constant block exactly.
+struct ColorGradePushConstants {
+    float saturation;
+    float contrast;
+    float brightness;
+    float tint_r;
+    float tint_g;
+    float tint_b;
+    float sharpen_strength;
+    float texel_size[2];
 };
 
 // Matches psp_ge_hw.vert/psp_ge_hw_packed0115.vert's push_constant block
@@ -315,6 +348,86 @@ struct VulkanGeState {
     VkCommandBuffer command_buffer{VK_NULL_HANDLE};
     VkFence fence{VK_NULL_HANDLE};
 
+    // GPU-side timestamp queries (see PSPRECOMP_GE_GPU_TIMESTAMP_DIAG),
+    // separate from the CPU wall-clock timer around command recording --
+    // together they split a slow frame into "the CPU spent a long time
+    // recording/submitting" vs "the GPU itself took a long time executing",
+    // which a single frame_us/ge_us number (already measured elsewhere)
+    // cannot distinguish. Index 0 is written at TOP_OF_PIPE right after
+    // vkBeginCommandBuffer, index 1 at BOTTOM_OF_PIPE right before
+    // vkEndCommandBuffer, so their difference times the whole submission
+    // (main GE pass + bloom pass, when active) on the GPU's own clock.
+    bool timestamps_supported{false};
+    float timestamp_period_ns{1.0f};
+    VkQueryPool timestamp_pool{VK_NULL_HANDLE};
+
+    // Step 2 of the native-swapchain present-path migration (see the
+    // scoping plan): a real VkSurfaceKHR created from the game window's
+    // actual CAMetalLayer, gated behind PSPRECOMP_VULKAN_SWAPCHAIN=1. Purely
+    // additive and diagnostic at this stage -- nothing yet reads from or
+    // presents through this surface; the existing CPU-readback/SDL present
+    // path (display_window_present_rgba) still does 100% of real
+    // presentation regardless of whether this surface exists. Kept
+    // completely separate from every other Vulkan resource above so this
+    // step can be reverted by deleting only this block plus
+    // ge_gpu_backend_set_native_window's body, with zero risk to anything
+    // already working.
+    bool swapchain_migration_enabled{false};
+    VkSurfaceKHR diagnostic_surface{VK_NULL_HANDLE};
+    void *diagnostic_metal_layer{nullptr};
+
+    // Real swapchain + present pipeline. Only ever touched when
+    // swapchain_migration_enabled; every field here stays VK_NULL_HANDLE/
+    // default and completely unused otherwise. Bloom is force-disabled
+    // whenever this path is active (bloom's glow composite is CPU-side
+    // only -- see ge_gpu_backend_finish_color_frame -- and would silently
+    // never show up if the CPU readback that composite depends on is
+    // skipped, which this path does).
+    VkSwapchainKHR swapchain{VK_NULL_HANDLE};
+    VkFormat swapchain_format{VK_FORMAT_UNDEFINED};
+    VkExtent2D swapchain_extent{};
+    std::vector<VkImage> swapchain_images;
+    std::vector<VkImageView> swapchain_views;
+    std::vector<VkFramebuffer> swapchain_framebuffers;
+    VkRenderPass present_render_pass{VK_NULL_HANDLE};
+    VkSampler present_sampler{VK_NULL_HANDLE};
+    VkDescriptorSetLayout present_descriptor_layout{VK_NULL_HANDLE};
+    VkDescriptorPool present_descriptor_pool{VK_NULL_HANDLE};
+    VkDescriptorSet present_descriptor_set{VK_NULL_HANDLE};
+    VkPipelineLayout present_pipeline_layout{VK_NULL_HANDLE};
+    VkPipeline present_pipeline{VK_NULL_HANDLE};
+    VkShaderModule present_vertex_shader{VK_NULL_HANDLE};
+    VkShaderModule present_fragment_shader{VK_NULL_HANDLE};
+    VkCommandBuffer present_command_buffer{VK_NULL_HANDLE};
+    VkSemaphore present_image_acquired{VK_NULL_HANDLE};
+    VkSemaphore present_render_finished{VK_NULL_HANDLE};
+    // Signaled alongside present_render_finished, but consumed by the NEXT
+    // frame's main render submission instead of vkQueuePresentKHR -- lets
+    // that submission wait only until the present pass's READ of
+    // color_image is done (a real dependency, satisfied on the GPU timeline)
+    // instead of the coarse vkQueueWaitIdle() this replaced, which stalled
+    // the CPU until the ENTIRE queue drained.
+    VkSemaphore present_color_read_done{VK_NULL_HANDLE};
+    bool present_just_ran{false};
+    // Set true only when this specific finish_color_frame() call actually
+    // blitted a new frame into the swapchain and presented it -- NOT the
+    // same thing as "swapchain mode is configured." Distinguishing these
+    // matters because a vblank with nothing new to render (no GE draws
+    // submitted this frame -- e.g. during intro-video playback, where the
+    // game issues no 3D draws at all) still calls finish_color_frame(), but
+    // s.submission_pending is false so the swapchain branch never runs.
+    // ge_gpu_backend_presents_directly() used to report "yes, handled" for
+    // every such vblank purely because swapchain mode was on, which made
+    // vcs_profile.cpp skip its software/video present path even though
+    // nothing was actually shown that vblank -- confirmed live as the
+    // actual cause of missing intro videos in swapchain mode (a CAMetalLayer
+    // ownership conflict with the SDL renderer was a *second*, real bug
+    // fixed separately in display_window.cpp, but did not fully explain the
+    // missing videos on its own).
+    bool swapchain_presented_this_call{false};
+    VkFence present_fence{VK_NULL_HANDLE};
+    bool present_fence_pending{false};
+
     std::uint32_t width{480u};
     std::uint32_t height{272u};
     VkImage color_image{VK_NULL_HANDLE};
@@ -377,6 +490,86 @@ struct VulkanGeState {
     VkDeviceMemory readback_memory{VK_NULL_HANDLE};
     VkDeviceSize readback_capacity{};
 
+    // Experimental bloom pass (see [SimulateHDR] in the .ini). One extra
+    // same-size image the bright-pass/blur fullscreen shader writes into,
+    // read back to CPU through its own buffer exactly like s.color_image is
+    // -- kept as a strictly one-directional GPU pass (sample color_image,
+    // write bloom_image) so the existing color_image readback path is never
+    // touched or reordered. The actual per-pixel additive composite happens
+    // on the CPU, in finish_color_frame()'s existing readback-collection
+    // step, not in Vulkan -- see bloom_enabled's use there. That keeps the
+    // one genuinely new piece of pixel logic (the composite) in ordinary,
+    // easily-inspected C++ instead of another render pass with its own
+    // load/store-op and layout-transition surface to get wrong.
+    bool bloom_enabled{false};
+    float bloom_threshold{0.8f};
+    float bloom_intensity{0.6f};
+    VkImage bloom_image{VK_NULL_HANDLE};
+    VkDeviceMemory bloom_memory{VK_NULL_HANDLE};
+    VkImageView bloom_view{VK_NULL_HANDLE};
+    VkRenderPass bloom_render_pass{VK_NULL_HANDLE};
+    VkFramebuffer bloom_framebuffer{VK_NULL_HANDLE};
+    VkSampler bloom_sampler{VK_NULL_HANDLE};
+    VkDescriptorSetLayout bloom_descriptor_layout{VK_NULL_HANDLE};
+    VkDescriptorPool bloom_descriptor_pool{VK_NULL_HANDLE};
+    VkDescriptorSet bloom_descriptor_set{VK_NULL_HANDLE};
+    VkPipelineLayout bloom_pipeline_layout{VK_NULL_HANDLE};
+    VkPipeline bloom_pipeline{VK_NULL_HANDLE};
+    VkShaderModule bloom_vertex_shader{VK_NULL_HANDLE};
+    VkShaderModule bloom_fragment_shader{VK_NULL_HANDLE};
+    VkBuffer bloom_readback_buffer{VK_NULL_HANDLE};
+    VkDeviceMemory bloom_readback_memory{VK_NULL_HANDLE};
+    VkDeviceSize bloom_readback_capacity{};
+    std::vector<std::byte> bloom_rgba;
+
+    // Single-pass FXAA (Rendering.SMAA/AntiAliasing -- see the field comment
+    // in vcs_config.hpp). A same-size image the FXAA shader writes into,
+    // reading s.color_image; when enabled, the existing readback copy (and
+    // the swapchain present pass's sample) reads FROM fxaa_image instead of
+    // color_image, so this is the one thing that actually reaches the
+    // screen/CPU frame -- unlike bloom's CPU-composited glow, this fully
+    // replaces the source pixels with their anti-aliased version on the GPU.
+    bool fxaa_enabled{false};
+    VkImage fxaa_image{VK_NULL_HANDLE};
+    VkDeviceMemory fxaa_memory{VK_NULL_HANDLE};
+    VkImageView fxaa_view{VK_NULL_HANDLE};
+    VkRenderPass fxaa_render_pass{VK_NULL_HANDLE};
+    VkFramebuffer fxaa_framebuffer{VK_NULL_HANDLE};
+    VkSampler fxaa_sampler{VK_NULL_HANDLE};
+    VkDescriptorSetLayout fxaa_descriptor_layout{VK_NULL_HANDLE};
+    VkDescriptorPool fxaa_descriptor_pool{VK_NULL_HANDLE};
+    VkDescriptorSet fxaa_descriptor_set{VK_NULL_HANDLE};
+    VkPipelineLayout fxaa_pipeline_layout{VK_NULL_HANDLE};
+    VkPipeline fxaa_pipeline{VK_NULL_HANDLE};
+    VkShaderModule fxaa_vertex_shader{VK_NULL_HANDLE};
+    VkShaderModule fxaa_fragment_shader{VK_NULL_HANDLE};
+
+    // Parametric color grading ([ColorGrading] -- see vcs_config.hpp).
+    // Reads whichever image is "current" at this point in the pass chain
+    // (fxaa_image if FXAA ran, else color_image -- see the descriptor
+    // written in create_backend and the pass ordering in
+    // finish_color_frame), writes grading_image, and becomes the new final
+    // source for the CPU readback / swapchain present when enabled.
+    bool color_grading_enabled{false};
+    float color_grading_saturation{1.0f};
+    float color_grading_contrast{1.0f};
+    float color_grading_brightness{0.0f};
+    float color_grading_tint[3]{1.0f, 1.0f, 1.0f};
+    float color_grading_sharpen{0.0f};
+    VkImage grading_image{VK_NULL_HANDLE};
+    VkDeviceMemory grading_memory{VK_NULL_HANDLE};
+    VkImageView grading_view{VK_NULL_HANDLE};
+    VkRenderPass grading_render_pass{VK_NULL_HANDLE};
+    VkFramebuffer grading_framebuffer{VK_NULL_HANDLE};
+    VkSampler grading_sampler{VK_NULL_HANDLE};
+    VkDescriptorSetLayout grading_descriptor_layout{VK_NULL_HANDLE};
+    VkDescriptorPool grading_descriptor_pool{VK_NULL_HANDLE};
+    VkDescriptorSet grading_descriptor_set{VK_NULL_HANDLE};
+    VkPipelineLayout grading_pipeline_layout{VK_NULL_HANDLE};
+    VkPipeline grading_pipeline{VK_NULL_HANDLE};
+    VkShaderModule grading_vertex_shader{VK_NULL_HANDLE};
+    VkShaderModule grading_fragment_shader{VK_NULL_HANDLE};
+
     VkBuffer staging_buffer{VK_NULL_HANDLE};
     VkDeviceMemory staging_memory{VK_NULL_HANDLE};
     VkDeviceSize staging_capacity{};
@@ -434,6 +627,12 @@ struct VulkanGeState {
     bool submission_pending{false};
     std::uint64_t pending_vblank{};
     std::uint32_t pending_target_address{};
+    // Wall-clock time this vblank's vkBeginCommandBuffer..vkEndCommandBuffer
+    // recording took on the CPU (batch loop, push constants, descriptor
+    // binds) -- paired with the GPU timestamp query above so a slow frame
+    // can be attributed to CPU recording overhead vs actual GPU execution
+    // time, instead of one combined number.
+    double pending_cpu_record_us{0.0};
 
     // The winning bucket's address from the last frame, so selection can
     // stick with it rather than re-picking the single largest bucket fresh
@@ -1077,6 +1276,67 @@ void destroy_backend(VulkanGeState &s) noexcept {
         destroy_buffer(s.hw_vertex_buffer, s.hw_vertex_memory);
         destroy_buffer(s.hw_packed_vertex_buffer, s.hw_packed_vertex_memory);
         destroy_buffer(s.hw_index_buffer, s.hw_index_memory);
+        destroy_buffer(s.bloom_readback_buffer, s.bloom_readback_memory);
+        if (s.bloom_pipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(s.device, s.bloom_pipeline, nullptr);
+        if (s.bloom_pipeline_layout != VK_NULL_HANDLE)
+            vkDestroyPipelineLayout(s.device, s.bloom_pipeline_layout, nullptr);
+        if (s.bloom_descriptor_pool != VK_NULL_HANDLE)
+            vkDestroyDescriptorPool(s.device, s.bloom_descriptor_pool, nullptr);
+        if (s.bloom_descriptor_layout != VK_NULL_HANDLE)
+            vkDestroyDescriptorSetLayout(s.device, s.bloom_descriptor_layout, nullptr);
+        if (s.bloom_sampler != VK_NULL_HANDLE) vkDestroySampler(s.device, s.bloom_sampler, nullptr);
+        if (s.bloom_vertex_shader != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.bloom_vertex_shader, nullptr);
+        if (s.bloom_fragment_shader != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.bloom_fragment_shader, nullptr);
+        if (s.bloom_framebuffer != VK_NULL_HANDLE)
+            vkDestroyFramebuffer(s.device, s.bloom_framebuffer, nullptr);
+        if (s.bloom_render_pass != VK_NULL_HANDLE)
+            vkDestroyRenderPass(s.device, s.bloom_render_pass, nullptr);
+        if (s.bloom_view != VK_NULL_HANDLE) vkDestroyImageView(s.device, s.bloom_view, nullptr);
+        if (s.bloom_image != VK_NULL_HANDLE) vkDestroyImage(s.device, s.bloom_image, nullptr);
+        if (s.bloom_memory != VK_NULL_HANDLE) vkFreeMemory(s.device, s.bloom_memory, nullptr);
+        if (s.fxaa_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(s.device, s.fxaa_pipeline, nullptr);
+        if (s.fxaa_pipeline_layout != VK_NULL_HANDLE)
+            vkDestroyPipelineLayout(s.device, s.fxaa_pipeline_layout, nullptr);
+        if (s.fxaa_descriptor_pool != VK_NULL_HANDLE)
+            vkDestroyDescriptorPool(s.device, s.fxaa_descriptor_pool, nullptr);
+        if (s.fxaa_descriptor_layout != VK_NULL_HANDLE)
+            vkDestroyDescriptorSetLayout(s.device, s.fxaa_descriptor_layout, nullptr);
+        if (s.fxaa_sampler != VK_NULL_HANDLE) vkDestroySampler(s.device, s.fxaa_sampler, nullptr);
+        if (s.fxaa_vertex_shader != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.fxaa_vertex_shader, nullptr);
+        if (s.fxaa_fragment_shader != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.fxaa_fragment_shader, nullptr);
+        if (s.fxaa_framebuffer != VK_NULL_HANDLE)
+            vkDestroyFramebuffer(s.device, s.fxaa_framebuffer, nullptr);
+        if (s.fxaa_render_pass != VK_NULL_HANDLE)
+            vkDestroyRenderPass(s.device, s.fxaa_render_pass, nullptr);
+        if (s.fxaa_view != VK_NULL_HANDLE) vkDestroyImageView(s.device, s.fxaa_view, nullptr);
+        if (s.fxaa_image != VK_NULL_HANDLE) vkDestroyImage(s.device, s.fxaa_image, nullptr);
+        if (s.fxaa_memory != VK_NULL_HANDLE) vkFreeMemory(s.device, s.fxaa_memory, nullptr);
+        if (s.grading_pipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(s.device, s.grading_pipeline, nullptr);
+        if (s.grading_pipeline_layout != VK_NULL_HANDLE)
+            vkDestroyPipelineLayout(s.device, s.grading_pipeline_layout, nullptr);
+        if (s.grading_descriptor_pool != VK_NULL_HANDLE)
+            vkDestroyDescriptorPool(s.device, s.grading_descriptor_pool, nullptr);
+        if (s.grading_descriptor_layout != VK_NULL_HANDLE)
+            vkDestroyDescriptorSetLayout(s.device, s.grading_descriptor_layout, nullptr);
+        if (s.grading_sampler != VK_NULL_HANDLE)
+            vkDestroySampler(s.device, s.grading_sampler, nullptr);
+        if (s.grading_vertex_shader != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.grading_vertex_shader, nullptr);
+        if (s.grading_fragment_shader != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.grading_fragment_shader, nullptr);
+        if (s.grading_framebuffer != VK_NULL_HANDLE)
+            vkDestroyFramebuffer(s.device, s.grading_framebuffer, nullptr);
+        if (s.grading_render_pass != VK_NULL_HANDLE)
+            vkDestroyRenderPass(s.device, s.grading_render_pass, nullptr);
+        if (s.grading_view != VK_NULL_HANDLE) vkDestroyImageView(s.device, s.grading_view, nullptr);
+        if (s.grading_image != VK_NULL_HANDLE) vkDestroyImage(s.device, s.grading_image, nullptr);
+        if (s.grading_memory != VK_NULL_HANDLE) vkFreeMemory(s.device, s.grading_memory, nullptr);
         if (s.framebuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(s.device, s.framebuffer, nullptr);
         if (s.render_pass != VK_NULL_HANDLE) vkDestroyRenderPass(s.device, s.render_pass, nullptr);
         if (s.color_view != VK_NULL_HANDLE) vkDestroyImageView(s.device, s.color_view, nullptr);
@@ -1101,6 +1361,8 @@ void destroy_backend(VulkanGeState &s) noexcept {
             vkDestroyShaderModule(s.device, s.hw_vertex_shader, nullptr);
         if (s.hw_packed_vertex_shader != VK_NULL_HANDLE)
             vkDestroyShaderModule(s.device, s.hw_packed_vertex_shader, nullptr);
+        if (s.timestamp_pool != VK_NULL_HANDLE)
+            vkDestroyQueryPool(s.device, s.timestamp_pool, nullptr);
         if (s.fence != VK_NULL_HANDLE) vkDestroyFence(s.device, s.fence, nullptr);
         if (s.command_pool != VK_NULL_HANDLE)
             vkDestroyCommandPool(s.device, s.command_pool, nullptr);
@@ -1145,6 +1407,23 @@ void destroy_backend(VulkanGeState &s) noexcept {
         instance_flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     }
 #endif
+    // Step 1 of the native-swapchain present-path migration (see the scoping
+    // plan): add the surface extensions only, nothing else changes yet. This
+    // backend still only ever renders offscreen (create_backend never calls
+    // vkCreateSwapchainKHR) -- these two lines exist so later steps can
+    // create a VkSurfaceKHR without a second instance-creation pass. Missing
+    // support (an older MoltenVK) must not fail the whole instance, so both
+    // are added conditionally, exactly like the portability extension above.
+    bool surface_extensions_supported = false;
+#if defined(VK_KHR_SURFACE_EXTENSION_NAME) && defined(VK_EXT_METAL_SURFACE_EXTENSION_NAME)
+    if (instance_extension_supported(VK_KHR_SURFACE_EXTENSION_NAME) &&
+        instance_extension_supported(VK_EXT_METAL_SURFACE_EXTENSION_NAME)) {
+        instance_extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        instance_extensions.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+        surface_extensions_supported = true;
+    }
+#endif
+    (void)surface_extensions_supported;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app_info;
     instance_info.enabledExtensionCount = static_cast<std::uint32_t>(instance_extensions.size());
@@ -1197,6 +1476,20 @@ void destroy_backend(VulkanGeState &s) noexcept {
     if (device_extension_supported(s.physical_device, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME))
         device_extensions.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
 #endif
+    // VK_KHR_swapchain is a DEVICE extension (separate from the VK_KHR_surface/
+    // VK_EXT_metal_surface INSTANCE extensions added earlier for the native-
+    // swapchain present-path migration) -- without this, vkCreateSwapchainKHR
+    // silently "succeeds" through a null driver function pointer (confirmed
+    // live: the Vulkan loader logs "Driver's function pointer was NULL,
+    // returning VK_SUCCESS" and the process then crashes the first time any
+    // real swapchain function is actually called). Requested unconditionally
+    // when supported; harmless for the default offscreen-only path since
+    // nothing else in this backend ever references it unless
+    // PSPRECOMP_VULKAN_SWAPCHAIN=1 also set the native window.
+    if (surface_extensions_supported &&
+        device_extension_supported(s.physical_device, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+        device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    }
     // Rendering.AnisotropicFiltering was confirmed a silent no-op previously:
     // every sampler hardcoded maxAnisotropy=1.0f and this device was never
     // asked to enable the feature at all, so even setting anisotropyEnable
@@ -1249,6 +1542,33 @@ void destroy_backend(VulkanGeState &s) noexcept {
         return false;
     }
 
+    // Optional: GPU timestamp queries for PSPRECOMP_GE_GPU_TIMESTAMP_DIAG.
+    // Not every Vulkan implementation (or queue family) supports timestamps;
+    // failing to set this up must not fail the whole backend, it just leaves
+    // s.timestamps_supported false and that diagnostic prints nothing.
+    {
+        VkPhysicalDeviceProperties device_properties{};
+        vkGetPhysicalDeviceProperties(s.physical_device, &device_properties);
+        std::uint32_t queue_family_count = 0u;
+        vkGetPhysicalDeviceQueueFamilyProperties(s.physical_device, &queue_family_count, nullptr);
+        std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
+        vkGetPhysicalDeviceQueueFamilyProperties(s.physical_device, &queue_family_count,
+                                                 queue_families.data());
+        const bool family_supports_timestamps =
+            s.graphics_queue_family < queue_families.size() &&
+            queue_families[s.graphics_queue_family].timestampValidBits > 0u;
+        if (device_properties.limits.timestampComputeAndGraphics && family_supports_timestamps) {
+            VkQueryPoolCreateInfo query_pool_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            query_pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            query_pool_info.queryCount = 2u;
+            if (vkCreateQueryPool(s.device, &query_pool_info, nullptr, &s.timestamp_pool) ==
+                VK_SUCCESS) {
+                s.timestamps_supported = true;
+                s.timestamp_period_ns = device_properties.limits.timestampPeriod;
+            }
+        }
+    }
+
     // --- Render target ----------------------------------------------------
     s.width = environment_dimension("PSPRECOMP_INTERNAL_WIDTH", 480u);
     s.height = environment_dimension("PSPRECOMP_INTERNAL_HEIGHT", 272u);
@@ -1257,7 +1577,22 @@ void destroy_backend(VulkanGeState &s) noexcept {
 
     const auto create_attachment = [&](VkFormat format, VkImageUsageFlags usage,
                                        VkImageAspectFlags aspect, VkImage &image,
-                                       VkDeviceMemory &memory, VkImageView &view) -> bool {
+                                       VkDeviceMemory &memory, VkImageView &view,
+                                       bool prefer_transient = false) -> bool {
+        // prefer_transient: for an attachment this backend never samples,
+        // copies, or reads back (the depth buffer below -- confirmed no
+        // other code in this file references s.depth_view except as a
+        // render-pass attachment), Apple's tile-based GPU can keep the data
+        // entirely in on-chip tile memory and never write it to system
+        // memory at all if the image is marked TRANSIENT_ATTACHMENT and
+        // allocated from a LAZILY_ALLOCATED memory type (MoltenVK maps this
+        // to Metal's memoryless storage mode on Apple Silicon). Real
+        // bandwidth saved, not just a hint -- but not every Vulkan
+        // implementation exposes a lazily-allocated memory type, so this
+        // always has a normal device-local fallback and is never load-
+        // bearing for correctness.
+        VkImageUsageFlags final_usage = usage;
+        if (prefer_transient) final_usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
         VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         image_info.imageType = VK_IMAGE_TYPE_2D;
         image_info.format = format;
@@ -1266,15 +1601,33 @@ void destroy_backend(VulkanGeState &s) noexcept {
         image_info.arrayLayers = 1u;
         image_info.samples = VK_SAMPLE_COUNT_1_BIT;
         image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-        image_info.usage = usage;
+        image_info.usage = final_usage;
         image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (vkCreateImage(s.device, &image_info, nullptr, &image) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vkGetImageMemoryRequirements(s.device, image, &requirements);
         std::uint32_t type_index = 0u;
-        if (!find_memory_type(s.physical_device, requirements.memoryTypeBits,
-                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, type_index))
+        bool found_type = false;
+        if (prefer_transient) {
+            found_type = find_memory_type(
+                s.physical_device, requirements.memoryTypeBits,
+                VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                type_index);
+        }
+        if (!found_type &&
+            !find_memory_type(s.physical_device, requirements.memoryTypeBits,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, type_index)) {
             return false;
+        }
+        if (prefer_transient) {
+            VkPhysicalDeviceMemoryProperties memory_properties{};
+            vkGetPhysicalDeviceMemoryProperties(s.physical_device, &memory_properties);
+            const bool actually_lazy =
+                (memory_properties.memoryTypes[type_index].propertyFlags &
+                 VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) != 0u;
+            std::fprintf(stderr, "[transient-attachment] lazily_allocated=%s\n",
+                        actually_lazy ? "yes" : "no (device fallback to device-local)");
+        }
         VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocate.allocationSize = requirements.size;
         allocate.memoryTypeIndex = type_index;
@@ -1291,7 +1644,8 @@ void destroy_backend(VulkanGeState &s) noexcept {
     };
 
     if (!create_attachment(kColorFormat,
-                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                               VK_IMAGE_USAGE_SAMPLED_BIT,
                            VK_IMAGE_ASPECT_COLOR_BIT, s.color_image, s.color_memory,
                            s.color_view)) {
         error = "failed to create the color render target";
@@ -1305,7 +1659,7 @@ void destroy_backend(VulkanGeState &s) noexcept {
         select_depth_format(s.physical_device, vcs_configuration().rendering.depth_precision);
     if (!create_attachment(depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                            VK_IMAGE_ASPECT_DEPTH_BIT, s.depth_image, s.depth_memory,
-                           s.depth_view)) {
+                           s.depth_view, /*prefer_transient=*/true)) {
         error = "failed to create the depth attachment";
         return false;
     }
@@ -1530,6 +1884,700 @@ void destroy_backend(VulkanGeState &s) noexcept {
     s.report.transfer_buffer_created = true;
     s.report.transfer_memory_mapped = true;
 
+    // --- Experimental bloom (see [SimulateHDR] in the .ini) ----------------
+    // Off by default; failing to set any of this up must not fail the whole
+    // backend -- it just leaves s.bloom_enabled false, same as if the .ini
+    // had it disabled.
+    s.bloom_enabled = false;
+    const VcsConfiguration &bloom_config = vcs_configuration();
+    if (bloom_config.initialized && bloom_config.bloom.enabled) {
+        bool bloom_ok = true;
+        if (!create_attachment(kColorFormat,
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, s.bloom_image, s.bloom_memory,
+                               s.bloom_view)) {
+            bloom_ok = false;
+        }
+
+        if (bloom_ok) {
+            VkAttachmentDescription bloom_attachment{};
+            bloom_attachment.format = kColorFormat;
+            bloom_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+            bloom_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            bloom_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            bloom_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            bloom_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            bloom_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            bloom_attachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            VkAttachmentReference bloom_color_ref{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+            VkSubpassDescription bloom_subpass{};
+            bloom_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            bloom_subpass.colorAttachmentCount = 1u;
+            bloom_subpass.pColorAttachments = &bloom_color_ref;
+            VkRenderPassCreateInfo bloom_render_pass_info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+            bloom_render_pass_info.attachmentCount = 1u;
+            bloom_render_pass_info.pAttachments = &bloom_attachment;
+            bloom_render_pass_info.subpassCount = 1u;
+            bloom_render_pass_info.pSubpasses = &bloom_subpass;
+            if (vkCreateRenderPass(s.device, &bloom_render_pass_info, nullptr,
+                                   &s.bloom_render_pass) != VK_SUCCESS) {
+                bloom_ok = false;
+            }
+        }
+
+        if (bloom_ok) {
+            VkFramebufferCreateInfo bloom_framebuffer_info{
+                VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            bloom_framebuffer_info.renderPass = s.bloom_render_pass;
+            bloom_framebuffer_info.attachmentCount = 1u;
+            bloom_framebuffer_info.pAttachments = &s.bloom_view;
+            bloom_framebuffer_info.width = s.width;
+            bloom_framebuffer_info.height = s.height;
+            bloom_framebuffer_info.layers = 1u;
+            if (vkCreateFramebuffer(s.device, &bloom_framebuffer_info, nullptr,
+                                    &s.bloom_framebuffer) != VK_SUCCESS) {
+                bloom_ok = false;
+            }
+        }
+
+        if (bloom_ok && (!create_shader_module(s, kBloomVertSpv, sizeof(kBloomVertSpv),
+                                               s.bloom_vertex_shader) ||
+                        !create_shader_module(s, kBloomFragSpv, sizeof(kBloomFragSpv),
+                                              s.bloom_fragment_shader))) {
+            bloom_ok = false;
+        }
+
+        // Dedicated sampler/descriptor layout/pool/set, separate from the
+        // per-texture ones above -- this samples a fixed image (s.color_view)
+        // for the life of the backend, never evicted/reallocated, so it does
+        // not need to share their eviction-capable pool.
+        if (bloom_ok) {
+            VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            sampler_info.magFilter = VK_FILTER_LINEAR;
+            sampler_info.minFilter = VK_FILTER_LINEAR;
+            sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            sampler_info.maxAnisotropy = 1.0f;
+            sampler_info.maxLod = 0.0f;
+            if (vkCreateSampler(s.device, &sampler_info, nullptr, &s.bloom_sampler) != VK_SUCCESS)
+                bloom_ok = false;
+        }
+
+        if (bloom_ok) {
+            VkDescriptorSetLayoutBinding bloom_binding{};
+            bloom_binding.binding = 0u;
+            bloom_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bloom_binding.descriptorCount = 1u;
+            bloom_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo bloom_layout_info{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            bloom_layout_info.bindingCount = 1u;
+            bloom_layout_info.pBindings = &bloom_binding;
+            if (vkCreateDescriptorSetLayout(s.device, &bloom_layout_info, nullptr,
+                                            &s.bloom_descriptor_layout) != VK_SUCCESS) {
+                bloom_ok = false;
+            }
+        }
+
+        if (bloom_ok) {
+            const VkDescriptorPoolSize bloom_pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                       1u};
+            VkDescriptorPoolCreateInfo bloom_pool_info{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            bloom_pool_info.maxSets = 1u;
+            bloom_pool_info.poolSizeCount = 1u;
+            bloom_pool_info.pPoolSizes = &bloom_pool_size;
+            if (vkCreateDescriptorPool(s.device, &bloom_pool_info, nullptr,
+                                       &s.bloom_descriptor_pool) != VK_SUCCESS) {
+                bloom_ok = false;
+            }
+        }
+
+        if (bloom_ok) {
+            VkDescriptorSetAllocateInfo bloom_allocate{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            bloom_allocate.descriptorPool = s.bloom_descriptor_pool;
+            bloom_allocate.descriptorSetCount = 1u;
+            bloom_allocate.pSetLayouts = &s.bloom_descriptor_layout;
+            if (vkAllocateDescriptorSets(s.device, &bloom_allocate, &s.bloom_descriptor_set) !=
+                VK_SUCCESS) {
+                bloom_ok = false;
+            } else {
+                // s.color_view never changes address for the life of the
+                // backend (only recreated on a full resize teardown, which
+                // also tears this down), so this descriptor is written once,
+                // not refreshed per frame.
+                VkDescriptorImageInfo bloom_image_info{};
+                bloom_image_info.sampler = s.bloom_sampler;
+                bloom_image_info.imageView = s.color_view;
+                bloom_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                VkWriteDescriptorSet bloom_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                bloom_write.dstSet = s.bloom_descriptor_set;
+                bloom_write.descriptorCount = 1u;
+                bloom_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                bloom_write.pImageInfo = &bloom_image_info;
+                vkUpdateDescriptorSets(s.device, 1, &bloom_write, 0, nullptr);
+            }
+        }
+
+        if (bloom_ok) {
+            VkPushConstantRange bloom_push_range{};
+            bloom_push_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            bloom_push_range.size = sizeof(BloomPushConstants);
+            VkPipelineLayoutCreateInfo bloom_pipeline_layout_info{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            bloom_pipeline_layout_info.setLayoutCount = 1u;
+            bloom_pipeline_layout_info.pSetLayouts = &s.bloom_descriptor_layout;
+            bloom_pipeline_layout_info.pushConstantRangeCount = 1u;
+            bloom_pipeline_layout_info.pPushConstantRanges = &bloom_push_range;
+            if (vkCreatePipelineLayout(s.device, &bloom_pipeline_layout_info, nullptr,
+                                       &s.bloom_pipeline_layout) != VK_SUCCESS) {
+                bloom_ok = false;
+            }
+        }
+
+        if (bloom_ok) {
+            std::array<VkPipelineShaderStageCreateInfo, 2> bloom_stages{};
+            bloom_stages[0] = VkPipelineShaderStageCreateInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            bloom_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            bloom_stages[0].module = s.bloom_vertex_shader;
+            bloom_stages[0].pName = "main";
+            bloom_stages[1] = VkPipelineShaderStageCreateInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            bloom_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            bloom_stages[1].module = s.bloom_fragment_shader;
+            bloom_stages[1].pName = "main";
+
+            // No vertex buffer: shaders/bloom.vert derives all 3 vertices of
+            // a fullscreen triangle from gl_VertexIndex alone.
+            VkPipelineVertexInputStateCreateInfo bloom_vertex_input{
+                VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+
+            VkPipelineInputAssemblyStateCreateInfo bloom_input_assembly{
+                VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            bloom_input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+            VkPipelineViewportStateCreateInfo bloom_viewport_state{
+                VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+            bloom_viewport_state.viewportCount = 1u;
+            bloom_viewport_state.scissorCount = 1u;
+
+            VkPipelineRasterizationStateCreateInfo bloom_rasterization{
+                VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            bloom_rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+            bloom_rasterization.cullMode = VK_CULL_MODE_NONE;
+            bloom_rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            bloom_rasterization.lineWidth = 1.0f;
+
+            VkPipelineMultisampleStateCreateInfo bloom_multisample{
+                VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            bloom_multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+            VkPipelineDepthStencilStateCreateInfo bloom_depth_stencil{
+                VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+
+            VkPipelineColorBlendAttachmentState bloom_blend{};
+            bloom_blend.colorWriteMask =
+                VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo bloom_color_blend{
+                VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            bloom_color_blend.attachmentCount = 1u;
+            bloom_color_blend.pAttachments = &bloom_blend;
+
+            const std::array<VkDynamicState, 2> bloom_dynamic_states{
+                VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo bloom_dynamic{
+                VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            bloom_dynamic.dynamicStateCount =
+                static_cast<std::uint32_t>(bloom_dynamic_states.size());
+            bloom_dynamic.pDynamicStates = bloom_dynamic_states.data();
+
+            VkGraphicsPipelineCreateInfo bloom_info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            bloom_info.stageCount = static_cast<std::uint32_t>(bloom_stages.size());
+            bloom_info.pStages = bloom_stages.data();
+            bloom_info.pVertexInputState = &bloom_vertex_input;
+            bloom_info.pInputAssemblyState = &bloom_input_assembly;
+            bloom_info.pViewportState = &bloom_viewport_state;
+            bloom_info.pRasterizationState = &bloom_rasterization;
+            bloom_info.pMultisampleState = &bloom_multisample;
+            bloom_info.pDepthStencilState = &bloom_depth_stencil;
+            bloom_info.pColorBlendState = &bloom_color_blend;
+            bloom_info.pDynamicState = &bloom_dynamic;
+            bloom_info.layout = s.bloom_pipeline_layout;
+            bloom_info.renderPass = s.bloom_render_pass;
+            bloom_info.subpass = 0u;
+            if (vkCreateGraphicsPipelines(s.device, VK_NULL_HANDLE, 1, &bloom_info, nullptr,
+                                          &s.bloom_pipeline) != VK_SUCCESS) {
+                bloom_ok = false;
+            }
+        }
+
+        if (bloom_ok &&
+            !create_buffer(s, readback_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                           s.bloom_readback_buffer, s.bloom_readback_memory)) {
+            bloom_ok = false;
+        }
+        if (bloom_ok) s.bloom_readback_capacity = readback_bytes;
+
+        s.bloom_enabled = bloom_ok;
+        s.bloom_threshold = bloom_config.bloom.threshold;
+        s.bloom_intensity = bloom_config.bloom.intensity;
+        std::fprintf(stderr, "[bloom] setup %s threshold=%.2f intensity=%.2f\n",
+                    bloom_ok ? "OK" : "FAILED (feature left disabled)", s.bloom_threshold,
+                    s.bloom_intensity);
+    }
+
+    // --- FXAA (Rendering.SMAA/AntiAliasing) ---------------------------------
+    s.fxaa_enabled = false;
+    if (bloom_config.initialized && bloom_config.rendering.smaa) {
+        bool fxaa_ok = true;
+        if (!create_attachment(kColorFormat,
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, s.fxaa_image, s.fxaa_memory,
+                               s.fxaa_view)) {
+            fxaa_ok = false;
+        }
+        if (fxaa_ok) {
+            VkAttachmentDescription fxaa_attachment{};
+            fxaa_attachment.format = kColorFormat;
+            fxaa_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+            fxaa_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            fxaa_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            fxaa_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            fxaa_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            fxaa_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            fxaa_attachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            VkAttachmentReference fxaa_color_ref{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+            VkSubpassDescription fxaa_subpass{};
+            fxaa_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            fxaa_subpass.colorAttachmentCount = 1u;
+            fxaa_subpass.pColorAttachments = &fxaa_color_ref;
+            VkRenderPassCreateInfo fxaa_render_pass_info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+            fxaa_render_pass_info.attachmentCount = 1u;
+            fxaa_render_pass_info.pAttachments = &fxaa_attachment;
+            fxaa_render_pass_info.subpassCount = 1u;
+            fxaa_render_pass_info.pSubpasses = &fxaa_subpass;
+            if (vkCreateRenderPass(s.device, &fxaa_render_pass_info, nullptr,
+                                   &s.fxaa_render_pass) != VK_SUCCESS) {
+                fxaa_ok = false;
+            }
+        }
+        if (fxaa_ok) {
+            VkFramebufferCreateInfo fxaa_framebuffer_info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fxaa_framebuffer_info.renderPass = s.fxaa_render_pass;
+            fxaa_framebuffer_info.attachmentCount = 1u;
+            fxaa_framebuffer_info.pAttachments = &s.fxaa_view;
+            fxaa_framebuffer_info.width = s.width;
+            fxaa_framebuffer_info.height = s.height;
+            fxaa_framebuffer_info.layers = 1u;
+            if (vkCreateFramebuffer(s.device, &fxaa_framebuffer_info, nullptr,
+                                    &s.fxaa_framebuffer) != VK_SUCCESS) {
+                fxaa_ok = false;
+            }
+        }
+        if (fxaa_ok && (!create_shader_module(s, kBloomVertSpv, sizeof(kBloomVertSpv),
+                                              s.fxaa_vertex_shader) ||
+                       !create_shader_module(s, kFxaaFragSpv, sizeof(kFxaaFragSpv),
+                                             s.fxaa_fragment_shader))) {
+            fxaa_ok = false;
+        }
+        if (fxaa_ok) {
+            VkSamplerCreateInfo fxaa_sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            fxaa_sampler_info.magFilter = VK_FILTER_LINEAR;
+            fxaa_sampler_info.minFilter = VK_FILTER_LINEAR;
+            fxaa_sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            fxaa_sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            fxaa_sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            fxaa_sampler_info.maxAnisotropy = 1.0f;
+            if (vkCreateSampler(s.device, &fxaa_sampler_info, nullptr, &s.fxaa_sampler) !=
+                VK_SUCCESS) {
+                fxaa_ok = false;
+            }
+        }
+        if (fxaa_ok) {
+            VkDescriptorSetLayoutBinding fxaa_binding{};
+            fxaa_binding.binding = 0u;
+            fxaa_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            fxaa_binding.descriptorCount = 1u;
+            fxaa_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo fxaa_layout_info{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            fxaa_layout_info.bindingCount = 1u;
+            fxaa_layout_info.pBindings = &fxaa_binding;
+            if (vkCreateDescriptorSetLayout(s.device, &fxaa_layout_info, nullptr,
+                                            &s.fxaa_descriptor_layout) != VK_SUCCESS) {
+                fxaa_ok = false;
+            }
+        }
+        if (fxaa_ok) {
+            const VkDescriptorPoolSize fxaa_pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                      1u};
+            VkDescriptorPoolCreateInfo fxaa_pool_info{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            fxaa_pool_info.maxSets = 1u;
+            fxaa_pool_info.poolSizeCount = 1u;
+            fxaa_pool_info.pPoolSizes = &fxaa_pool_size;
+            if (vkCreateDescriptorPool(s.device, &fxaa_pool_info, nullptr,
+                                       &s.fxaa_descriptor_pool) != VK_SUCCESS) {
+                fxaa_ok = false;
+            }
+        }
+        if (fxaa_ok) {
+            VkDescriptorSetAllocateInfo fxaa_allocate{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            fxaa_allocate.descriptorPool = s.fxaa_descriptor_pool;
+            fxaa_allocate.descriptorSetCount = 1u;
+            fxaa_allocate.pSetLayouts = &s.fxaa_descriptor_layout;
+            if (vkAllocateDescriptorSets(s.device, &fxaa_allocate, &s.fxaa_descriptor_set) !=
+                VK_SUCCESS) {
+                fxaa_ok = false;
+            } else {
+                VkDescriptorImageInfo fxaa_image_info{};
+                fxaa_image_info.sampler = s.fxaa_sampler;
+                fxaa_image_info.imageView = s.color_view;
+                fxaa_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                VkWriteDescriptorSet fxaa_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                fxaa_write.dstSet = s.fxaa_descriptor_set;
+                fxaa_write.descriptorCount = 1u;
+                fxaa_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                fxaa_write.pImageInfo = &fxaa_image_info;
+                vkUpdateDescriptorSets(s.device, 1, &fxaa_write, 0, nullptr);
+            }
+        }
+        if (fxaa_ok) {
+            VkPushConstantRange fxaa_push_range{};
+            fxaa_push_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            fxaa_push_range.size = sizeof(FxaaPushConstants);
+            VkPipelineLayoutCreateInfo fxaa_pipeline_layout_info{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            fxaa_pipeline_layout_info.setLayoutCount = 1u;
+            fxaa_pipeline_layout_info.pSetLayouts = &s.fxaa_descriptor_layout;
+            fxaa_pipeline_layout_info.pushConstantRangeCount = 1u;
+            fxaa_pipeline_layout_info.pPushConstantRanges = &fxaa_push_range;
+            if (vkCreatePipelineLayout(s.device, &fxaa_pipeline_layout_info, nullptr,
+                                       &s.fxaa_pipeline_layout) != VK_SUCCESS) {
+                fxaa_ok = false;
+            }
+        }
+        if (fxaa_ok) {
+            std::array<VkPipelineShaderStageCreateInfo, 2> fxaa_stages{};
+            fxaa_stages[0] = VkPipelineShaderStageCreateInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            fxaa_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            fxaa_stages[0].module = s.fxaa_vertex_shader;
+            fxaa_stages[0].pName = "main";
+            fxaa_stages[1] = VkPipelineShaderStageCreateInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            fxaa_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            fxaa_stages[1].module = s.fxaa_fragment_shader;
+            fxaa_stages[1].pName = "main";
+
+            VkPipelineVertexInputStateCreateInfo fxaa_vertex_input{
+                VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            VkPipelineInputAssemblyStateCreateInfo fxaa_input_assembly{
+                VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            fxaa_input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            VkPipelineViewportStateCreateInfo fxaa_viewport_state{
+                VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+            fxaa_viewport_state.viewportCount = 1u;
+            fxaa_viewport_state.scissorCount = 1u;
+            VkPipelineRasterizationStateCreateInfo fxaa_rasterization{
+                VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            fxaa_rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+            fxaa_rasterization.cullMode = VK_CULL_MODE_NONE;
+            fxaa_rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            fxaa_rasterization.lineWidth = 1.0f;
+            VkPipelineMultisampleStateCreateInfo fxaa_multisample{
+                VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            fxaa_multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineDepthStencilStateCreateInfo fxaa_depth_stencil{
+                VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+            VkPipelineColorBlendAttachmentState fxaa_blend{};
+            fxaa_blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo fxaa_color_blend{
+                VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            fxaa_color_blend.attachmentCount = 1u;
+            fxaa_color_blend.pAttachments = &fxaa_blend;
+            const std::array<VkDynamicState, 2> fxaa_dynamic_states{
+                VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo fxaa_dynamic{
+                VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            fxaa_dynamic.dynamicStateCount =
+                static_cast<std::uint32_t>(fxaa_dynamic_states.size());
+            fxaa_dynamic.pDynamicStates = fxaa_dynamic_states.data();
+
+            VkGraphicsPipelineCreateInfo fxaa_info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            fxaa_info.stageCount = static_cast<std::uint32_t>(fxaa_stages.size());
+            fxaa_info.pStages = fxaa_stages.data();
+            fxaa_info.pVertexInputState = &fxaa_vertex_input;
+            fxaa_info.pInputAssemblyState = &fxaa_input_assembly;
+            fxaa_info.pViewportState = &fxaa_viewport_state;
+            fxaa_info.pRasterizationState = &fxaa_rasterization;
+            fxaa_info.pMultisampleState = &fxaa_multisample;
+            fxaa_info.pDepthStencilState = &fxaa_depth_stencil;
+            fxaa_info.pColorBlendState = &fxaa_color_blend;
+            fxaa_info.pDynamicState = &fxaa_dynamic;
+            fxaa_info.layout = s.fxaa_pipeline_layout;
+            fxaa_info.renderPass = s.fxaa_render_pass;
+            fxaa_info.subpass = 0u;
+            if (vkCreateGraphicsPipelines(s.device, VK_NULL_HANDLE, 1, &fxaa_info, nullptr,
+                                          &s.fxaa_pipeline) != VK_SUCCESS) {
+                fxaa_ok = false;
+            }
+        }
+        s.fxaa_enabled = fxaa_ok;
+        std::fprintf(stderr, "[fxaa] setup %s\n", fxaa_ok ? "OK" : "FAILED (feature left disabled)");
+    }
+
+    // --- Color grading ([ColorGrading]) -------------------------------------
+    s.color_grading_enabled = false;
+    // Sharpen shares this same pass/shader with color grading (see
+    // shaders/color_grade.frag) -- either one alone is enough to create it,
+    // and each applies independently of whether the other is on (grading
+    // params fall back to identity below when ColorGrading.Enabled is
+    // false, so a sharpen-only setup doesn't also apply the neon grade).
+    if (bloom_config.initialized &&
+        (bloom_config.color_grading.enabled || bloom_config.rendering.sharpen > 0.0f)) {
+        bool grading_ok = true;
+        if (!create_attachment(kColorFormat,
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, s.grading_image, s.grading_memory,
+                               s.grading_view)) {
+            grading_ok = false;
+        }
+        if (grading_ok) {
+            VkAttachmentDescription grading_attachment{};
+            grading_attachment.format = kColorFormat;
+            grading_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+            grading_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            grading_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            grading_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            grading_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            grading_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            grading_attachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            VkAttachmentReference grading_color_ref{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+            VkSubpassDescription grading_subpass{};
+            grading_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            grading_subpass.colorAttachmentCount = 1u;
+            grading_subpass.pColorAttachments = &grading_color_ref;
+            VkRenderPassCreateInfo grading_render_pass_info{
+                VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+            grading_render_pass_info.attachmentCount = 1u;
+            grading_render_pass_info.pAttachments = &grading_attachment;
+            grading_render_pass_info.subpassCount = 1u;
+            grading_render_pass_info.pSubpasses = &grading_subpass;
+            if (vkCreateRenderPass(s.device, &grading_render_pass_info, nullptr,
+                                   &s.grading_render_pass) != VK_SUCCESS) {
+                grading_ok = false;
+            }
+        }
+        if (grading_ok) {
+            VkFramebufferCreateInfo grading_framebuffer_info{
+                VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            grading_framebuffer_info.renderPass = s.grading_render_pass;
+            grading_framebuffer_info.attachmentCount = 1u;
+            grading_framebuffer_info.pAttachments = &s.grading_view;
+            grading_framebuffer_info.width = s.width;
+            grading_framebuffer_info.height = s.height;
+            grading_framebuffer_info.layers = 1u;
+            if (vkCreateFramebuffer(s.device, &grading_framebuffer_info, nullptr,
+                                    &s.grading_framebuffer) != VK_SUCCESS) {
+                grading_ok = false;
+            }
+        }
+        if (grading_ok && (!create_shader_module(s, kBloomVertSpv, sizeof(kBloomVertSpv),
+                                                 s.grading_vertex_shader) ||
+                          !create_shader_module(s, kColorGradeFragSpv, sizeof(kColorGradeFragSpv),
+                                                s.grading_fragment_shader))) {
+            grading_ok = false;
+        }
+        if (grading_ok) {
+            VkSamplerCreateInfo grading_sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            grading_sampler_info.magFilter = VK_FILTER_LINEAR;
+            grading_sampler_info.minFilter = VK_FILTER_LINEAR;
+            grading_sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            grading_sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            grading_sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            grading_sampler_info.maxAnisotropy = 1.0f;
+            if (vkCreateSampler(s.device, &grading_sampler_info, nullptr, &s.grading_sampler) !=
+                VK_SUCCESS) {
+                grading_ok = false;
+            }
+        }
+        if (grading_ok) {
+            VkDescriptorSetLayoutBinding grading_binding{};
+            grading_binding.binding = 0u;
+            grading_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            grading_binding.descriptorCount = 1u;
+            grading_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo grading_layout_info{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            grading_layout_info.bindingCount = 1u;
+            grading_layout_info.pBindings = &grading_binding;
+            if (vkCreateDescriptorSetLayout(s.device, &grading_layout_info, nullptr,
+                                            &s.grading_descriptor_layout) != VK_SUCCESS) {
+                grading_ok = false;
+            }
+        }
+        if (grading_ok) {
+            const VkDescriptorPoolSize grading_pool_size{
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u};
+            VkDescriptorPoolCreateInfo grading_pool_info{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            grading_pool_info.maxSets = 1u;
+            grading_pool_info.poolSizeCount = 1u;
+            grading_pool_info.pPoolSizes = &grading_pool_size;
+            if (vkCreateDescriptorPool(s.device, &grading_pool_info, nullptr,
+                                       &s.grading_descriptor_pool) != VK_SUCCESS) {
+                grading_ok = false;
+            }
+        }
+        if (grading_ok) {
+            VkDescriptorSetAllocateInfo grading_allocate{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            grading_allocate.descriptorPool = s.grading_descriptor_pool;
+            grading_allocate.descriptorSetCount = 1u;
+            grading_allocate.pSetLayouts = &s.grading_descriptor_layout;
+            if (vkAllocateDescriptorSets(s.device, &grading_allocate, &s.grading_descriptor_set) !=
+                VK_SUCCESS) {
+                grading_ok = false;
+            } else {
+                // Reads whichever image is "current" at this stage of the
+                // pass chain -- fxaa_image if FXAA is active (grading runs
+                // after it), else color_image directly. s.fxaa_enabled is
+                // already finalized above by this point.
+                VkDescriptorImageInfo grading_image_info{};
+                grading_image_info.sampler = s.grading_sampler;
+                grading_image_info.imageView = s.fxaa_enabled ? s.fxaa_view : s.color_view;
+                grading_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                VkWriteDescriptorSet grading_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                grading_write.dstSet = s.grading_descriptor_set;
+                grading_write.descriptorCount = 1u;
+                grading_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                grading_write.pImageInfo = &grading_image_info;
+                vkUpdateDescriptorSets(s.device, 1, &grading_write, 0, nullptr);
+            }
+        }
+        if (grading_ok) {
+            VkPushConstantRange grading_push_range{};
+            grading_push_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            grading_push_range.size = sizeof(ColorGradePushConstants);
+            VkPipelineLayoutCreateInfo grading_pipeline_layout_info{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            grading_pipeline_layout_info.setLayoutCount = 1u;
+            grading_pipeline_layout_info.pSetLayouts = &s.grading_descriptor_layout;
+            grading_pipeline_layout_info.pushConstantRangeCount = 1u;
+            grading_pipeline_layout_info.pPushConstantRanges = &grading_push_range;
+            if (vkCreatePipelineLayout(s.device, &grading_pipeline_layout_info, nullptr,
+                                       &s.grading_pipeline_layout) != VK_SUCCESS) {
+                grading_ok = false;
+            }
+        }
+        if (grading_ok) {
+            std::array<VkPipelineShaderStageCreateInfo, 2> grading_stages{};
+            grading_stages[0] = VkPipelineShaderStageCreateInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            grading_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            grading_stages[0].module = s.grading_vertex_shader;
+            grading_stages[0].pName = "main";
+            grading_stages[1] = VkPipelineShaderStageCreateInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            grading_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            grading_stages[1].module = s.grading_fragment_shader;
+            grading_stages[1].pName = "main";
+
+            VkPipelineVertexInputStateCreateInfo grading_vertex_input{
+                VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            VkPipelineInputAssemblyStateCreateInfo grading_input_assembly{
+                VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            grading_input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            VkPipelineViewportStateCreateInfo grading_viewport_state{
+                VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+            grading_viewport_state.viewportCount = 1u;
+            grading_viewport_state.scissorCount = 1u;
+            VkPipelineRasterizationStateCreateInfo grading_rasterization{
+                VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            grading_rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+            grading_rasterization.cullMode = VK_CULL_MODE_NONE;
+            grading_rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            grading_rasterization.lineWidth = 1.0f;
+            VkPipelineMultisampleStateCreateInfo grading_multisample{
+                VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            grading_multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineDepthStencilStateCreateInfo grading_depth_stencil{
+                VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+            VkPipelineColorBlendAttachmentState grading_blend{};
+            grading_blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo grading_color_blend{
+                VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            grading_color_blend.attachmentCount = 1u;
+            grading_color_blend.pAttachments = &grading_blend;
+            const std::array<VkDynamicState, 2> grading_dynamic_states{
+                VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo grading_dynamic{
+                VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            grading_dynamic.dynamicStateCount =
+                static_cast<std::uint32_t>(grading_dynamic_states.size());
+            grading_dynamic.pDynamicStates = grading_dynamic_states.data();
+
+            VkGraphicsPipelineCreateInfo grading_info{
+                VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            grading_info.stageCount = static_cast<std::uint32_t>(grading_stages.size());
+            grading_info.pStages = grading_stages.data();
+            grading_info.pVertexInputState = &grading_vertex_input;
+            grading_info.pInputAssemblyState = &grading_input_assembly;
+            grading_info.pViewportState = &grading_viewport_state;
+            grading_info.pRasterizationState = &grading_rasterization;
+            grading_info.pMultisampleState = &grading_multisample;
+            grading_info.pDepthStencilState = &grading_depth_stencil;
+            grading_info.pColorBlendState = &grading_color_blend;
+            grading_info.pDynamicState = &grading_dynamic;
+            grading_info.layout = s.grading_pipeline_layout;
+            grading_info.renderPass = s.grading_render_pass;
+            grading_info.subpass = 0u;
+            if (vkCreateGraphicsPipelines(s.device, VK_NULL_HANDLE, 1, &grading_info, nullptr,
+                                          &s.grading_pipeline) != VK_SUCCESS) {
+                grading_ok = false;
+            }
+        }
+        s.color_grading_enabled = grading_ok;
+        // Grading params fall back to identity when the grade itself is
+        // off (a sharpen-only setup) -- otherwise a sharpen-only config
+        // would silently also pick up whatever's in [ColorGrading]'s
+        // saturation/contrast/tint fields even with Enabled=false.
+        if (bloom_config.color_grading.enabled) {
+            s.color_grading_saturation = bloom_config.color_grading.saturation;
+            s.color_grading_contrast = bloom_config.color_grading.contrast;
+            s.color_grading_brightness = bloom_config.color_grading.brightness;
+            s.color_grading_tint[0] = bloom_config.color_grading.tint_r;
+            s.color_grading_tint[1] = bloom_config.color_grading.tint_g;
+            s.color_grading_tint[2] = bloom_config.color_grading.tint_b;
+        } else {
+            s.color_grading_saturation = 1.0f;
+            s.color_grading_contrast = 1.0f;
+            s.color_grading_brightness = 0.0f;
+            s.color_grading_tint[0] = 1.0f;
+            s.color_grading_tint[1] = 1.0f;
+            s.color_grading_tint[2] = 1.0f;
+        }
+        s.color_grading_sharpen = bloom_config.rendering.sharpen;
+        std::fprintf(stderr,
+                    "[color-grading] setup %s grading_enabled=%d saturation=%.2f contrast=%.2f "
+                    "sharpen=%.2f\n",
+                    grading_ok ? "OK" : "FAILED (feature left disabled)",
+                    bloom_config.color_grading.enabled ? 1 : 0, s.color_grading_saturation,
+                    s.color_grading_contrast, s.color_grading_sharpen);
+    }
+
     // 1x1 white texture, bound for untextured draws so one pipeline layout and
     // one descriptor slot serve every batch.
     const std::array<std::byte, 4> white{std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
@@ -1560,6 +2608,338 @@ void destroy_backend(VulkanGeState &s) noexcept {
     s.report.frames_in_flight_capacity = 1u;
     return true;
 }
+
+#if defined(__APPLE__)
+// Native-swapchain present-path migration: builds a real VkSwapchainKHR
+// against the surface ge_gpu_backend_set_native_window() just created, plus
+// a minimal fullscreen-triangle blit pipeline that samples the already-
+// rendered s.color_image and writes it straight into the acquired swapchain
+// image -- replacing every CPU copy the existing readback/SDL path does
+// (GPU->readback buffer, readback->swizzle buffer, swizzle->SDL texture)
+// with a single GPU-side sample. Only ever called once per process (no
+// resize/recreate handling yet -- a real limitation, not an oversight: this
+// is still the experimental, opt-in (PSPRECOMP_VULKAN_SWAPCHAIN=1) path).
+[[nodiscard]] bool create_present_swapchain(VulkanGeState &s, VkSurfaceKHR surface,
+                                            std::string &error) {
+    VkSurfaceCapabilitiesKHR capabilities{};
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s.physical_device, surface, &capabilities);
+
+    std::uint32_t format_count = 0u;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(s.physical_device, surface, &format_count, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(format_count);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(s.physical_device, surface, &format_count, formats.data());
+    VkSurfaceFormatKHR chosen_format = formats.empty()
+        ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}
+        : formats.front();
+    for (const VkSurfaceFormatKHR &candidate : formats) {
+        if (candidate.format == kColorFormat) {
+            chosen_format = candidate;
+            break;
+        }
+    }
+
+    std::uint32_t present_mode_count = 0u;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(s.physical_device, surface, &present_mode_count,
+                                              nullptr);
+    std::vector<VkPresentModeKHR> present_modes(present_mode_count);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(s.physical_device, surface, &present_mode_count,
+                                              present_modes.data());
+    // FIFO is the one present mode every Vulkan implementation must support
+    // and is exactly what "flawless 60fps, no tearing/stutter" wants: vsync-
+    // paced, no frame skipped or torn.
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+
+    VkExtent2D extent = capabilities.currentExtent;
+    if (extent.width == 0xFFFFFFFFu) {
+        extent.width = std::clamp(capabilities.minImageExtent.width, 1u, 16384u);
+        extent.height = std::clamp(capabilities.minImageExtent.height, 1u, 16384u);
+    }
+    s.swapchain_extent = extent;
+    s.swapchain_format = chosen_format.format;
+
+    const std::uint32_t image_count = capabilities.maxImageCount == 0u
+        ? std::max(3u, capabilities.minImageCount)
+        : std::min(std::max(3u, capabilities.minImageCount), capabilities.maxImageCount);
+
+    VkSwapchainCreateInfoKHR swapchain_info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    swapchain_info.surface = surface;
+    swapchain_info.minImageCount = image_count;
+    swapchain_info.imageFormat = chosen_format.format;
+    swapchain_info.imageColorSpace = chosen_format.colorSpace;
+    swapchain_info.imageExtent = extent;
+    swapchain_info.imageArrayLayers = 1u;
+    swapchain_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    swapchain_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    swapchain_info.preTransform = capabilities.currentTransform;
+    swapchain_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    swapchain_info.presentMode = present_mode;
+    swapchain_info.clipped = VK_TRUE;
+    if (vkCreateSwapchainKHR(s.device, &swapchain_info, nullptr, &s.swapchain) != VK_SUCCESS) {
+        error = "vkCreateSwapchainKHR failed";
+        return false;
+    }
+
+    std::uint32_t real_image_count = 0u;
+    vkGetSwapchainImagesKHR(s.device, s.swapchain, &real_image_count, nullptr);
+    s.swapchain_images.resize(real_image_count);
+    vkGetSwapchainImagesKHR(s.device, s.swapchain, &real_image_count, s.swapchain_images.data());
+
+    s.swapchain_views.resize(real_image_count);
+    for (std::uint32_t i = 0u; i < real_image_count; ++i) {
+        VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view_info.image = s.swapchain_images[i];
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = s.swapchain_format;
+        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        view_info.subresourceRange.levelCount = 1u;
+        view_info.subresourceRange.layerCount = 1u;
+        if (vkCreateImageView(s.device, &view_info, nullptr, &s.swapchain_views[i]) != VK_SUCCESS) {
+            error = "vkCreateImageView failed for a swapchain image";
+            return false;
+        }
+    }
+
+    VkAttachmentDescription present_attachment{};
+    present_attachment.format = s.swapchain_format;
+    present_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    present_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    present_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    present_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    present_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    present_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    present_attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentReference present_color_ref{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription present_subpass{};
+    present_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    present_subpass.colorAttachmentCount = 1u;
+    present_subpass.pColorAttachments = &present_color_ref;
+    VkRenderPassCreateInfo present_render_pass_info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    present_render_pass_info.attachmentCount = 1u;
+    present_render_pass_info.pAttachments = &present_attachment;
+    present_render_pass_info.subpassCount = 1u;
+    present_render_pass_info.pSubpasses = &present_subpass;
+    if (vkCreateRenderPass(s.device, &present_render_pass_info, nullptr, &s.present_render_pass) !=
+        VK_SUCCESS) {
+        error = "vkCreateRenderPass failed for the present pass";
+        return false;
+    }
+
+    s.swapchain_framebuffers.resize(real_image_count);
+    for (std::uint32_t i = 0u; i < real_image_count; ++i) {
+        VkFramebufferCreateInfo framebuffer_info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        framebuffer_info.renderPass = s.present_render_pass;
+        framebuffer_info.attachmentCount = 1u;
+        framebuffer_info.pAttachments = &s.swapchain_views[i];
+        framebuffer_info.width = extent.width;
+        framebuffer_info.height = extent.height;
+        framebuffer_info.layers = 1u;
+        if (vkCreateFramebuffer(s.device, &framebuffer_info, nullptr,
+                                &s.swapchain_framebuffers[i]) != VK_SUCCESS) {
+            error = "vkCreateFramebuffer failed for a swapchain image";
+            return false;
+        }
+    }
+
+    if (!create_shader_module(s, kBloomVertSpv, sizeof(kBloomVertSpv), s.present_vertex_shader) ||
+        !create_shader_module(s, kPresentFragSpv, sizeof(kPresentFragSpv),
+                              s.present_fragment_shader)) {
+        error = "vkCreateShaderModule failed for the present shaders";
+        return false;
+    }
+
+    VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    const bool bilinear =
+        vcs_configuration().display.upscale_filter == DisplayUpscaleFilter::Bilinear;
+    sampler_info.magFilter = bilinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    sampler_info.minFilter = sampler_info.magFilter;
+    sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.maxAnisotropy = 1.0f;
+    if (vkCreateSampler(s.device, &sampler_info, nullptr, &s.present_sampler) != VK_SUCCESS) {
+        error = "vkCreateSampler failed for the present pass";
+        return false;
+    }
+
+    VkDescriptorSetLayoutBinding present_binding{};
+    present_binding.binding = 0u;
+    present_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    present_binding.descriptorCount = 1u;
+    present_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo present_layout_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    present_layout_info.bindingCount = 1u;
+    present_layout_info.pBindings = &present_binding;
+    if (vkCreateDescriptorSetLayout(s.device, &present_layout_info, nullptr,
+                                    &s.present_descriptor_layout) != VK_SUCCESS) {
+        error = "vkCreateDescriptorSetLayout failed for the present pass";
+        return false;
+    }
+
+    const VkDescriptorPoolSize present_pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u};
+    VkDescriptorPoolCreateInfo present_pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    present_pool_info.maxSets = 1u;
+    present_pool_info.poolSizeCount = 1u;
+    present_pool_info.pPoolSizes = &present_pool_size;
+    if (vkCreateDescriptorPool(s.device, &present_pool_info, nullptr,
+                               &s.present_descriptor_pool) != VK_SUCCESS) {
+        error = "vkCreateDescriptorPool failed for the present pass";
+        return false;
+    }
+
+    VkDescriptorSetAllocateInfo present_allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    present_allocate.descriptorPool = s.present_descriptor_pool;
+    present_allocate.descriptorSetCount = 1u;
+    present_allocate.pSetLayouts = &s.present_descriptor_layout;
+    if (vkAllocateDescriptorSets(s.device, &present_allocate, &s.present_descriptor_set) !=
+        VK_SUCCESS) {
+        error = "vkAllocateDescriptorSets failed for the present pass";
+        return false;
+    }
+    // s.color_view never changes address for the life of the backend (no
+    // resize-recreate yet, matching this feature's current scope), so this
+    // descriptor is written once here, not refreshed per frame.
+    VkDescriptorImageInfo present_image_info{};
+    present_image_info.sampler = s.present_sampler;
+    // Same "current final image" selection finish_color_frame's readback
+    // copy uses -- by the time this runs (triggered from window creation,
+    // after create_backend has already finalized bloom/fxaa/grading), those
+    // flags are already known.
+    present_image_info.imageView = s.color_grading_enabled ? s.grading_view
+        : (s.fxaa_enabled ? s.fxaa_view : s.color_view);
+    present_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet present_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    present_write.dstSet = s.present_descriptor_set;
+    present_write.descriptorCount = 1u;
+    present_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    present_write.pImageInfo = &present_image_info;
+    vkUpdateDescriptorSets(s.device, 1, &present_write, 0, nullptr);
+
+    VkPipelineLayoutCreateInfo present_pipeline_layout_info{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    present_pipeline_layout_info.setLayoutCount = 1u;
+    present_pipeline_layout_info.pSetLayouts = &s.present_descriptor_layout;
+    if (vkCreatePipelineLayout(s.device, &present_pipeline_layout_info, nullptr,
+                               &s.present_pipeline_layout) != VK_SUCCESS) {
+        error = "vkCreatePipelineLayout failed for the present pass";
+        return false;
+    }
+
+    std::array<VkPipelineShaderStageCreateInfo, 2> present_stages{};
+    present_stages[0] = VkPipelineShaderStageCreateInfo{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    present_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    present_stages[0].module = s.present_vertex_shader;
+    present_stages[0].pName = "main";
+    present_stages[1] = VkPipelineShaderStageCreateInfo{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    present_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    present_stages[1].module = s.present_fragment_shader;
+    present_stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo present_vertex_input{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo present_input_assembly{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    present_input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo present_viewport_state{
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    present_viewport_state.viewportCount = 1u;
+    present_viewport_state.scissorCount = 1u;
+    VkPipelineRasterizationStateCreateInfo present_rasterization{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    present_rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+    present_rasterization.cullMode = VK_CULL_MODE_NONE;
+    present_rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    present_rasterization.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo present_multisample{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    present_multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo present_depth_stencil{
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState present_blend{};
+    present_blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo present_color_blend{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    present_color_blend.attachmentCount = 1u;
+    present_color_blend.pAttachments = &present_blend;
+    const std::array<VkDynamicState, 2> present_dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                               VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo present_dynamic{
+        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    present_dynamic.dynamicStateCount = static_cast<std::uint32_t>(present_dynamic_states.size());
+    present_dynamic.pDynamicStates = present_dynamic_states.data();
+
+    VkGraphicsPipelineCreateInfo present_pipeline_info{
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    present_pipeline_info.stageCount = static_cast<std::uint32_t>(present_stages.size());
+    present_pipeline_info.pStages = present_stages.data();
+    present_pipeline_info.pVertexInputState = &present_vertex_input;
+    present_pipeline_info.pInputAssemblyState = &present_input_assembly;
+    present_pipeline_info.pViewportState = &present_viewport_state;
+    present_pipeline_info.pRasterizationState = &present_rasterization;
+    present_pipeline_info.pMultisampleState = &present_multisample;
+    present_pipeline_info.pDepthStencilState = &present_depth_stencil;
+    present_pipeline_info.pColorBlendState = &present_color_blend;
+    present_pipeline_info.pDynamicState = &present_dynamic;
+    present_pipeline_info.layout = s.present_pipeline_layout;
+    present_pipeline_info.renderPass = s.present_render_pass;
+    present_pipeline_info.subpass = 0u;
+    if (vkCreateGraphicsPipelines(s.device, VK_NULL_HANDLE, 1, &present_pipeline_info, nullptr,
+                                  &s.present_pipeline) != VK_SUCCESS) {
+        error = "vkCreateGraphicsPipelines failed for the present pass";
+        return false;
+    }
+
+    VkCommandBufferAllocateInfo present_cmd_allocate{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    present_cmd_allocate.commandPool = s.command_pool;
+    present_cmd_allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    present_cmd_allocate.commandBufferCount = 1u;
+    if (vkAllocateCommandBuffers(s.device, &present_cmd_allocate, &s.present_command_buffer) !=
+        VK_SUCCESS) {
+        error = "vkAllocateCommandBuffers failed for the present pass";
+        return false;
+    }
+
+    VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    if (vkCreateSemaphore(s.device, &semaphore_info, nullptr, &s.present_image_acquired) !=
+            VK_SUCCESS ||
+        vkCreateSemaphore(s.device, &semaphore_info, nullptr, &s.present_render_finished) !=
+            VK_SUCCESS ||
+        vkCreateSemaphore(s.device, &semaphore_info, nullptr, &s.present_color_read_done) !=
+            VK_SUCCESS) {
+        error = "vkCreateSemaphore failed for the present pass";
+        return false;
+    }
+    VkFenceCreateInfo present_fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    present_fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    if (vkCreateFence(s.device, &present_fence_info, nullptr, &s.present_fence) != VK_SUCCESS) {
+        error = "vkCreateFence failed for the present pass";
+        return false;
+    }
+
+    // Bloom's glow composite is CPU-side only (finish_color_frame additively
+    // blends bloom_rgba into frame_rgba after the CPU readback) -- this path
+    // skips that readback entirely, so bloom would silently do nothing if
+    // left on. Force it off rather than leave a feature that quietly stops
+    // working.
+    if (s.bloom_enabled) {
+        s.bloom_enabled = false;
+        std::fprintf(stderr,
+            "[swapchain-migration] bloom disabled: its composite is CPU-side only and this path "
+            "skips the CPU readback bloom depends on\n");
+    }
+
+    std::fprintf(stderr,
+        "[swapchain-migration] real swapchain + present pipeline created: %ux%u format=%d "
+        "images=%u present_mode=FIFO upscale=%s\n",
+        extent.width, extent.height, static_cast<int>(chosen_format.format), real_image_count,
+        bilinear ? "bilinear" : "nearest");
+    return true;
+}
+#endif
 
 // Packed as R8G8B8A8_UINT and consumed by psp_ge.frag as texture_control:
 // byte0 = GE texture function (MODULATE/DECAL/BLEND/REPLACE/ADD), byte1 =
@@ -1838,6 +3218,36 @@ void ge_gpu_backend_accumulate_color_triangles(
     if (pipeline == VK_NULL_HANDLE) {
         ++s.report.rejected_gpu_draws;
         return;
+    }
+
+    // Experimental HUD-at-output-resolution feature: this counts, per frame,
+    // how many draws the classifier (gpu_draw.hud_candidate, ge_renderer.cpp)
+    // would route to a separate HUD target, versus through-mode draws it
+    // excludes as world effects, versus ordinary 3D draws -- proof the
+    // classifier fires on real, sane numbers before any pixel is actually
+    // rerouted. No rendering behavior changes here.
+    if (std::getenv("PSPRECOMP_HUD_DIAG") != nullptr) {
+        static std::uint64_t frame_marker = 0u;
+        static std::uint64_t hud_candidate_draws = 0u;
+        static std::uint64_t through_excluded_draws = 0u;
+        static std::uint64_t world_draws = 0u;
+        if (frame_marker != s.frame_epoch) {
+            if (frame_marker != 0u) {
+                std::fprintf(stderr,
+                    "[hud-diag] frame=%llu hud_candidate=%llu through_excluded=%llu world=%llu\n",
+                    static_cast<unsigned long long>(frame_marker),
+                    static_cast<unsigned long long>(hud_candidate_draws),
+                    static_cast<unsigned long long>(through_excluded_draws),
+                    static_cast<unsigned long long>(world_draws));
+            }
+            frame_marker = s.frame_epoch;
+            hud_candidate_draws = 0u;
+            through_excluded_draws = 0u;
+            world_draws = 0u;
+        }
+        if (draw.hud_candidate) ++hud_candidate_draws;
+        else if (draw.through) ++through_excluded_draws;
+        else ++world_draws;
     }
 
     if (std::getenv("PSPRECOMP_GE_GPU_DRAW_DIAG") != nullptr) {
@@ -2166,11 +3576,118 @@ bool ge_gpu_backend_accumulate_hardware_packed_0115(
     return true;
 }
 
-void ge_gpu_backend_set_native_window(void *) noexcept {}
+void ge_gpu_backend_set_native_window(void *metal_layer) noexcept {
+#if defined(__APPLE__)
+    VulkanGeState &s = state();
+    if (!s.enabled || metal_layer == nullptr) return;
+    // Default ON (see the matching comment in display_window.cpp) --
+    // PSPRECOMP_VULKAN_SWAPCHAIN=0 opts back out.
+    static const bool migration_flag = [] {
+        const char *value = std::getenv("PSPRECOMP_VULKAN_SWAPCHAIN");
+        return value == nullptr || (*value != '\0' && std::strcmp(value, "0") != 0);
+    }();
+    if (!migration_flag) return;
+    s.swapchain_migration_enabled = true;
+    if (s.diagnostic_metal_layer == metal_layer && s.diagnostic_surface != VK_NULL_HANDLE) return;
+
+    const auto create_metal_surface = reinterpret_cast<PFN_vkCreateMetalSurfaceEXT>(
+        vkGetInstanceProcAddr(s.instance, "vkCreateMetalSurfaceEXT"));
+    if (create_metal_surface == nullptr) {
+        std::fprintf(stderr,
+            "[swapchain-migration] vkCreateMetalSurfaceEXT unavailable (surface extension not "
+            "loaded) -- staying on the existing present path\n");
+        return;
+    }
+    VkMetalSurfaceCreateInfoEXT surface_info{VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT};
+    surface_info.pLayer = static_cast<const CAMetalLayer *>(metal_layer);
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    if (create_metal_surface(s.instance, &surface_info, nullptr, &surface) != VK_SUCCESS) {
+        std::fprintf(stderr,
+            "[swapchain-migration] vkCreateMetalSurfaceEXT failed -- staying on the existing "
+            "present path\n");
+        return;
+    }
+    s.diagnostic_surface = surface;
+    s.diagnostic_metal_layer = metal_layer;
+
+    VkBool32 supported = VK_FALSE;
+    vkGetPhysicalDeviceSurfaceSupportKHR(s.physical_device, s.graphics_queue_family, surface,
+                                        &supported);
+    VkSurfaceCapabilitiesKHR capabilities{};
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s.physical_device, surface, &capabilities);
+    std::uint32_t format_count = 0u;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(s.physical_device, surface, &format_count, nullptr);
+    std::uint32_t present_mode_count = 0u;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(s.physical_device, surface, &present_mode_count,
+                                              nullptr);
+    std::fprintf(stderr,
+        "[swapchain-migration] real VkSurfaceKHR created from the game window's CAMetalLayer -- "
+        "graphics_queue_supports_present=%s current_extent=%ux%u min_extent=%ux%u "
+        "max_extent=%ux%u min_image_count=%u max_image_count=%u surface_formats=%u "
+        "present_modes=%u\n",
+        supported == VK_TRUE ? "yes" : "no", capabilities.currentExtent.width,
+        capabilities.currentExtent.height, capabilities.minImageExtent.width,
+        capabilities.minImageExtent.height, capabilities.maxImageExtent.width,
+        capabilities.maxImageExtent.height, capabilities.minImageCount,
+        capabilities.maxImageCount, format_count, present_mode_count);
+
+    std::string swapchain_error;
+    if (!create_present_swapchain(s, surface, swapchain_error)) {
+        std::fprintf(stderr,
+            "[swapchain-migration] swapchain/present pipeline creation failed (%s) -- staying "
+            "on the existing present path\n",
+            swapchain_error.c_str());
+    }
+#else
+    (void)metal_layer;
+#endif
+}
 
 void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept {
     VulkanGeState &s = state();
     s.display_framebuffer = address & 0x001FFFF0u;
+}
+
+// Apple Silicon's GPU is tile-based (TBDR): unlike a desktop immediate-mode
+// GPU, a scissor-rectangle or pipeline change mid-renderpass is not free --
+// it can force extra tile-binning/visibility work, and VCS's screen-space
+// path emits well over a thousand small batches a frame, each rebinding its
+// own scissor/blend/descriptor even when several batches in a row share
+// identical state (adjacent triangles of the same textured surface, split
+// into separate PSP GE draw calls by the game itself, not by anything this
+// backend does). Batches are appended to a bucket in strict draw order and
+// their vertex ranges are always contiguous by construction (see
+// ge_gpu_backend_accumulate_color_triangles), so merging an adjacent run
+// that also shares pipeline/scissor/blend/descriptor/format into one wider
+// vkCmdDraw is lossless -- same vertices, same order, same GPU state, just
+// fewer state-change commands recorded and executed. Confirmed via
+// PSPRECOMP_GE_GPU_TIMESTAMP_DIAG that GPU execution time itself (not CPU
+// recording, which was already negligible) was the real cost driving
+// airport-area frame drops, with draw/triangle counts too modest to explain
+// it by raw fill/vertex work alone -- exactly the shape TBDR state-change
+// overhead produces.
+void coalesce_batches(std::vector<Batch> &batches, std::uint64_t &merged_away) noexcept {
+    if (batches.size() < 2u) return;
+    std::vector<Batch> merged;
+    merged.reserve(batches.size());
+    merged.push_back(batches.front());
+    for (std::size_t i = 1u; i < batches.size(); ++i) {
+        Batch &prev = merged.back();
+        const Batch &cur = batches[i];
+        const bool contiguous = prev.first_vertex + prev.vertex_count == cur.first_vertex;
+        const bool same_state =
+            prev.pipeline == cur.pipeline && prev.descriptor == cur.descriptor &&
+            prev.framebuffer_format == cur.framebuffer_format &&
+            prev.framebuffer_stride == cur.framebuffer_stride && prev.scissor == cur.scissor &&
+            prev.blend_constants == cur.blend_constants;
+        if (contiguous && same_state) {
+            prev.vertex_count += cur.vertex_count;
+            ++merged_away;
+        } else {
+            merged.push_back(cur);
+        }
+    }
+    batches.swap(merged);
 }
 
 bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
@@ -2182,6 +3699,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     // monotonically increasing per-frame counter, so it doubles as the
     // epoch directly -- no separate counter needed.
     s.frame_epoch = vblank;
+    s.swapchain_presented_this_call = false;
 
     bool produced_frame = false;
 
@@ -2198,6 +3716,123 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     if (s.submission_pending) {
         s.submission_pending = false;
         if (vkWaitForFences(s.device, 1, &s.fence, VK_TRUE, 5'000'000'000ull) == VK_SUCCESS) {
+#if defined(__APPLE__)
+            // Native-swapchain present path: color_image from the
+            // submission just fence-waited above is now guaranteed
+            // GPU-complete (same guarantee the CPU readback below relies
+            // on) -- blit it straight into the swapchain instead of the
+            // CPU readback/memcpy/swizzle/SDL-texture chain. Skips the CPU
+            // side of presentation entirely; the GPU-side copy-to-buffer in
+            // this frame's already-recorded command buffer still runs
+            // (harmless, unused bytes) rather than touch that recording
+            // path too, keeping this migration's risk surface smaller.
+            if (s.swapchain_migration_enabled && s.swapchain != VK_NULL_HANDLE) {
+                vkWaitForFences(s.device, 1, &s.present_fence, VK_TRUE, 5'000'000'000ull);
+                vkResetFences(s.device, 1, &s.present_fence);
+                std::uint32_t image_index = 0u;
+                const VkResult acquire_result = vkAcquireNextImageKHR(
+                    s.device, s.swapchain, 5'000'000'000ull, s.present_image_acquired,
+                    VK_NULL_HANDLE, &image_index);
+                if (acquire_result == VK_SUCCESS || acquire_result == VK_SUBOPTIMAL_KHR) {
+                    vkResetCommandBuffer(s.present_command_buffer, 0);
+                    VkCommandBufferBeginInfo present_begin{
+                        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                    present_begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                    if (vkBeginCommandBuffer(s.present_command_buffer, &present_begin) ==
+                        VK_SUCCESS) {
+                        // Must match the same "current final image"
+                        // finish_color_frame's readback copy and the present
+                        // descriptor (create_present_swapchain) both use.
+                        const VkImage present_source = s.color_grading_enabled
+                            ? s.grading_image
+                            : (s.fxaa_enabled ? s.fxaa_image : s.color_image);
+                        transition_image(s.present_command_buffer, present_source,
+                                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                         VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+                        VkClearValue present_clear{};
+                        present_clear.color = VkClearColorValue{{0.0f, 0.0f, 0.0f, 1.0f}};
+                        VkRenderPassBeginInfo present_render_begin{
+                            VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+                        present_render_begin.renderPass = s.present_render_pass;
+                        present_render_begin.framebuffer =
+                            s.swapchain_framebuffers[image_index];
+                        present_render_begin.renderArea.extent = s.swapchain_extent;
+                        present_render_begin.clearValueCount = 1u;
+                        present_render_begin.pClearValues = &present_clear;
+                        vkCmdBeginRenderPass(s.present_command_buffer, &present_render_begin,
+                                             VK_SUBPASS_CONTENTS_INLINE);
+                        VkViewport present_viewport{};
+                        present_viewport.width = static_cast<float>(s.swapchain_extent.width);
+                        present_viewport.height = static_cast<float>(s.swapchain_extent.height);
+                        present_viewport.maxDepth = 1.0f;
+                        vkCmdSetViewport(s.present_command_buffer, 0, 1, &present_viewport);
+                        VkRect2D present_scissor{{0, 0}, s.swapchain_extent};
+                        vkCmdSetScissor(s.present_command_buffer, 0, 1, &present_scissor);
+                        vkCmdBindPipeline(s.present_command_buffer,
+                                          VK_PIPELINE_BIND_POINT_GRAPHICS, s.present_pipeline);
+                        vkCmdBindDescriptorSets(s.present_command_buffer,
+                                                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                s.present_pipeline_layout, 0, 1,
+                                                &s.present_descriptor_set, 0, nullptr);
+                        vkCmdDraw(s.present_command_buffer, 3u, 1u, 0u, 0u);
+                        vkCmdEndRenderPass(s.present_command_buffer);
+
+                        if (vkEndCommandBuffer(s.present_command_buffer) == VK_SUCCESS) {
+                            const VkPipelineStageFlags wait_stage =
+                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                            const std::array<VkSemaphore, 2> present_signal_semaphores{
+                                s.present_render_finished, s.present_color_read_done};
+                            VkSubmitInfo present_submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                            present_submit.waitSemaphoreCount = 1u;
+                            present_submit.pWaitSemaphores = &s.present_image_acquired;
+                            present_submit.pWaitDstStageMask = &wait_stage;
+                            present_submit.commandBufferCount = 1u;
+                            present_submit.pCommandBuffers = &s.present_command_buffer;
+                            present_submit.signalSemaphoreCount =
+                                static_cast<std::uint32_t>(present_signal_semaphores.size());
+                            present_submit.pSignalSemaphores = present_signal_semaphores.data();
+                            if (vkQueueSubmit(s.graphics_queue, 1, &present_submit,
+                                              s.present_fence) == VK_SUCCESS) {
+                                VkPresentInfoKHR present_info{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+                                present_info.waitSemaphoreCount = 1u;
+                                present_info.pWaitSemaphores = &s.present_render_finished;
+                                present_info.swapchainCount = 1u;
+                                present_info.pSwapchains = &s.swapchain;
+                                present_info.pImageIndices = &image_index;
+                                vkQueuePresentKHR(s.graphics_queue, &present_info);
+                                // Step 2 below (the next frame's main render,
+                                // later in this same function call) waits on
+                                // present_color_read_done before it starts
+                                // writing color_image again -- a real,
+                                // GPU-timeline dependency instead of the
+                                // vkQueueWaitIdle() this replaced (which
+                                // blocked the CPU until the whole queue
+                                // drained, undoing most of the point of
+                                // this migration).
+                                s.present_just_ran = true;
+                                s.swapchain_presented_this_call = true;
+                            }
+                        }
+                    }
+                }
+                s.frame_valid = false;
+                ++s.report.game_frames;
+                s.report.game_frame_vblank = s.pending_vblank;
+                s.report.presented_framebuffer_target = s.pending_target_address;
+                produced_frame = true;
+            }
+#endif
+            if (
+#if defined(__APPLE__)
+                !(s.swapchain_migration_enabled && s.swapchain != VK_NULL_HANDLE)
+#else
+                true
+#endif
+            ) {
             void *mapped = nullptr;
             if (vkMapMemory(s.device, s.readback_memory, 0, s.readback_capacity, 0, &mapped) ==
                 VK_SUCCESS) {
@@ -2210,6 +3845,72 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                 s.report.game_frame_readback_bytes += s.frame_rgba.size();
                 s.report.presented_framebuffer_target = s.pending_target_address;
                 produced_frame = true;
+
+                // GPU timestamp readback for the submission just waited on
+                // (see PSPRECOMP_GE_GPU_TIMESTAMP_DIAG). Safe to read without
+                // VK_QUERY_RESULT_WAIT_BIT here -- the fence wait above
+                // already proves this submission's GPU work, timestamps
+                // included, is finished.
+                if (s.timestamps_supported && std::getenv("PSPRECOMP_GE_GPU_TIMESTAMP_DIAG") != nullptr) {
+                    std::array<std::uint64_t, 2> timestamps{};
+                    if (vkGetQueryPoolResults(s.device, s.timestamp_pool, 0u, 2u,
+                                              sizeof(timestamps), timestamps.data(),
+                                              sizeof(std::uint64_t),
+                                              VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                        const double gpu_execute_us =
+                            static_cast<double>(timestamps[1] - timestamps[0]) *
+                            static_cast<double>(s.timestamp_period_ns) / 1000.0;
+                        std::fprintf(stderr,
+                            "[gpu-timestamp] vblank=%llu cpu_record_us=%.1f gpu_execute_us=%.1f\n",
+                            static_cast<unsigned long long>(s.pending_vblank), s.pending_cpu_record_us,
+                            gpu_execute_us);
+                    }
+                }
+
+                // Bloom composite: additive-blend the extracted/blurred
+                // highlight image (rendered this same submission, see the
+                // bloom render pass below) onto the frame just read back.
+                // Deliberately plain CPU math, not another Vulkan pass --
+                // the one genuinely new piece of pixel logic stays easy to
+                // read and to disable without touching the GPU side at all.
+                if (s.bloom_enabled) {
+                    void *bloom_mapped = nullptr;
+                    if (vkMapMemory(s.device, s.bloom_readback_memory, 0,
+                                    s.bloom_readback_capacity, 0, &bloom_mapped) == VK_SUCCESS) {
+                        s.bloom_rgba.resize(static_cast<std::size_t>(s.bloom_readback_capacity));
+                        std::memcpy(s.bloom_rgba.data(), bloom_mapped, s.bloom_rgba.size());
+                        vkUnmapMemory(s.device, s.bloom_readback_memory);
+
+                        std::uint64_t sum_brightness = 0u;
+                        std::uint8_t max_brightness = 0u;
+                        const std::size_t pixel_count =
+                            std::min(s.frame_rgba.size(), s.bloom_rgba.size());
+                        for (std::size_t i = 0; i + 3u < pixel_count; i += 4u) {
+                            for (std::size_t c = 0; c < 3u; ++c) {
+                                const auto base = static_cast<std::uint8_t>(s.frame_rgba[i + c]);
+                                const auto glow = static_cast<std::uint8_t>(s.bloom_rgba[i + c]);
+                                const int sum = static_cast<int>(base) + static_cast<int>(glow);
+                                s.frame_rgba[i + c] =
+                                    static_cast<std::byte>(std::min(sum, 255));
+                                sum_brightness += glow;
+                                max_brightness = std::max(max_brightness, glow);
+                            }
+                        }
+                        if (std::getenv("PSPRECOMP_BLOOM_DIAG") != nullptr) {
+                            static std::uint64_t frames = 0u;
+                            ++frames;
+                            const double avg = pixel_count > 0u
+                                ? static_cast<double>(sum_brightness) /
+                                      static_cast<double>(pixel_count / 4u * 3u)
+                                : 0.0;
+                            std::fprintf(stderr,
+                                "[bloom-diag] frame=%llu avg_glow=%.3f max_glow=%u\n",
+                                static_cast<unsigned long long>(frames), avg,
+                                static_cast<unsigned>(max_brightness));
+                        }
+                    }
+                }
+            }
             }
         }
     }
@@ -2335,12 +4036,20 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                        static_cast<std::size_t>(hw_index_needed));
     }
 
+    const auto record_start_time = std::chrono::steady_clock::now();
+
     vkResetCommandBuffer(s.command_buffer, 0);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(s.command_buffer, &begin) != VK_SUCCESS) {
         s.frame_buckets.clear();
         return produced_frame;
+    }
+
+    if (s.timestamps_supported) {
+        vkCmdResetQueryPool(s.command_buffer, s.timestamp_pool, 0u, 2u);
+        vkCmdWriteTimestamp(s.command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s.timestamp_pool,
+                            0u);
     }
 
     std::array<VkClearValue, 2> clears{};
@@ -2369,6 +4078,16 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     // viewport automatically; only the scissor rectangle needs converting.
     const float scale_x = static_cast<float>(s.width) / kPspWidth;
     const float scale_y = static_cast<float>(s.height) / kPspHeight;
+
+    const std::size_t batches_before_coalesce = winner->batches.size();
+    std::uint64_t batches_merged_away = 0u;
+    coalesce_batches(winner->batches, batches_merged_away);
+    if (std::getenv("PSPRECOMP_GE_BATCH_COALESCE_DIAG") != nullptr) {
+        std::fprintf(stderr,
+            "[batch-coalesce] vblank=%llu before=%zu after=%zu merged=%llu\n",
+            static_cast<unsigned long long>(vblank), batches_before_coalesce,
+            winner->batches.size(), static_cast<unsigned long long>(batches_merged_away));
+    }
 
     VkPipeline bound = VK_NULL_HANDLE;
     for (const Batch &batch : winner->batches) {
@@ -2467,21 +4186,199 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     }
     vkCmdEndRenderPass(s.command_buffer);
 
+    // Experimental bloom: one fullscreen pass reading the frame just
+    // rendered (world + HUD, screen-space, already composited) and writing
+    // a same-size bright-pass/blur image, read back separately and additive-
+    // composited on the CPU in Step 1 above. See BloomPushConstants /
+    // shaders/bloom.frag. This never writes back into s.color_image itself
+    // -- it only reads it -- so the existing copy-to-buffer below is
+    // completely unmodified by this being on or off.
+    if (s.bloom_enabled) {
+        // s.render_pass's color attachment already lands in
+        // TRANSFER_SRC_OPTIMAL when the subpass above ends (that's its
+        // declared finalLayout); make it shader-readable for this pass, then
+        // put it back before the existing readback copy relies on it again.
+        transition_image(s.command_buffer, s.color_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+                         VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+        VkClearValue bloom_clear{};
+        bloom_clear.color = VkClearColorValue{{0.0f, 0.0f, 0.0f, 1.0f}};
+        VkRenderPassBeginInfo bloom_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        bloom_begin.renderPass = s.bloom_render_pass;
+        bloom_begin.framebuffer = s.bloom_framebuffer;
+        bloom_begin.renderArea.extent = {s.width, s.height};
+        bloom_begin.clearValueCount = 1u;
+        bloom_begin.pClearValues = &bloom_clear;
+        vkCmdBeginRenderPass(s.command_buffer, &bloom_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+        VkViewport bloom_viewport{};
+        bloom_viewport.width = static_cast<float>(s.width);
+        bloom_viewport.height = static_cast<float>(s.height);
+        bloom_viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(s.command_buffer, 0, 1, &bloom_viewport);
+        VkRect2D bloom_scissor{{0, 0}, {s.width, s.height}};
+        vkCmdSetScissor(s.command_buffer, 0, 1, &bloom_scissor);
+
+        vkCmdBindPipeline(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s.bloom_pipeline);
+        vkCmdBindDescriptorSets(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                s.bloom_pipeline_layout, 0, 1, &s.bloom_descriptor_set, 0, nullptr);
+        BloomPushConstants bloom_push{};
+        bloom_push.texel_size[0] = 1.0f / static_cast<float>(s.width);
+        bloom_push.texel_size[1] = 1.0f / static_cast<float>(s.height);
+        bloom_push.threshold = s.bloom_threshold;
+        bloom_push.intensity = s.bloom_intensity;
+        vkCmdPushConstants(s.command_buffer, s.bloom_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(bloom_push), &bloom_push);
+        vkCmdDraw(s.command_buffer, 3u, 1u, 0u, 0u);
+
+        vkCmdEndRenderPass(s.command_buffer);
+
+        transition_image(s.command_buffer, s.color_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                         VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        VkBufferImageCopy bloom_region{};
+        bloom_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        bloom_region.imageSubresource.layerCount = 1u;
+        bloom_region.imageExtent = {s.width, s.height, 1u};
+        vkCmdCopyImageToBuffer(s.command_buffer, s.bloom_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               s.bloom_readback_buffer, 1, &bloom_region);
+    }
+
+    // FXAA: one fullscreen pass reading color_image (world + HUD, already
+    // composited) and writing the anti-aliased result into fxaa_image. This
+    // one, unlike bloom, becomes the actual frame everything downstream
+    // reads (the CPU readback below, and the swapchain present pass) --
+    // color_image itself is left untouched, only ever read from here.
+    if (s.fxaa_enabled) {
+        transition_image(s.command_buffer, s.color_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+                         VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+        VkClearValue fxaa_clear{};
+        fxaa_clear.color = VkClearColorValue{{0.0f, 0.0f, 0.0f, 1.0f}};
+        VkRenderPassBeginInfo fxaa_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        fxaa_begin.renderPass = s.fxaa_render_pass;
+        fxaa_begin.framebuffer = s.fxaa_framebuffer;
+        fxaa_begin.renderArea.extent = {s.width, s.height};
+        fxaa_begin.clearValueCount = 1u;
+        fxaa_begin.pClearValues = &fxaa_clear;
+        vkCmdBeginRenderPass(s.command_buffer, &fxaa_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+        VkViewport fxaa_viewport{};
+        fxaa_viewport.width = static_cast<float>(s.width);
+        fxaa_viewport.height = static_cast<float>(s.height);
+        fxaa_viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(s.command_buffer, 0, 1, &fxaa_viewport);
+        VkRect2D fxaa_scissor{{0, 0}, {s.width, s.height}};
+        vkCmdSetScissor(s.command_buffer, 0, 1, &fxaa_scissor);
+
+        vkCmdBindPipeline(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s.fxaa_pipeline);
+        vkCmdBindDescriptorSets(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                s.fxaa_pipeline_layout, 0, 1, &s.fxaa_descriptor_set, 0, nullptr);
+        FxaaPushConstants fxaa_push{};
+        fxaa_push.texel_size[0] = 1.0f / static_cast<float>(s.width);
+        fxaa_push.texel_size[1] = 1.0f / static_cast<float>(s.height);
+        vkCmdPushConstants(s.command_buffer, s.fxaa_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(fxaa_push), &fxaa_push);
+        vkCmdDraw(s.command_buffer, 3u, 1u, 0u, 0u);
+
+        vkCmdEndRenderPass(s.command_buffer);
+    }
+
+    // Color grading: one more fullscreen pass, reading whichever image is
+    // "current" (fxaa_image if FXAA ran, else color_image) and writing
+    // grading_image -- the last stop before this frame becomes the CPU
+    // readback / swapchain present source.
+    if (s.color_grading_enabled) {
+        const VkImage grading_source = s.fxaa_enabled ? s.fxaa_image : s.color_image;
+        transition_image(s.command_buffer, grading_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+                         VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+        VkClearValue grading_clear{};
+        grading_clear.color = VkClearColorValue{{0.0f, 0.0f, 0.0f, 1.0f}};
+        VkRenderPassBeginInfo grading_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        grading_begin.renderPass = s.grading_render_pass;
+        grading_begin.framebuffer = s.grading_framebuffer;
+        grading_begin.renderArea.extent = {s.width, s.height};
+        grading_begin.clearValueCount = 1u;
+        grading_begin.pClearValues = &grading_clear;
+        vkCmdBeginRenderPass(s.command_buffer, &grading_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+        VkViewport grading_viewport{};
+        grading_viewport.width = static_cast<float>(s.width);
+        grading_viewport.height = static_cast<float>(s.height);
+        grading_viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(s.command_buffer, 0, 1, &grading_viewport);
+        VkRect2D grading_scissor{{0, 0}, {s.width, s.height}};
+        vkCmdSetScissor(s.command_buffer, 0, 1, &grading_scissor);
+
+        vkCmdBindPipeline(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s.grading_pipeline);
+        vkCmdBindDescriptorSets(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                s.grading_pipeline_layout, 0, 1, &s.grading_descriptor_set, 0,
+                                nullptr);
+        ColorGradePushConstants grading_push{};
+        grading_push.saturation = s.color_grading_saturation;
+        grading_push.contrast = s.color_grading_contrast;
+        grading_push.brightness = s.color_grading_brightness;
+        grading_push.tint_r = s.color_grading_tint[0];
+        grading_push.tint_g = s.color_grading_tint[1];
+        grading_push.tint_b = s.color_grading_tint[2];
+        grading_push.sharpen_strength = s.color_grading_sharpen;
+        grading_push.texel_size[0] = 1.0f / static_cast<float>(s.width);
+        grading_push.texel_size[1] = 1.0f / static_cast<float>(s.height);
+        vkCmdPushConstants(s.command_buffer, s.grading_pipeline_layout,
+                           VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(grading_push), &grading_push);
+        vkCmdDraw(s.command_buffer, 3u, 1u, 0u, 0u);
+
+        vkCmdEndRenderPass(s.command_buffer);
+    }
+
     VkBufferImageCopy region{};
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.layerCount = 1u;
     region.imageExtent = {s.width, s.height, 1u};
-    vkCmdCopyImageToBuffer(s.command_buffer, s.color_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    const VkImage final_source = s.color_grading_enabled
+        ? s.grading_image
+        : (s.fxaa_enabled ? s.fxaa_image : s.color_image);
+    vkCmdCopyImageToBuffer(s.command_buffer, final_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            s.readback_buffer, 1, &region);
+
+    if (s.timestamps_supported) {
+        vkCmdWriteTimestamp(s.command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            s.timestamp_pool, 1u);
+    }
 
     if (vkEndCommandBuffer(s.command_buffer) != VK_SUCCESS) {
         s.frame_buckets.clear();
         return produced_frame;
     }
 
+    s.pending_cpu_record_us =
+        std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() -
+                                                   record_start_time)
+            .count();
+
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1u;
     submit.pCommandBuffers = &s.command_buffer;
+    VkPipelineStageFlags present_read_wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+#if defined(__APPLE__)
+    if (s.present_just_ran) {
+        submit.waitSemaphoreCount = 1u;
+        submit.pWaitSemaphores = &s.present_color_read_done;
+        submit.pWaitDstStageMask = &present_read_wait_stage;
+        s.present_just_ran = false;
+    }
+#else
+    (void)present_read_wait_stage;
+#endif
     vkResetFences(s.device, 1, &s.fence);
     if (vkQueueSubmit(s.graphics_queue, 1, &submit, s.fence) == VK_SUCCESS) {
         ++s.report.perf_queue_submit_calls;
@@ -2501,7 +4398,16 @@ bool ge_gpu_backend_copy_game_frame_rgba(std::span<std::byte> destination) noexc
     return true;
 }
 
-bool ge_gpu_backend_presents_directly() noexcept { return false; }
+bool ge_gpu_backend_presents_directly() noexcept {
+    const VulkanGeState &s = state();
+    // Must reflect "did this specific vblank actually get shown via the
+    // swapchain," not just "is swapchain mode configured" -- see
+    // swapchain_presented_this_call's comment. A vblank with nothing new
+    // to render (e.g. during intro-video playback) needs this to report
+    // false so vcs_profile.cpp's software/video present path still runs.
+    return s.swapchain_migration_enabled && s.swapchain != VK_NULL_HANDLE &&
+        s.swapchain_presented_this_call;
+}
 
 std::uint32_t ge_gpu_backend_owned_framebuffer() noexcept {
     const VulkanGeState &s = state();

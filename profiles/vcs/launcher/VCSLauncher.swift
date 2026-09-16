@@ -100,6 +100,15 @@ final class IniDocument: ObservableObject {
     func setInt(_ section: String, _ key: String, _ value: Int) {
         set(section, key, String(value))
     }
+
+    func float(_ section: String, _ key: String, default def: Double) -> Double {
+        guard let raw = get(section, key), let v = Double(raw) else { return def }
+        return v
+    }
+
+    func setFloat(_ section: String, _ key: String, _ value: Double) {
+        set(section, key, String(format: "%.2f", value))
+    }
 }
 
 // MARK: - Bindings between the form and the document
@@ -116,6 +125,10 @@ extension IniDocument {
     func binding(_ section: String, _ key: String, default def: String) -> Binding<String> {
         Binding(get: { self.get(section, key) ?? def },
                 set: { self.set(section, key, $0) })
+    }
+    func binding(_ section: String, _ key: String, default def: Double) -> Binding<Double> {
+        Binding(get: { self.float(section, key, default: def) },
+                set: { self.setFloat(section, key, $0) })
     }
 }
 
@@ -192,6 +205,12 @@ struct ContentView: View {
     @State private var saveMessage: String?
     @State private var launching = false
 
+    // Launcher-only preference (not an .ini key -- this toggles Apple's own
+    // built-in Metal HUD overlay via the MTL_HUD_ENABLED environment
+    // variable at launch time, not anything this backend implements itself.
+    // Works because MoltenVK is a real Metal client underneath Vulkan.
+    @AppStorage("VCSShowMetalHUD") private var showMetalHUD: Bool = false
+
     // Display
     private var fullscreen: Binding<Bool> { doc.binding("Display", "Fullscreen", default: true) }
     private var resolutionMode: Binding<String> { doc.binding("Display", "ResolutionMode", default: "Desktop") }
@@ -207,14 +226,35 @@ struct ContentView: View {
     private var internalScale: Binding<Int> { doc.binding("Rendering", "InternalScale", default: 2) }
     private var internalWidth: Binding<Int> { doc.binding("Rendering", "InternalWidth", default: 1920) }
     private var internalHeight: Binding<Int> { doc.binding("Rendering", "InternalHeight", default: 1080) }
-    private var hardwareTransform: Binding<Bool> { doc.binding("Rendering", "HardwareTransform", default: true) }
+    private var hardwareTransform: Binding<Bool> { doc.binding("Rendering", "HardwareTransform", default: false) }
     private var anisotropic: Binding<Int> { doc.binding("Rendering", "AnisotropicFiltering", default: 1) }
+    private var sharpen: Binding<Double> { doc.binding("Rendering", "Sharpen", default: 0.0) }
     private var depthPrecision: Binding<Int> { doc.binding("Rendering", "DepthPrecision", default: 24) }
+    private var fxaaEnabled: Binding<Bool> { doc.binding("Rendering", "SMAA", default: false) }
 
     // Timing / widescreen / addons
-    private var frameRate: Binding<Int> { doc.binding("Timing", "FrameRate", default: 120) }
     private var widescreen: Binding<Bool> { doc.binding("Widescreen", "Enabled", default: true) }
     private var project2dfx: Binding<Bool> { doc.binding("Project2DFX", "Enabled", default: false) }
+
+    // Bloom (Vulkan backend only -- see the [SimulateHDR] comment in the ini)
+    private var bloomEnabled: Binding<Bool> { doc.binding("SimulateHDR", "Enabled", default: false) }
+    private var bloomThreshold: Binding<Double> { doc.binding("SimulateHDR", "Threshold", default: 0.80) }
+    private var bloomIntensity: Binding<Double> { doc.binding("SimulateHDR", "Intensity", default: 0.60) }
+
+    // Color grading ("Vice Neon" preset)
+    private var gradingEnabled: Binding<Bool> { doc.binding("ColorGrading", "Enabled", default: false) }
+    private var gradingSaturation: Binding<Double> { doc.binding("ColorGrading", "Saturation", default: 1.25) }
+    private var gradingContrast: Binding<Double> { doc.binding("ColorGrading", "Contrast", default: 1.08) }
+    private var gradingBrightness: Binding<Double> { doc.binding("ColorGrading", "Brightness", default: 0.0) }
+    private var gradingTintR: Binding<Double> { doc.binding("ColorGrading", "TintR", default: 1.05) }
+    private var gradingTintG: Binding<Double> { doc.binding("ColorGrading", "TintG", default: 0.98) }
+    private var gradingTintB: Binding<Double> { doc.binding("ColorGrading", "TintB", default: 1.02) }
+
+    // Draw distance
+    private var drawDistanceEnabled: Binding<Bool> { doc.binding("DrawDistance", "Enabled", default: false) }
+    private var drawDistanceWorld: Binding<Double> { doc.binding("DrawDistance", "World", default: 1.00) }
+    private var drawDistanceVehicles: Binding<Double> { doc.binding("DrawDistance", "Vehicles", default: 1.00) }
+    private var drawDistanceNPCs: Binding<Double> { doc.binding("DrawDistance", "NPCs", default: 1.00) }
 
     var body: some View {
         Group {
@@ -340,6 +380,8 @@ struct ContentView: View {
                 Section {
                     Toggle("Show FPS counter", isOn: showFPS)
                         .help("Shows the game's own on-screen frames-per-second counter (separate from the Metal HUD overlay macOS itself can show).")
+                    Toggle("Show Metal HUD (FPS + GPU frame time)", isOn: $showMetalHUD)
+                        .help("Apple's own built-in Metal performance overlay (top-left corner) — live FPS and GPU frame time, straight from the system, not this game's own counter. Works here because MoltenVK (this build's Vulkan-on-Metal layer) is a real Metal client. A launcher preference, not an .ini setting.")
                 }
             }
             .formStyle(.grouped)
@@ -394,6 +436,13 @@ struct ContentView: View {
                     }
                     .help("Precision of the depth (Z) buffer used to decide which surface is in front of another. Higher precision reduces \"z-fighting\" flicker between overlapping surfaces, especially over VCS's long draw distances. 24-bit isn't natively available on Apple's Metal, so this automatically falls back to the closest format the GPU actually supports (usually 32-bit).")
                     Note(text: "Both genuinely affect rendering on this Vulkan/MoltenVK build. Depth precision falls back automatically to the closest format Metal actually supports if the exact bit depth isn't available.")
+                    LabeledContent("Texture sharpening") {
+                        Slider(value: sharpen, in: 0.0...1.0, step: 0.05)
+                            .frame(width: 160)
+                        Text(String(format: "%.2f", sharpen.wrappedValue))
+                            .foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                    }
+                    .help("Unsharp-mask sharpening of the final frame. 0 = off. PSP-era textures are low-resolution and get magnified a lot by the internal-resolution upscale — this makes existing detail read as crisper, it doesn't invent detail that was never captured. 0.3-0.6 is a reasonable range before halos/ringing become visible. Works independently of Color Grading.")
                 }
 
                 Section {
@@ -417,12 +466,101 @@ struct ContentView: View {
                         .help("Widens the PSP's original 4:3-ish projection to 16:9 (matching a modern screen) instead of showing the original narrower field of view stretched or pillarboxed.")
                 }
 
+                Section("Bloom") {
+                    Toggle("Bloom (experimental)", isOn: bloomEnabled)
+                        .help("Adds a soft glow around bright highlights (streetlights, headlights, neon signs, sun glare). A genuinely new single-pass implementation, verified live — but only on the Vulkan GE backend: this Mac build, or a Windows build compiled with PSPRECOMP_VCS_WIN32_VULKAN=ON. A default Windows (DirectX12) build silently ignores this toggle.")
+                    if bloomEnabled.wrappedValue {
+                        LabeledContent("Threshold") {
+                            Slider(value: bloomThreshold, in: 0.0...1.0, step: 0.05)
+                                .frame(width: 160)
+                            Text(String(format: "%.2f", bloomThreshold.wrappedValue))
+                                .foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                        }
+                        .help("Luminance (0-1) above which a pixel starts glowing. Lower = more of the scene blooms; higher = only the brightest highlights do.")
+                        LabeledContent("Intensity") {
+                            Slider(value: bloomIntensity, in: 0.0...2.0, step: 0.05)
+                                .frame(width: 160)
+                            Text(String(format: "%.2f", bloomIntensity.wrappedValue))
+                                .foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                        }
+                        .help("How strongly the glow is added back over the scene. Additive light — high values can blow out highlights to solid white.")
+                    }
+                }
+
+                Section("Color grading") {
+                    Toggle("\"Vice Neon\" look", isOn: gradingEnabled)
+                        .help("A researched approximation of GTA:VC's classic Miami neon aesthetic (boosted saturation, a warm sunset-leaning tint) — tuned against real ENB/ReShade community presets, not a guess. Purely optional and off by default. Honest limitation: this is one static grade, not the original game's actual day/night color-cycle system, so it can't separately push warm daytime vs cool neon-night tones.")
+                    if gradingEnabled.wrappedValue {
+                        LabeledContent("Saturation") {
+                            Slider(value: gradingSaturation, in: 0.5...2.0, step: 0.05)
+                                .frame(width: 160)
+                            Text(String(format: "%.2f", gradingSaturation.wrappedValue))
+                                .foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                        }
+                        .help("Color intensity. 1.0 = unchanged. The 1.15-1.30 range is the sweet spot before it starts looking oversaturated/cartoonish.")
+                        LabeledContent("Contrast") {
+                            Slider(value: gradingContrast, in: 0.5...1.5, step: 0.02)
+                                .frame(width: 160)
+                            Text(String(format: "%.2f", gradingContrast.wrappedValue))
+                                .foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                        }
+                        .help("Contrast around mid-gray. 1.0 = unchanged. Higher values start crushing shadow detail.")
+                        LabeledContent("Brightness") {
+                            Slider(value: gradingBrightness, in: -0.3...0.3, step: 0.02)
+                                .frame(width: 160)
+                            Text(String(format: "%.2f", gradingBrightness.wrappedValue))
+                                .foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                        }
+                        .help("Flat brightness offset. 0.0 = unchanged. Vice City's look relies on saturation/hue, not raised black levels — keep this near zero.")
+                        LabeledContent("Warm tint (R/G/B)") {
+                            Slider(value: gradingTintR, in: 0.8...1.3, step: 0.01)
+                                .frame(width: 90)
+                            Slider(value: gradingTintG, in: 0.8...1.3, step: 0.01)
+                                .frame(width: 90)
+                            Slider(value: gradingTintB, in: 0.8...1.3, step: 0.01)
+                                .frame(width: 90)
+                        }
+                        .help("Multiplies red/green/blue independently. 1.0/1.0/1.0 = unchanged. The default (slightly up on red, slightly down on green, mildly up on blue) approximates sunset-neon warmth without a full day/night system.")
+                    }
+                }
+
+                Section("Draw distance") {
+                    Toggle("Extended draw distance", isOn: drawDistanceEnabled)
+                        .help("Scales up how far away world objects, vehicles and pedestrians render/despawn, instead of the PSP's original short pop-in range. A real patch to the game's own LOD/culling code, verified live.")
+                    if drawDistanceEnabled.wrappedValue {
+                        LabeledContent("World objects") {
+                            Slider(value: drawDistanceWorld, in: 1.0...8.0, step: 0.25)
+                                .frame(width: 160)
+                            Text(String(format: "%.2f×", drawDistanceWorld.wrappedValue))
+                                .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
+                        }
+                        .help("Multiplies world/scenery draw distance and the game's far clip plane. 1.0 = original PSP distance, up to 8.0×.")
+                        LabeledContent("Vehicles") {
+                            Slider(value: drawDistanceVehicles, in: 1.0...4.0, step: 0.25)
+                                .frame(width: 160)
+                            Text(String(format: "%.2f×", drawDistanceVehicles.wrappedValue))
+                                .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
+                        }
+                        .help("Multiplies vehicle LOD/despawn range, up to 4.0×. Values above 2.0× are untested for mission-trigger compatibility.")
+                        LabeledContent("Pedestrians") {
+                            Slider(value: drawDistanceNPCs, in: 1.0...4.0, step: 0.25)
+                                .frame(width: 160)
+                            Text(String(format: "%.2f×", drawDistanceNPCs.wrappedValue))
+                                .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
+                        }
+                        .help("Multiplies pedestrian LOD/population range, up to 4.0×. Values above 2.0× are untested for mission-trigger compatibility.")
+                        Note(text: "Above 2.0× on Vehicles/Pedestrians is untested for mission compatibility — the underlying patch itself caps at 4.0×.", tint: .orange)
+                    }
+                }
+
+                Section("Anti-aliasing") {
+                    Toggle("FXAA", isOn: fxaaEnabled)
+                        .help("Fast approximate anti-aliasing — smooths jagged polygon edges with a single post-process pass. A genuinely new, working Vulkan implementation, verified live. Not the real SMAA algorithm (which needs precomputed lookup textures and three passes) — kept under the historical \"SMAA\" .ini key for compatibility, but this is FXAA.")
+                }
+
                 Section("Not available on this build") {
                     LabeledContent("MSAA") { Text("Off").foregroundStyle(.tertiary) }
-                        .help("Multisample anti-aliasing — smooths jagged polygon edges. Confirmed hardcoded off in this build's Vulkan backend (DirectX12-only feature); editing the .ini value has no effect.")
-                    LabeledContent("SMAA") { Text("Off").foregroundStyle(.tertiary) }
-                        .help("Subpixel Morphological Anti-Aliasing — a post-process edge-smoothing pass. Confirmed entirely absent from this build's Vulkan backend (DirectX12-only feature); editing the .ini value has no effect.")
-                    Note(text: "MSAA and SMAA are DirectX12-only — confirmed absent from the Vulkan/MoltenVK backend entirely (MSAA is hardcoded to 1 sample, no SMAA pass exists). Not shown as editable controls since changing them in the .ini would have no effect.")
+                        .help("Multisample anti-aliasing — smooths jagged polygon edges. Confirmed hardcoded off in this build's Vulkan backend (DirectX12-only feature); editing the .ini value has no effect. FXAA above is this build's real anti-aliasing option instead.")
                 }
             }
             .formStyle(.grouped)
@@ -442,9 +580,9 @@ struct ContentView: View {
                 }
 
                 Section("Not available on this build") {
-                    LabeledContent("ProperShaders / CloudWorks") { Text("Off").foregroundStyle(.tertiary) }
-                        .help("DirectX12-only post-processing chain (bloom, color grading, volumetric clouds). Confirmed absent from this build's Vulkan backend entirely — no Mac equivalent exists yet.")
-                    Note(text: "DirectX12-only post-processing (bloom, color grading, volumetric clouds) — confirmed absent from the Vulkan backend entirely. No Mac equivalent exists yet.")
+                    LabeledContent("ProperShaders / CloudWorks color grading & clouds") { Text("Off").foregroundStyle(.tertiary) }
+                        .help("DirectX12-only post-processing (color grading, volumetric clouds). Confirmed absent from this build's Vulkan backend entirely — no Mac equivalent exists yet.")
+                    Note(text: "Color grading and volumetric clouds are DirectX12-only — confirmed absent from the Vulkan backend entirely. Bloom now has its own Vulkan implementation; see Quality → Bloom.")
                 }
             }
             .formStyle(.grouped)
@@ -458,12 +596,9 @@ struct ContentView: View {
 
             Form {
                 Section {
-                    Picker("Target frame rate", selection: frameRate) {
-                        Text("60").tag(60)
-                        Text("120").tag(120)
-                        Text("Uncapped (240)").tag(240)
-                    }
-                    .help("Caps how fast the game loop and renderer are allowed to run. Higher isn't necessarily smoother — it just raises the ceiling; actual performance still depends on what your Mac can sustain each frame.")
+                    LabeledContent("Target frame rate") { Text("60 fps").foregroundStyle(.secondary) }
+                        .help("Locked to 60. This build is tuned and verified against a 60fps baseline (batch coalescing, GPU timestamp profiling, memoryless depth, etc.) — an uncapped or 120fps+ mode isn't offered since none of that tuning has been validated at a different target.")
+                    Note(text: "Fixed at 60fps — the baseline this port is tuned and verified against, not a placeholder default.")
                 }
             }
             .formStyle(.grouped)
@@ -534,6 +669,25 @@ struct ContentView: View {
         launching = true
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.createsNewApplicationInstance = true
+        // Defensive hygiene: Metal shader validation and MoltenVK's own
+        // per-frame activity/performance logging both have a real per-frame
+        // CPU cost and are meant for debug builds, not play sessions. Not
+        // needed for a Finder double-click (a fresh process inherits no
+        // shell environment at all), but launching through here can
+        // otherwise inherit whatever the parent shell/IDE happened to have
+        // exported (e.g. a Terminal session with MTL_SHADER_VALIDATION=1
+        // set globally for other Metal work) -- forcing them off here means
+        // a Play from this launcher is never accidentally slower than a
+        // real double-click launch would be.
+        var environment: [String: String] = [
+            "MTL_SHADER_VALIDATION": "0",
+            "MTL_DEBUG_LAYER": "0",
+            "MVK_CONFIG_PERFORMANCE_TRACKING": "0",
+        ]
+        if showMetalHUD {
+            environment["MTL_HUD_ENABLED"] = "1"
+        }
+        configuration.environment = environment
         NSWorkspace.shared.openApplication(at: GameLocation.appURL, configuration: configuration) { _, error in
             DispatchQueue.main.async {
                 launching = false

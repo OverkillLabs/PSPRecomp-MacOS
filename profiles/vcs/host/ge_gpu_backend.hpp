@@ -93,6 +93,16 @@ struct GeGpuDrawDescriptor {
     // back into the 16:9 box. The backend reads it to move the scissor with
     // them. See ge_gpu_backend_widescreen_hud().
     bool widescreen_hud{};
+    // Set by the GE renderer for through-mode (real PSP GE hardware TFLAG,
+    // vertex-type bit 23) draws that pass the same world-effect exclusion
+    // rules widescreen_hud already applies (not a full-width backdrop, not
+    // additive depth-tested screen-space glow/corona/flare, not a
+    // framebuffer-feedback composition quad) -- i.e. draws that are genuine
+    // 2D interface, independent of whether widescreen shrink is active.
+    // Experimental: feeds the HUD-at-output-resolution diagnostics/render
+    // path (see [HudResolution] in the .ini), not yet used to change any
+    // pixel this backend produces.
+    bool hud_candidate{};
     bool texture_enabled{};
     bool blend_enabled{};
     std::uint32_t blend_equation{};

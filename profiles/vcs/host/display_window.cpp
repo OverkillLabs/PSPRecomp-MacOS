@@ -141,6 +141,8 @@ struct WindowState {
     // Set while a movie is on screen; see display_window_set_aspect_lock.
     // Atomic because the guest thread raises it and the window thread paints.
     std::atomic<bool> aspect_lock{false};
+    // Whether ClipCursor() currently confines the OS cursor to this window.
+    // See clip_cursor_to_window() below.
     bool mouse_captured{false};
     std::string status{"booting"};
     DisplayConfiguration configuration{};
@@ -261,6 +263,34 @@ void resolve_client_size(WindowState &state) {
     }
 }
 
+// Confines the OS cursor to this window's client area. Mouse look reads raw
+// input deltas (see mouse_dx/mouse_dy above), which do not care where the
+// OS cursor physically is -- deliberately, so a wide monitor does not cap
+// camera turning once the pointer hits the screen edge. WM_SETCURSOR also
+// hides the pointer over the client area for the same reason. Without this,
+// nothing stops the invisible cursor drifting off the window entirely (a
+// second monitor, especially), and the next click lands wherever it
+// actually is at the OS level -- another window, the desktop -- not in the
+// game at all. ClipCursor()'s rect is absolute screen coordinates and goes
+// stale if the window moves or resizes, so this must be called again on
+// WM_MOVE/WM_SIZE while focused, not just once on WM_SETFOCUS.
+void clip_cursor_to_window(HWND window) {
+    RECT client_rect{};
+    if (!GetClientRect(window, &client_rect)) return;
+    POINT top_left{client_rect.left, client_rect.top};
+    POINT bottom_right{client_rect.right, client_rect.bottom};
+    ClientToScreen(window, &top_left);
+    ClientToScreen(window, &bottom_right);
+    const RECT screen_rect{top_left.x, top_left.y, bottom_right.x, bottom_right.y};
+    ClipCursor(&screen_rect);
+    window_state().mouse_captured = true;
+}
+
+void release_cursor_clip() {
+    ClipCursor(nullptr);
+    window_state().mouse_captured = false;
+}
+
 LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     WindowState &state = window_state();
     switch (message) {
@@ -269,9 +299,22 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wparam, LPAR
         return 0;
     case WM_SETFOCUS:
         state.focused.store(true, std::memory_order_relaxed);
+        clip_cursor_to_window(window);
         return 0;
     case WM_KILLFOCUS:
         state.focused.store(false, std::memory_order_relaxed);
+        // Release before losing focus, not after: alt-tab and clicking
+        // another window both need the cursor free immediately, and a
+        // still-active clip would fight the window manager's own focus
+        // change.
+        release_cursor_clip();
+        return 0;
+    case WM_MOVE:
+    case WM_SIZE:
+        // Re-clip only while focused: an unfocused/background window
+        // re-clipping here would fight whatever window the user actually
+        // has focused right now.
+        if (state.focused.load(std::memory_order_relaxed)) clip_cursor_to_window(window);
         return 0;
     case WM_KEYDOWN:
         // Escape is the pause button now that it is bound to Start, the way it
@@ -411,6 +454,10 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wparam, LPAR
         state.close_requested.store(true, std::memory_order_relaxed);
         return 0;
     case WM_DESTROY:
+        // Release the clip before the window goes away -- an orphaned
+        // ClipCursor() rect would otherwise keep the cursor trapped at
+        // whatever screen coordinates this window used to occupy.
+        release_cursor_clip();
         PostQuitMessage(0);
         return 0;
     default:

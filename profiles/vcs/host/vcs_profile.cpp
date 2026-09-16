@@ -4719,7 +4719,13 @@ void ge_async_worker_main() {
         }
 
         std::vector<GuestCallbackInvocation> callbacks;
+        // Serialize against the main thread's own backend calls (present,
+        // once per vblank -- see the lock around that call site). See
+        // ge_gpu_backend_lock()'s comment in ge_gpu_backend.hpp for why this
+        // is required, not optional, once this worker thread exists.
+        ge_gpu_backend_lock();
         const bool ok = execute_ge_list(*runtime, local, callbacks, task.stall.get());
+        ge_gpu_backend_unlock();
 
         {
             std::lock_guard lock(ge_async.mutex);
@@ -7043,7 +7049,34 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         };
         capture_frame_if_requested(rt.memory(), displayed);
         dump_ram_if_requested(rt.memory());
+        // Serializes against the GE async worker thread's own backend calls
+        // (see the lock around execute_ge_list() in ge_async_worker_main()
+        // and ge_gpu_backend_lock()'s comment in ge_gpu_backend.hpp). This
+        // present sequence and that worker both call into backend state --
+        // a single in-flight command buffer/fence and unsynchronized
+        // pipeline/texture caches -- with nothing else protecting it.
+        ge_gpu_backend_lock();
         ge_gpu_backend_set_display_framebuffer(display_state.frame_buffer);
+        // Display.ShowFPS: fps_overlay_render_frame()/fps_overlay_observe_draw()
+        // (ge_renderer.cpp's two accumulate_color_triangles call sites) were
+        // both fully implemented already but never wired to anything -- the
+        // option did nothing at all, in either the launcher or the raw .ini,
+        // no matter what was selected. Must run after this frame's draws are
+        // accumulated (so fps_overlay_observe_draw() has already seen the
+        // displayed target) and before finish_color_frame() below (so the
+        // overlay's own draw is still part of this frame's submission).
+        //
+        // Targets the previous frame's GPU-selected winning bucket
+        // (ge_gpu_backend_last_winner_target()), not display_state.frame_
+        // buffer (the raw sceDisplaySetFrameBuf address): VCS composites HUD
+        // gameplay frames through more than one GE render target, and the
+        // backend's own bucket selection routinely picks a different one as
+        // "the frame" than the raw display address. Passing the raw address
+        // put the overlay's draw in a bucket nothing ever selects, so it
+        // rendered on simple single-buffer screens (loading screens) and
+        // silently vanished the moment real gameplay's multi-pass
+        // compositing started.
+        fps_overlay_render_frame(ge_gpu_backend_last_winner_target());
         project2dfx_render_frame(
             rt.memory(), ctx.gpr[28], display_vblank_index, display_state.frame_buffer);
         // A movie frame is a finished 480x272 picture with no more image at the
@@ -7055,6 +7088,11 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         const auto present_entry = frame_time_diag_enabled()
             ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const bool gpu_frame_ready = ge_gpu_backend_finish_color_frame(display_vblank_index);
+        // Counts toward Display.ShowFPS's measured rate only when this vblank
+        // actually produced a new frame -- see fps_overlay_note_presented_
+        // frame()'s comment for why counting every vblank tick instead read
+        // well above the real, vsync-locked on-screen rate.
+        if (gpu_frame_ready) fps_overlay_note_presented_frame();
         // VCS only fills the displayed framebuffer on every other vblank, so the
         // GPU path produces a frame at half the vblank rate. Presenting the
         // software framebuffer in between alternated two differently scaled
@@ -7086,6 +7124,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 presented_gpu_frame = true;
             }
         }
+        ge_gpu_backend_unlock();
         if (!presented_gpu_frame) {
             holding_gpu_frame = false;
             // The window is showing the guest framebuffer that the software GE

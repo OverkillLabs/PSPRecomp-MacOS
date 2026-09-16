@@ -408,6 +408,29 @@ struct GeGpuBackendReport {
 [[nodiscard]] bool initialize_ge_gpu_backend(std::string &error);
 void shutdown_ge_gpu_backend() noexcept;
 
+// The backend's internal state (command lists, pipeline/texture caches, the
+// single in-flight fence) was never built for concurrent access -- there is
+// no synchronization anywhere inside ge_gpu_backend_dx12.cpp. That is fine
+// as long as exactly one thread ever calls into this interface. It stops
+// being fine the moment PSPRECOMP_GE_ASYNC hands display-list execution to
+// its own worker thread while the main thread continues calling
+// ge_gpu_backend_finish_color_frame()/ge_gpu_backend_mark_window_presented()
+// once per vblank on its own: those two call paths then genuinely race on
+// the same backend state.
+//
+// Every call site that enters this interface from either the main thread's
+// present path or the GE async worker thread (see ge_async_worker_main() in
+// vcs_profile.cpp) holds this lock for the duration, so the two threads'
+// backend calls are serialized against each other instead of racing. This
+// does not add real parallelism inside the backend itself -- it makes
+// concurrent use of it safe, which is the prerequisite for the worker
+// thread doing anything at all. The actual latency win async is meant to
+// provide is the main thread staying free to do non-backend work (audio
+// submission among it) while the worker holds this lock executing a
+// display list, not true simultaneous backend use from two threads.
+void ge_gpu_backend_lock() noexcept;
+void ge_gpu_backend_unlock() noexcept;
+
 [[nodiscard]] bool ge_gpu_backend_active() noexcept;
 [[nodiscard]] bool ge_gpu_backend_transfer_ready() noexcept;
 [[nodiscard]] bool ge_gpu_backend_graphics_ready() noexcept;
@@ -581,6 +604,19 @@ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept;
 // backend presents its own image this surface never reaches the screen, so the
 // composition VCS rasterizes into it is only needed by whatever samples it back.
 [[nodiscard]] std::uint32_t ge_gpu_backend_display_framebuffer() noexcept;
+
+// The GPU-selected target address the *previous* completed frame actually
+// drew as "the frame" (finish_color_frame()'s most-vertices-wins bucket,
+// sticky across frames). VCS composites through more than one GE render
+// target per frame (a working buffer the HUD draws into, then a plain quad
+// that copies it into the real display buffer), and the backend picks
+// whichever one actually carries the frame's geometry -- which is routinely
+// NOT the raw sceDisplaySetFrameBuf address (ge_gpu_backend_display_
+// framebuffer() above). Something injecting its own draw for the CURRENT
+// frame (the FPS overlay) needs to target this address, not the raw display
+// one, or its draw lands in a bucket nothing ever selects and is never
+// composited in. 0 when no frame has completed yet.
+[[nodiscard]] std::uint32_t ge_gpu_backend_last_winner_target() noexcept;
 
 // Borrowed view of the last readback, valid until the next finished frame.
 // Presenting through this avoids allocating and copying a desktop-sized RGBA

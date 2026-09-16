@@ -127,6 +127,22 @@ void fps_overlay_observe_draw(const GeGpuDrawDescriptor &draw,
     tracked.candidate.draw = draw;
 }
 
+void fps_overlay_note_presented_frame() noexcept {
+    if (!enabled()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (g_measurement_start.time_since_epoch().count() == 0) {
+        g_measurement_start = now;
+        g_measurement_frames = 0u;
+    }
+    ++g_measurement_frames;
+    const double seconds = std::chrono::duration<double>(now - g_measurement_start).count();
+    if (seconds >= 0.5) {
+        g_fps = static_cast<double>(g_measurement_frames) / seconds;
+        g_measurement_frames = 0u;
+        g_measurement_start = now;
+    }
+}
+
 void fps_overlay_render_frame(std::uint32_t selected_framebuffer) noexcept {
     if (!enabled() || !ge_gpu_backend_graphics_ready()) {
         clear_targets();
@@ -141,19 +157,6 @@ void fps_overlay_render_frame(std::uint32_t selected_framebuffer) noexcept {
     }
     GeGpuDrawDescriptor draw = found->draw;
     clear_targets();
-
-    const auto now = std::chrono::steady_clock::now();
-    if (g_measurement_start.time_since_epoch().count() == 0) {
-        g_measurement_start = now;
-        g_measurement_frames = 0u;
-    }
-    ++g_measurement_frames;
-    const double seconds = std::chrono::duration<double>(now - g_measurement_start).count();
-    if (seconds >= 0.5) {
-        g_fps = static_cast<double>(g_measurement_frames) / seconds;
-        g_measurement_frames = 0u;
-        g_measurement_start = now;
-    }
 
     char label[32]{};
     if (g_fps > 0.0)

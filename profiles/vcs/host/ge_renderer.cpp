@@ -3481,6 +3481,7 @@ void accumulate_gpu_prepared_triangles(
                                 pack_gpu_alpha_control(effective_draw), 0u, effective_draw.texture_env,
                                 triangle.c.fog_factor, pack_gpu_fog_control(effective_draw), triangle.c.q});
         }
+        fps_overlay_observe_draw(effective_draw, static_cast<std::uint32_t>(vertices.size()));
         ge_gpu_backend_accumulate_color_triangles(effective_draw, vertices);
     } catch (...) {
         // The reference software path must remain authoritative even if the
@@ -3528,6 +3529,7 @@ void accumulate_gpu_rectangle(const GeGpuDrawDescriptor &draw,
     const GeGpuVertex p01 = make(a.x, b.y, mid_z, a.u, b.v, mid_q,
                                   (a.fog_factor + b.fog_factor) * 0.5f);
     const std::array<GeGpuVertex, 6> triangles{{p00, p10, p11, p00, p11, p01}};
+    fps_overlay_observe_draw(effective_draw, static_cast<std::uint32_t>(triangles.size()));
     ge_gpu_backend_accumulate_color_triangles(effective_draw, triangles);
 }
 

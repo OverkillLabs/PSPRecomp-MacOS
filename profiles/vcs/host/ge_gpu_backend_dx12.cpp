@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <limits>
 #include <iterator>
+#include <mutex>
 #include <span>
 #include <sstream>
 #include <unordered_map>
@@ -3079,6 +3080,11 @@ void shutdown_ge_gpu_backend() noexcept {
     s.display_framebuffer = 0u;
 }
 
+// See ge_gpu_backend_lock()/unlock()'s comment in ge_gpu_backend.hpp.
+namespace { std::recursive_mutex &backend_mutex() { static std::recursive_mutex m; return m; } }
+void ge_gpu_backend_lock() noexcept { backend_mutex().lock(); }
+void ge_gpu_backend_unlock() noexcept { backend_mutex().unlock(); }
+
 bool ge_gpu_backend_active() noexcept { return state().enabled; }
 bool ge_gpu_backend_transfer_ready() noexcept { return state().enabled; }
 bool ge_gpu_backend_graphics_ready() noexcept { return state().enabled; }
@@ -4189,6 +4195,7 @@ std::uint32_t ge_gpu_backend_owned_framebuffer() noexcept {
         ? s.presented_framebuffer : 0u;
 }
 std::uint32_t ge_gpu_backend_display_framebuffer() noexcept { return state().display_framebuffer; }
+std::uint32_t ge_gpu_backend_last_winner_target() noexcept { return state().report.presented_framebuffer_target; }
 std::span<const std::byte> ge_gpu_backend_game_frame_rgba() noexcept {
     const Dx12GeState &s = state();
     return s.frame_rgba.empty() ? std::span<const std::byte>{}
@@ -4214,6 +4221,10 @@ bool initialize_ge_gpu_backend(std::string &error) {
     error.clear(); return true;
 }
 void shutdown_ge_gpu_backend() noexcept { state() = {}; }
+// This stub never touches real GPU resources (it's always Software active),
+// so it needs no real lock -- but the header declares these unconditionally.
+void ge_gpu_backend_lock() noexcept {}
+void ge_gpu_backend_unlock() noexcept {}
 bool ge_gpu_backend_active() noexcept { return false; }
 bool ge_gpu_backend_transfer_ready() noexcept { return false; }
 bool ge_gpu_backend_graphics_ready() noexcept { return false; }
@@ -4247,6 +4258,7 @@ bool ge_gpu_backend_copy_game_frame_rgba(std::span<std::byte>) noexcept { return
 bool ge_gpu_backend_presents_directly() noexcept { return false; }
 std::uint32_t ge_gpu_backend_owned_framebuffer() noexcept { return 0u; }
 std::uint32_t ge_gpu_backend_display_framebuffer() noexcept { return state().display_framebuffer; }
+std::uint32_t ge_gpu_backend_last_winner_target() noexcept { return state().report.presented_framebuffer_target; }
 std::span<const std::byte> ge_gpu_backend_game_frame_rgba() noexcept { return {}; }
 bool ge_gpu_backend_copy_offscreen_rgba(std::span<std::byte>) noexcept { return false; }
 void ge_gpu_backend_mark_window_presented() noexcept {}

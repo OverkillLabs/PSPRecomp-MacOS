@@ -1,14 +1,15 @@
 #version 450
 
-// Bright-pass extraction + a small fixed blur kernel, in one pass. Reads the
+// Bright-pass extraction + a blur kernel, in one pass. Reads the
 // already-composited scene (world + HUD, screen-space), keeps only pixels
-// above `threshold` luminance, and averages a 13-tap cross/diagonal pattern
-// around each texel so the extracted highlights spread into a soft glow
-// instead of staying pixel-sharp. This is a single-pass approximation (real
-// separable multi-pass Gaussian bloom would look smoother at a wider radius)
-// -- intentionally simple for a first, verifiable version: one pass, one
-// input image, one output image, easy to reason about and to diff against
-// with the threshold/intensity turned up for a diagnostic capture.
+// above `threshold` luminance, and blends a 25-tap 5x5 pattern around each
+// texel with real Gaussian weights (sigma ~1.5, radius up to 2 texels) so
+// the glow falls off smoothly instead of the uniform 13-tap box average
+// this replaces, which read as a flat, slightly blocky halo rather than a
+// soft glow. Still a single pass, one input image, one output image --
+// wider/smoother separable multi-pass Gaussian bloom would look better
+// still, but is a bigger, riskier change (new ping-pong attachment) for a
+// later pass, not this one.
 layout(push_constant) uniform BloomPushConstants {
     vec2 texel_size;
     float threshold;
@@ -30,15 +31,16 @@ vec3 bright_pass(vec2 uv) {
 }
 
 void main() {
-    const vec2 offsets[13] = vec2[13](
-        vec2(0.0, 0.0),
-        vec2(1.0, 0.0),  vec2(-1.0, 0.0),  vec2(0.0, 1.0),  vec2(0.0, -1.0),
-        vec2(1.0, 1.0),  vec2(-1.0, 1.0),  vec2(1.0, -1.0), vec2(-1.0, -1.0),
-        vec2(2.0, 0.0),  vec2(-2.0, 0.0),  vec2(0.0, 2.0),  vec2(0.0, -2.0)
-    );
+    // 5x5 grid, offsets -2..2 texels in x and y; weights are a discretized
+    // 2D Gaussian (sigma=1.5), precomputed and normalized to sum to 1 so
+    // `intensity` alone controls overall brightness.
+    const float w[5] = float[5](0.06136, 0.24477, 0.38774, 0.24477, 0.06136);
     vec3 sum = vec3(0.0);
-    for (int i = 0; i < 13; ++i) {
-        sum += bright_pass(v_uv + offsets[i] * pc.texel_size);
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            float weight = w[x + 2] * w[y + 2];
+            sum += bright_pass(v_uv + vec2(float(x), float(y)) * pc.texel_size) * weight;
+        }
     }
-    out_color = vec4(sum * (pc.intensity / 13.0), 1.0);
+    out_color = vec4(sum * pc.intensity, 1.0);
 }

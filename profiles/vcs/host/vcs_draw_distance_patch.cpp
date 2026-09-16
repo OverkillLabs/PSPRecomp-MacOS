@@ -8,10 +8,15 @@
 // World = 1.50
 // Vehicles = 1.50
 // NPCs = 1.50
+// LOD = 1.50
 //
 // 1.0 = original PSP distance. Values below 1.0 are clamped to 1.0.
-// World is allowed up to 8.0; Vehicles/NPCs up to 4.0.
+// World is allowed up to 8.0; Vehicles/NPCs up to 4.0; LOD up to 10.0.
 // For mission compatibility, keep Vehicles/NPCs <= 2.0 unless tested.
+// LOD has no such caveat -- it only controls the distance at which an
+// entity (vehicle/ped) switches from its low-poly to high-poly model, a
+// purely visual effect with no population-density downside, so it can be
+// pushed much further than Vehicles/NPCs safely.
 //
 // Integration (no header required):
 //   1) Add this .cpp to VCSNative's target sources.
@@ -50,6 +55,16 @@ struct DrawDistanceConfig {
     float world{1.0f};
     float vehicles{1.0f};
     float npcs{1.0f};
+    // Separate from Vehicles/NPCs on purpose: those two also drive
+    // vehicle_range_patch/npc_range_patch below (population spawn/despawn
+    // distance), and pushing that multiplier past ~1.5-2.0x was confirmed
+    // live to spread the same population budget over a much larger area,
+    // making the game feel sparser even though more is technically
+    // rendered. LOD is the entity mesh-detail-switch distance (a car/ped
+    // going from a low-poly "blob" to its real model) -- a purely visual
+    // effect with no population-density downside, so it gets its own,
+    // more aggressive multiplier instead of inheriting max(vehicles, npcs).
+    float lod{1.0f};
 };
 
 DrawDistanceConfig g_config{};
@@ -81,6 +96,22 @@ constexpr std::uint32_t kDrawDist2Offset  = 0x30u;
 constexpr std::uint32_t kDrawDist3Offset  = 0x34u;
 constexpr std::uint8_t  kIdeTypeObject    = 1u;
 constexpr std::uint8_t  kIdeTypeTimedObj  = 3u;
+constexpr std::uint8_t  kIdeTypeClump     = 4u;
+// Confirmed live (PSPRECOMP_IDE_TYPE_DIAG) that real, non-trivial numbers of
+// world-object slots use type 4/5/6/7 too (40/10/111/161 out of ~7900 this
+// session), previously untouched by the World multiplier -- a real, likely
+// cause of fences/signs/decals still popping in close even at World=8.00.
+// First attempt (extending to all four blindly, gated only by
+// sane_draw_distance()'s range check) crashed the guest: a NaN/garbage
+// write reached, and corrupted, an out-of-PSP-RAM address. The actual raw
+// struct bytes at 0x2C/0x30/0x34 were then dumped per type to find out why:
+// types 5, 6 and 7 all hold 0xFFFFFFFF at +0x2C -- a sentinel/pointer value,
+// never a distance, exactly what the crash needed. Type 4 (clump) is
+// different: +0x2C held 50.0f (a genuinely plausible distance) with +0x30/
+// +0x34 at 0, the same shape as many ordinary type-1 objects. Extending to
+// type 4 alone is therefore justified by an actual confirmed struct match,
+// not just a range check -- 5/6/7 stay excluded, their fields are provably
+// not distances.
 
 struct OriginalWorldModel {
     std::uint32_t hash{};
@@ -182,12 +213,17 @@ DrawDistanceConfig load_config(const std::filesystem::path &path) {
             parse_float(value, cfg.vehicles);
         } else if (key == "npcs" || key == "peds" || key == "npcmultiplier") {
             parse_float(value, cfg.npcs);
+        } else if (key == "lod" || key == "lodmultiplier" || key == "loddistance") {
+            parse_float(value, cfg.lod);
         }
     }
 
     cfg.world = std::clamp(cfg.world, 1.0f, 8.0f);
     cfg.vehicles = std::clamp(cfg.vehicles, 1.0f, 4.0f);
     cfg.npcs = std::clamp(cfg.npcs, 1.0f, 4.0f);
+    // No population-density downside to this one (see the field comment),
+    // so it's allowed a much wider range than Vehicles/NPCs.
+    cfg.lod = std::clamp(cfg.lod, 1.0f, 10.0f);
     return cfg;
 }
 
@@ -237,13 +273,88 @@ bool patch_world_model_table(psprecomp::Runtime &runtime, const psprecomp::Alleg
     }
     if (bad) return false;
 
+    // One-off diagnostic (PSPRECOMP_IDE_TYPE_DIAG): world objects/props not
+    // patched by the World multiplier below (fences, signs, small decals
+    // reported still popping close even at World=8.00) may simply use an
+    // IDE model-info `type` value other than kIdeTypeObject(1)/
+    // kIdeTypeTimedObj(3), which the filter right below this block skips
+    // entirely -- confirm or rule that out by logging the real type
+    // distribution actually present in this table, once.
+    if (std::getenv("PSPRECOMP_IDE_TYPE_DIAG") != nullptr) {
+        static bool logged_types = false;
+        if (!logged_types) {
+            logged_types = true;
+            std::unordered_map<std::uint8_t, std::uint32_t> type_counts;
+            std::unordered_map<std::uint8_t, std::uint32_t> sample_info;
+            for (std::uint32_t i = 0; i < count; ++i) {
+                const std::uint32_t info = runtime.memory().load32(table + i * 4u);
+                if (info == 0u || !runtime.memory().contains(info, 0x38u)) continue;
+                const std::uint8_t type = runtime.memory().load8(info + kModelTypeOffset);
+                ++type_counts[type];
+                sample_info.try_emplace(type, info);
+            }
+            std::cerr << "[ide-type-diag] type distribution across " << count << " slots:\n";
+            for (const auto &[type, type_count] : type_counts) {
+                std::cerr << "  type=" << static_cast<unsigned>(type) << " count=" << type_count
+                          << (type == kIdeTypeObject ? " (kIdeTypeObject, patched)"
+                              : type == kIdeTypeTimedObj ? " (kIdeTypeTimedObj, patched)"
+                                                          : " (NOT patched by World multiplier)")
+                          << "\n";
+            }
+            // Raw struct dump for one sample of each currently-unpatched
+            // type -- decide from actual bytes whether 0x2C/0x30/0x34 hold
+            // plausible distances there at all, rather than trusting
+            // sane_draw_distance()'s range check again (confirmed
+            // insufficient: it let a corrupt write through once already).
+            for (const auto &[type, info] : sample_info) {
+                if (type == kIdeTypeObject || type == kIdeTypeTimedObj) continue;
+                // Widened past 0x38 for types where the draw-dist offsets
+                // are already confirmed NOT distances (5/6/7's 0x2C holds a
+                // 0xFFFFFFFF sentinel) -- their real distance field, if any,
+                // could plausibly sit further into a differently-shaped
+                // struct. 0x80 is a guess at "far enough to likely include
+                // it if it exists nearby", not a confirmed struct size.
+                const bool wide_scan =
+                    type != kIdeTypeObject && type != kIdeTypeTimedObj && type != kIdeTypeClump;
+                const std::uint32_t scan_end = wide_scan ? 0x80u : 0x38u;
+                if (!runtime.memory().contains(info, scan_end)) continue;
+                std::cerr << "  [ide-struct-dump] type=" << static_cast<unsigned>(type)
+                          << " info=" << psprecomp::hex32(info) << "\n";
+                for (std::uint32_t off = 0u; off < scan_end; off += 4u) {
+                    const std::uint32_t raw = runtime.memory().load32(info + off);
+                    const float as_float = std::bit_cast<float>(raw);
+                    // A crude but useful filter for "could plausibly be a
+                    // real distance field": finite, positive, in a sane
+                    // meters range, and NOT in the 0x08xxxxxx/0x09xxxxxx/
+                    // 0x0Axxxxxx range real guest pointers in this game
+                    // fall in (a pointer's bit pattern almost never also
+                    // looks like a tiny plausible float, but explicitly
+                    // excluding the common pointer prefixes avoids the one
+                    // case where it could coincidentally slip through).
+                    const bool looks_like_pointer = raw >= 0x08000000u && raw <= 0x0BFFFFFFu;
+                    const bool plausible_distance = std::isfinite(as_float) && as_float > 0.5f &&
+                        as_float < 2000.0f && !looks_like_pointer;
+                    std::cerr << "    +0x" << std::hex << off << std::dec
+                              << " raw=" << psprecomp::hex32(raw) << " as_float="
+                              << (std::isfinite(as_float) ? std::to_string(as_float) : "nan/inf")
+                              << (off == kDrawDist1Offset || off == kDrawDist2Offset ||
+                                          off == kDrawDist3Offset
+                                      ? "  <-- draw-dist offset for type 1/3"
+                                      : "")
+                              << (plausible_distance ? "  *** PLAUSIBLE DISTANCE ***" : "")
+                              << "\n";
+                }
+            }
+        }
+    }
+
     std::uint32_t patched = 0u;
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint32_t info = runtime.memory().load32(table + i * 4u);
         if (info == 0u || !runtime.memory().contains(info, 0x38u)) continue;
 
         const std::uint8_t type = runtime.memory().load8(info + kModelTypeOffset);
-        if (type != kIdeTypeObject && type != kIdeTypeTimedObj) continue;
+        if (type != kIdeTypeObject && type != kIdeTypeTimedObj && type != kIdeTypeClump) continue;
 
         const std::uint32_t hash = runtime.memory().load32(info + kModelHashOffset);
         const float cur1 = load_float(runtime, info + kDrawDist1Offset);
@@ -348,11 +459,14 @@ void far_clip_setter_patch(psprecomp::Runtime &runtime, psprecomp::AllegrexConte
 }
 
 // Equivalent to ThirteenAG's VCS WidescreenFix entity LOD hook, adapted to the
-// static AOT recomp. The original PSP patch uses one LOD multiplier for cars+peds;
-// use max(Vehicles,NPCs) here, while their actual despawn/culling ranges remain
-// independently controlled below.
+// static AOT recomp. Uses its own LOD multiplier (g_config.lod), deliberately
+// NOT max(Vehicles,NPCs) -- this is purely the mesh-detail-switch distance
+// (confirmed live: models visibly changing shape, "a muddy blob to a high
+// resolution vehicle," a few meters from the camera), independent of the
+// population spawn/despawn ranges vehicle_range_patch/npc_range_patch control
+// below, which have a real density downside at high multipliers this doesn't.
 void entity_lod_setup_patch(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx) {
-    const float multiplier = std::max(g_config.vehicles, g_config.npcs);
+    const float multiplier = g_config.lod;
     const std::uint32_t entity = ctx.gpr[16]; // s0 in this VCS call site
     if (entity != 0u && runtime.memory().contains(entity + kEntityLodDistance, 12u)) {
         const float base = load_float(runtime, entity + kEntityBaseLodDistance);
@@ -448,7 +562,7 @@ void install_draw_distance_patch(psprecomp::Runtime &runtime,
         hook(kIdeInitEpilogue, &ide_init_epilogue_patch, "vcs_draw_distance_world_ide", "ide_init");
     }
 
-    if (g_config.vehicles > 1.0f || g_config.npcs > 1.0f) {
+    if (g_config.lod > 1.0f) {
         hook(kEntityLodSetup, &entity_lod_setup_patch, "vcs_draw_distance_entity_lod", "entity_lod");
     }
     if (g_config.vehicles > 1.0f) {
@@ -463,7 +577,7 @@ void install_draw_distance_patch(psprecomp::Runtime &runtime,
               << " world=" << g_config.world
               << " vehicles=" << g_config.vehicles
               << " npcs=" << g_config.npcs
-              << " entity_lod=" << std::max(g_config.vehicles, g_config.npcs)
+              << " lod=" << g_config.lod
               << "\n";
 }
 

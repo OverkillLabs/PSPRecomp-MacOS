@@ -255,6 +255,7 @@ struct ContentView: View {
     private var drawDistanceWorld: Binding<Double> { doc.binding("DrawDistance", "World", default: 1.00) }
     private var drawDistanceVehicles: Binding<Double> { doc.binding("DrawDistance", "Vehicles", default: 1.00) }
     private var drawDistanceNPCs: Binding<Double> { doc.binding("DrawDistance", "NPCs", default: 1.00) }
+    private var drawDistanceLOD: Binding<Double> { doc.binding("DrawDistance", "LOD", default: 1.00) }
 
     var body: some View {
         Group {
@@ -541,15 +542,22 @@ struct ContentView: View {
                             Text(String(format: "%.2f×", drawDistanceVehicles.wrappedValue))
                                 .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
                         }
-                        .help("Multiplies vehicle LOD/despawn range, up to 4.0×. Values above 2.0× are untested for mission-trigger compatibility.")
+                        .help("Multiplies vehicle spawn/despawn range, up to 4.0×. Values above 2.0× are untested for mission-trigger compatibility.")
                         LabeledContent("Pedestrians") {
                             Slider(value: drawDistanceNPCs, in: 1.0...4.0, step: 0.25)
                                 .frame(width: 160)
                             Text(String(format: "%.2f×", drawDistanceNPCs.wrappedValue))
                                 .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
                         }
-                        .help("Multiplies pedestrian LOD/population range, up to 4.0×. Values above 2.0× are untested for mission-trigger compatibility.")
+                        .help("Multiplies pedestrian spawn/population range, up to 4.0×. Values above 2.0× are untested for mission-trigger compatibility.")
                         Note(text: "Above 2.0× on Vehicles/Pedestrians is untested for mission compatibility — the underlying patch itself caps at 4.0×.", tint: .orange)
+                        LabeledContent("Model detail switch") {
+                            Slider(value: drawDistanceLOD, in: 1.0...10.0, step: 0.5)
+                                .frame(width: 160)
+                            Text(String(format: "%.2f×", drawDistanceLOD.wrappedValue))
+                                .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
+                        }
+                        .help("Distance at which a vehicle/pedestrian switches from its low-poly to high-poly model — purely visual, no population-density downside (unlike Vehicles/Pedestrians above), so this can go much higher safely. Fixes the \"low-poly blob snapping to a full model a few meters away\" pop-in. Up to 10.0×.")
                     }
                 }
 

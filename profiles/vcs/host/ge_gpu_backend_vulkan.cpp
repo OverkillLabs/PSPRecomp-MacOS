@@ -25,6 +25,7 @@
 // (shaderc supplies glslc, used at build time to produce the SPIR-V headers).
 
 #include "ge_gpu_backend.hpp"
+#include "ge_cloud_camera_math.hpp"
 #include "vcs_config.hpp"
 #include "vcs_runtime_log.hpp"
 
@@ -42,9 +43,13 @@
 #include "present_frag_spv.h"
 #include "fxaa_frag_spv.h"
 #include "color_grade_frag_spv.h"
+#include "cloud_march_frag_spv.h"
+#include "cloud_resolve_frag_spv.h"
+#include "cloud_composite_frag_spv.h"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -134,6 +139,46 @@ struct ColorGradePushConstants {
     float sharpen_strength;
     float texel_size[2];
 };
+
+// One observed GE draw camera, tracked so the cloud march can pick the same
+// world camera VCS' native geometry actually rasterized with. Direct port of
+// ge_gpu_backend_dx12.cpp's CloudCameraCandidate; unlike DX12, this backend
+// only ever has one render target (s.color_image), so `target` is kept for
+// parity/diagnostics but selection no longer needs DX12's framebuffer-
+// feedback ancestor graph.
+struct CloudCameraCandidate {
+    std::array<float, 12> view{};
+    std::array<float, 16> projection{};
+    std::array<float, 6> viewport{};
+    std::array<float, 3> camera_position{};
+    std::uint32_t target{};
+    std::uint64_t weight{};
+    std::uint64_t occluding_weight{};
+};
+
+// Matches shaders/cloud_march.frag / cloud_resolve.frag / cloud_composite.frag's
+// `CloudUBO` std140 block exactly -- 15 vec4s, direct port of DX12's
+// CloudShaderConstants (10 vec4s) + CloudTemporalConstants (5 vec4s) merged
+// into one buffer since Vulkan has no root-constant equivalent large enough
+// (240 bytes exceeds the guaranteed-minimum 128-byte push-constant budget).
+struct CloudUniforms {
+    std::array<float, 4> ray_right_time{};
+    std::array<float, 4> ray_up_seed{};
+    std::array<float, 4> ray_forward_opacity{};
+    std::array<float, 4> camera_settings{};
+    std::array<float, 4> coverage_speed{};
+    std::array<float, 4> sun_direction_day{};
+    std::array<float, 4> sun_color_atmosphere{};
+    std::array<float, 4> cloud_color_mist{};
+    std::array<float, 4> fog_color_start{};
+    std::array<float, 4> brightness_padding{};
+    std::array<float, 4> previous_right_history{};
+    std::array<float, 4> previous_up_blend{};
+    std::array<float, 4> previous_forward_spatial{};
+    std::array<float, 4> texel_subpixel{};
+    std::array<float, 4> control{};
+};
+static_assert(sizeof(CloudUniforms) == 15u * 4u * sizeof(float));
 
 // Matches psp_ge_hw.vert/psp_ge_hw_packed0115.vert's push_constant block
 // layout exactly (both shaders share one struct/pipeline layout; the
@@ -323,6 +368,13 @@ struct Batch {
     // tracks this per-target width -- see ge_gpu_backend_dx12.cpp's
     // logical_width). 0 means "not yet known" / "use kPspWidth".
     std::uint32_t framebuffer_stride{};
+    // Cloud FadingEntities-boundary detection only (see the batch loop in
+    // ge_gpu_backend_finish_color_frame): the GE state, not baked into
+    // `pipeline`'s VkPipeline handle the way blend/format/depth-compare-op
+    // are, so it has to ride along on the batch itself.
+    bool clear_mode{};
+    bool depth_test_enabled{};
+    bool depth_write_enabled{};
 };
 
 struct VulkanGeState {
@@ -569,6 +621,79 @@ struct VulkanGeState {
     VkPipeline grading_pipeline{VK_NULL_HANDLE};
     VkShaderModule grading_vertex_shader{VK_NULL_HANDLE};
     VkShaderModule grading_fragment_shader{VK_NULL_HANDLE};
+
+    // Volumetric clouds ([VolumetricClouds] in ProperShaders.ini -- see
+    // ge_cloudworks_present_shader.hpp / ge_cloud_camera_math.hpp and
+    // docs/VCS_CLOUDWORKS_GAME_INTEGRATION.md). Direct port of the DX12
+    // backend's CloudWorks temporal-reprojection renderer: a sparse march
+    // pass, a temporal-resolve pass reprojecting into a ping-ponged history
+    // pair, and a composite drawn inline (no render-pass split -- see the
+    // struct comment on `cloud_history` below for why) into the still-open
+    // main GE render pass at the FadingEntities boundary.
+    bool cloud_enabled{false};
+    std::vector<CloudCameraCandidate> cloud_cameras;
+    // History targets are R16G16B16A16_SFLOAT, downscaled from the world
+    // target by [VolumetricClouds].DownscaleDiv; cloud_march is half that
+    // again (one texel per 2x2 sparse-march block). Unlike s.depth_image,
+    // these are ordinary sampled color attachments -- ge_gpu_backend_dx12.cpp
+    // proved this exact temporal-history/ping-pong shape works; the only
+    // real platform risk here was ever needing to sample s.depth_image
+    // later, which this feature does not do (the composite pass only needs
+    // depth as a same-subpass EQUAL-test attachment, already supported).
+    struct CloudTarget {
+        VkImage image{VK_NULL_HANDLE};
+        VkDeviceMemory memory{VK_NULL_HANDLE};
+        VkImageView view{VK_NULL_HANDLE};
+        VkFramebuffer framebuffer{VK_NULL_HANDLE};
+        std::uint32_t width{};
+        std::uint32_t height{};
+    };
+    std::array<CloudTarget, 2> cloud_history{};
+    CloudTarget cloud_march{};
+    VkRenderPass cloud_target_render_pass{VK_NULL_HANDLE};
+    VkSampler cloud_sampler{VK_NULL_HANDLE};
+    // March has no texture inputs (CloudMarchPS only reads the UBO); resolve
+    // and composite both sample two textures, so they share a layout.
+    VkDescriptorSetLayout cloud_ubo_only_layout{VK_NULL_HANDLE};
+    VkDescriptorSetLayout cloud_dual_texture_layout{VK_NULL_HANDLE};
+    VkDescriptorPool cloud_descriptor_pool{VK_NULL_HANDLE};
+    // One fixed descriptor set (and one fixed, persistently-mapped UBO
+    // buffer) per cloud draw *slot*, not per draw call: up to three cloud
+    // draws happen per frame (target-or-march, resolve, composite), each
+    // needing its own constants live at submit time, so each gets its own
+    // buffer/set written once per frame rather than one set/buffer reused
+    // and overwritten between draws (which would race: a VkDescriptorSet
+    // update or a memcpy into its bound buffer takes effect at *execution*
+    // time, not at the vkCmdBindDescriptorSets call site, so reusing one set
+    // across draws in the same command buffer recording would leave every
+    // earlier draw seeing the last draw's constants once the GPU actually
+    // runs it).
+    VkDescriptorSet cloud_set_target{VK_NULL_HANDLE};
+    VkDescriptorSet cloud_set_resolve{VK_NULL_HANDLE};
+    VkDescriptorSet cloud_set_composite{VK_NULL_HANDLE};
+    VkBuffer cloud_ubo_target{VK_NULL_HANDLE};
+    VkDeviceMemory cloud_ubo_target_memory{VK_NULL_HANDLE};
+    void *cloud_ubo_target_mapped{};
+    VkBuffer cloud_ubo_resolve{VK_NULL_HANDLE};
+    VkDeviceMemory cloud_ubo_resolve_memory{VK_NULL_HANDLE};
+    void *cloud_ubo_resolve_mapped{};
+    VkBuffer cloud_ubo_composite{VK_NULL_HANDLE};
+    VkDeviceMemory cloud_ubo_composite_memory{VK_NULL_HANDLE};
+    void *cloud_ubo_composite_mapped{};
+    VkShaderModule cloud_vertex_shader{VK_NULL_HANDLE};
+    VkPipelineLayout cloud_target_pipeline_layout{VK_NULL_HANDLE};
+    VkPipelineLayout cloud_dual_pipeline_layout{VK_NULL_HANDLE};
+    VkPipeline cloud_target_pipeline{VK_NULL_HANDLE};
+    VkPipeline cloud_resolve_pipeline{VK_NULL_HANDLE};
+    VkPipeline cloud_composite_pipeline{VK_NULL_HANDLE};
+    VkShaderModule cloud_march_fragment_shader{VK_NULL_HANDLE};
+    VkShaderModule cloud_resolve_fragment_shader{VK_NULL_HANDLE};
+    VkShaderModule cloud_composite_fragment_shader{VK_NULL_HANDLE};
+    std::uint32_t cloud_history_index{};
+    std::uint32_t cloud_temporal_frame{};
+    std::array<float, 3> cloud_previous_camera{};
+    std::array<float, 9> cloud_previous_ray_basis{};
+    bool cloud_history_valid{};
 
     VkBuffer staging_buffer{VK_NULL_HANDLE};
     VkDeviceMemory staging_memory{VK_NULL_HANDLE};
@@ -1337,6 +1462,43 @@ void destroy_backend(VulkanGeState &s) noexcept {
         if (s.grading_view != VK_NULL_HANDLE) vkDestroyImageView(s.device, s.grading_view, nullptr);
         if (s.grading_image != VK_NULL_HANDLE) vkDestroyImage(s.device, s.grading_image, nullptr);
         if (s.grading_memory != VK_NULL_HANDLE) vkFreeMemory(s.device, s.grading_memory, nullptr);
+        destroy_buffer(s.cloud_ubo_target, s.cloud_ubo_target_memory);
+        destroy_buffer(s.cloud_ubo_resolve, s.cloud_ubo_resolve_memory);
+        destroy_buffer(s.cloud_ubo_composite, s.cloud_ubo_composite_memory);
+        if (s.cloud_target_pipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(s.device, s.cloud_target_pipeline, nullptr);
+        if (s.cloud_resolve_pipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(s.device, s.cloud_resolve_pipeline, nullptr);
+        if (s.cloud_composite_pipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(s.device, s.cloud_composite_pipeline, nullptr);
+        if (s.cloud_target_pipeline_layout != VK_NULL_HANDLE)
+            vkDestroyPipelineLayout(s.device, s.cloud_target_pipeline_layout, nullptr);
+        if (s.cloud_dual_pipeline_layout != VK_NULL_HANDLE)
+            vkDestroyPipelineLayout(s.device, s.cloud_dual_pipeline_layout, nullptr);
+        if (s.cloud_descriptor_pool != VK_NULL_HANDLE)
+            vkDestroyDescriptorPool(s.device, s.cloud_descriptor_pool, nullptr);
+        if (s.cloud_ubo_only_layout != VK_NULL_HANDLE)
+            vkDestroyDescriptorSetLayout(s.device, s.cloud_ubo_only_layout, nullptr);
+        if (s.cloud_dual_texture_layout != VK_NULL_HANDLE)
+            vkDestroyDescriptorSetLayout(s.device, s.cloud_dual_texture_layout, nullptr);
+        if (s.cloud_sampler != VK_NULL_HANDLE) vkDestroySampler(s.device, s.cloud_sampler, nullptr);
+        if (s.cloud_vertex_shader != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.cloud_vertex_shader, nullptr);
+        if (s.cloud_march_fragment_shader != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.cloud_march_fragment_shader, nullptr);
+        if (s.cloud_resolve_fragment_shader != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.cloud_resolve_fragment_shader, nullptr);
+        if (s.cloud_composite_fragment_shader != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.cloud_composite_fragment_shader, nullptr);
+        if (s.cloud_target_render_pass != VK_NULL_HANDLE)
+            vkDestroyRenderPass(s.device, s.cloud_target_render_pass, nullptr);
+        for (VulkanGeState::CloudTarget *target : {&s.cloud_history[0], &s.cloud_history[1], &s.cloud_march}) {
+            if (target->framebuffer != VK_NULL_HANDLE)
+                vkDestroyFramebuffer(s.device, target->framebuffer, nullptr);
+            if (target->view != VK_NULL_HANDLE) vkDestroyImageView(s.device, target->view, nullptr);
+            if (target->image != VK_NULL_HANDLE) vkDestroyImage(s.device, target->image, nullptr);
+            if (target->memory != VK_NULL_HANDLE) vkFreeMemory(s.device, target->memory, nullptr);
+        }
         if (s.framebuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(s.device, s.framebuffer, nullptr);
         if (s.render_pass != VK_NULL_HANDLE) vkDestroyRenderPass(s.device, s.render_pass, nullptr);
         if (s.color_view != VK_NULL_HANDLE) vkDestroyImageView(s.device, s.color_view, nullptr);
@@ -1578,7 +1740,10 @@ void destroy_backend(VulkanGeState &s) noexcept {
     const auto create_attachment = [&](VkFormat format, VkImageUsageFlags usage,
                                        VkImageAspectFlags aspect, VkImage &image,
                                        VkDeviceMemory &memory, VkImageView &view,
+                                       std::uint32_t width = 0u, std::uint32_t height = 0u,
                                        bool prefer_transient = false) -> bool {
+        if (width == 0u) width = s.width;
+        if (height == 0u) height = s.height;
         // prefer_transient: for an attachment this backend never samples,
         // copies, or reads back (the depth buffer below -- confirmed no
         // other code in this file references s.depth_view except as a
@@ -1596,7 +1761,7 @@ void destroy_backend(VulkanGeState &s) noexcept {
         VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         image_info.imageType = VK_IMAGE_TYPE_2D;
         image_info.format = format;
-        image_info.extent = {s.width, s.height, 1u};
+        image_info.extent = {width, height, 1u};
         image_info.mipLevels = 1u;
         image_info.arrayLayers = 1u;
         image_info.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1659,7 +1824,7 @@ void destroy_backend(VulkanGeState &s) noexcept {
         select_depth_format(s.physical_device, vcs_configuration().rendering.depth_precision);
     if (!create_attachment(depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                            VK_IMAGE_ASPECT_DEPTH_BIT, s.depth_image, s.depth_memory,
-                           s.depth_view, /*prefer_transient=*/true)) {
+                           s.depth_view, 0u, 0u, /*prefer_transient=*/true)) {
         error = "failed to create the depth attachment";
         return false;
     }
@@ -2578,6 +2743,405 @@ void destroy_backend(VulkanGeState &s) noexcept {
                     s.color_grading_contrast, s.color_grading_sharpen);
     }
 
+    // --- Volumetric clouds ([VolumetricClouds]) -----------------------------
+    // Direct port of ge_gpu_backend_dx12.cpp's CloudWorks renderer -- see the
+    // VulkanGeState::cloud_* field comments above and
+    // docs/VCS_CLOUDWORKS_GAME_INTEGRATION.md for the overall design.
+    s.cloud_enabled = false;
+    constexpr VkFormat kCloudFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (bloom_config.initialized && bloom_config.volumetric_clouds.enabled) {
+        bool cloud_ok = true;
+        const std::uint32_t divisor =
+            std::clamp<std::uint32_t>(bloom_config.volumetric_clouds.downscale_div, 1u, 8u);
+        std::uint32_t cloud_width = std::max(2u, (s.width + divisor - 1u) / divisor);
+        std::uint32_t cloud_height = std::max(2u, (s.height + divisor - 1u) / divisor);
+        cloud_width = (cloud_width + 1u) & ~1u;
+        cloud_height = (cloud_height + 1u) & ~1u;
+        const std::uint32_t march_width = std::max(1u, cloud_width / 2u);
+        const std::uint32_t march_height = std::max(1u, cloud_height / 2u);
+
+        s.cloud_history[0].width = s.cloud_history[1].width = cloud_width;
+        s.cloud_history[0].height = s.cloud_history[1].height = cloud_height;
+        s.cloud_march.width = march_width;
+        s.cloud_march.height = march_height;
+
+        if (!create_attachment(kCloudFormat,
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, s.cloud_history[0].image,
+                               s.cloud_history[0].memory, s.cloud_history[0].view, cloud_width,
+                               cloud_height) ||
+            !create_attachment(kCloudFormat,
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, s.cloud_history[1].image,
+                               s.cloud_history[1].memory, s.cloud_history[1].view, cloud_width,
+                               cloud_height) ||
+            !create_attachment(kCloudFormat,
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, s.cloud_march.image, s.cloud_march.memory,
+                               s.cloud_march.view, march_width, march_height)) {
+            cloud_ok = false;
+        }
+
+        // Both history slots start life with genuinely undefined GPU memory
+        // (VK_IMAGE_LAYOUT_UNDEFINED, never rendered into yet) until their
+        // first turn as "current" in the march ping-pong. Whichever slot is
+        // "previous" on the very first frame gets sampled by resolve before
+        // that ever happens -- confirmed live as a real bug: even with its
+        // contribution weighted to 0 (via the `valid` flag), IEEE 754
+        // mix(a, b, 0) is `a + 0*(b-a)`, which is NaN (not a clean `a`) if
+        // `b` happens to contain a NaN/Inf bit pattern from uninitialized
+        // memory. Clearing both slots to a known "clear sky" value (0,0,0,1
+        // -- zero light, full transmittance) up front removes this failure
+        // mode at the source instead of relying on every downstream sample
+        // site to defend against it.
+        if (cloud_ok) {
+            VkCommandBuffer clear_cmd = begin_one_shot(s);
+            if (clear_cmd == VK_NULL_HANDLE) {
+                cloud_ok = false;
+            } else {
+                const VkClearColorValue clear_sky{{0.0f, 0.0f, 0.0f, 1.0f}};
+                VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+                for (VkImage image : {s.cloud_history[0].image, s.cloud_history[1].image}) {
+                    transition_image(clear_cmd, image, VK_IMAGE_LAYOUT_UNDEFINED,
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0u,
+                                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    vkCmdClearColorImage(clear_cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                         &clear_sky, 1u, &range);
+                    transition_image(clear_cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                }
+                if (!end_one_shot(s, clear_cmd)) cloud_ok = false;
+            }
+        }
+
+        if (cloud_ok) {
+            VkAttachmentDescription cloud_attachment{};
+            cloud_attachment.format = kCloudFormat;
+            cloud_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+            cloud_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            cloud_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            cloud_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            cloud_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            cloud_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            // Implicit layout transition to SHADER_READ_ONLY_OPTIMAL at
+            // render-pass end -- every consumer (resolve reading march/
+            // previous history, composite reading current history) only ever
+            // samples these images, never anything else, so no explicit
+            // barrier is needed between writing one of these targets and
+            // reading it later, mirroring how bloom/fxaa/grading already do
+            // this in this same function.
+            cloud_attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkAttachmentReference cloud_color_ref{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+            VkSubpassDescription cloud_subpass{};
+            cloud_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            cloud_subpass.colorAttachmentCount = 1u;
+            cloud_subpass.pColorAttachments = &cloud_color_ref;
+            VkRenderPassCreateInfo cloud_render_pass_info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+            cloud_render_pass_info.attachmentCount = 1u;
+            cloud_render_pass_info.pAttachments = &cloud_attachment;
+            cloud_render_pass_info.subpassCount = 1u;
+            cloud_render_pass_info.pSubpasses = &cloud_subpass;
+            if (vkCreateRenderPass(s.device, &cloud_render_pass_info, nullptr,
+                                   &s.cloud_target_render_pass) != VK_SUCCESS) {
+                cloud_ok = false;
+            }
+        }
+
+        if (cloud_ok) {
+            const auto make_cloud_framebuffer = [&](VulkanGeState::CloudTarget &target) {
+                VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+                info.renderPass = s.cloud_target_render_pass;
+                info.attachmentCount = 1u;
+                info.pAttachments = &target.view;
+                info.width = target.width;
+                info.height = target.height;
+                info.layers = 1u;
+                return vkCreateFramebuffer(s.device, &info, nullptr, &target.framebuffer) ==
+                       VK_SUCCESS;
+            };
+            if (!make_cloud_framebuffer(s.cloud_history[0]) ||
+                !make_cloud_framebuffer(s.cloud_history[1]) || !make_cloud_framebuffer(s.cloud_march))
+                cloud_ok = false;
+        }
+
+        if (cloud_ok && (!create_shader_module(s, kBloomVertSpv, sizeof(kBloomVertSpv),
+                                               s.cloud_vertex_shader) ||
+                        !create_shader_module(s, kCloudMarchFragSpv, sizeof(kCloudMarchFragSpv),
+                                              s.cloud_march_fragment_shader) ||
+                        !create_shader_module(s, kCloudResolveFragSpv, sizeof(kCloudResolveFragSpv),
+                                              s.cloud_resolve_fragment_shader) ||
+                        !create_shader_module(s, kCloudCompositeFragSpv,
+                                              sizeof(kCloudCompositeFragSpv),
+                                              s.cloud_composite_fragment_shader))) {
+            cloud_ok = false;
+        }
+
+        if (cloud_ok) {
+            VkSamplerCreateInfo cloud_sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            cloud_sampler_info.magFilter = VK_FILTER_LINEAR;
+            cloud_sampler_info.minFilter = VK_FILTER_LINEAR;
+            cloud_sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            cloud_sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            cloud_sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            cloud_sampler_info.maxAnisotropy = 1.0f;
+            if (vkCreateSampler(s.device, &cloud_sampler_info, nullptr, &s.cloud_sampler) !=
+                VK_SUCCESS)
+                cloud_ok = false;
+        }
+
+        if (cloud_ok) {
+            VkDescriptorSetLayoutBinding ubo_binding{};
+            ubo_binding.binding = 0u;
+            ubo_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            ubo_binding.descriptorCount = 1u;
+            ubo_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo ubo_layout_info{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            ubo_layout_info.bindingCount = 1u;
+            ubo_layout_info.pBindings = &ubo_binding;
+            if (vkCreateDescriptorSetLayout(s.device, &ubo_layout_info, nullptr,
+                                            &s.cloud_ubo_only_layout) != VK_SUCCESS) {
+                cloud_ok = false;
+            }
+        }
+        if (cloud_ok) {
+            std::array<VkDescriptorSetLayoutBinding, 3> dual_bindings{};
+            dual_bindings[0].binding = 0u;
+            dual_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            dual_bindings[0].descriptorCount = 1u;
+            dual_bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            dual_bindings[1].binding = 1u;
+            dual_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            dual_bindings[1].descriptorCount = 1u;
+            dual_bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            dual_bindings[2].binding = 2u;
+            dual_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            dual_bindings[2].descriptorCount = 1u;
+            dual_bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo dual_layout_info{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            dual_layout_info.bindingCount = static_cast<std::uint32_t>(dual_bindings.size());
+            dual_layout_info.pBindings = dual_bindings.data();
+            if (vkCreateDescriptorSetLayout(s.device, &dual_layout_info, nullptr,
+                                            &s.cloud_dual_texture_layout) != VK_SUCCESS) {
+                cloud_ok = false;
+            }
+        }
+        if (cloud_ok) {
+            std::array<VkDescriptorPoolSize, 2> cloud_pool_sizes{
+                VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3u},
+                VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4u}};
+            VkDescriptorPoolCreateInfo cloud_pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            cloud_pool_info.maxSets = 3u;
+            cloud_pool_info.poolSizeCount = static_cast<std::uint32_t>(cloud_pool_sizes.size());
+            cloud_pool_info.pPoolSizes = cloud_pool_sizes.data();
+            if (vkCreateDescriptorPool(s.device, &cloud_pool_info, nullptr,
+                                       &s.cloud_descriptor_pool) != VK_SUCCESS) {
+                cloud_ok = false;
+            }
+        }
+        if (cloud_ok) {
+            VkDescriptorSetAllocateInfo target_allocate{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            target_allocate.descriptorPool = s.cloud_descriptor_pool;
+            target_allocate.descriptorSetCount = 1u;
+            target_allocate.pSetLayouts = &s.cloud_ubo_only_layout;
+            std::array<VkDescriptorSetLayout, 2> dual_layouts{s.cloud_dual_texture_layout,
+                                                              s.cloud_dual_texture_layout};
+            VkDescriptorSetAllocateInfo dual_allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            dual_allocate.descriptorPool = s.cloud_descriptor_pool;
+            dual_allocate.descriptorSetCount = 2u;
+            dual_allocate.pSetLayouts = dual_layouts.data();
+            std::array<VkDescriptorSet, 2> dual_sets{};
+            if (vkAllocateDescriptorSets(s.device, &target_allocate, &s.cloud_set_target) !=
+                    VK_SUCCESS ||
+                vkAllocateDescriptorSets(s.device, &dual_allocate, dual_sets.data()) != VK_SUCCESS) {
+                cloud_ok = false;
+            } else {
+                s.cloud_set_resolve = dual_sets[0];
+                s.cloud_set_composite = dual_sets[1];
+            }
+        }
+        if (cloud_ok) {
+            const auto make_ubo = [&](VkBuffer &buffer, VkDeviceMemory &memory, void *&mapped) {
+                if (!create_buffer(s, sizeof(CloudUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                   buffer, memory))
+                    return false;
+                return vkMapMemory(s.device, memory, 0, sizeof(CloudUniforms), 0, &mapped) ==
+                       VK_SUCCESS;
+            };
+            if (!make_ubo(s.cloud_ubo_target, s.cloud_ubo_target_memory, s.cloud_ubo_target_mapped) ||
+                !make_ubo(s.cloud_ubo_resolve, s.cloud_ubo_resolve_memory,
+                         s.cloud_ubo_resolve_mapped) ||
+                !make_ubo(s.cloud_ubo_composite, s.cloud_ubo_composite_memory,
+                         s.cloud_ubo_composite_mapped)) {
+                cloud_ok = false;
+            }
+        }
+        if (cloud_ok) {
+            // Write each set's fixed UBO binding once; the image bindings on
+            // the two dual-texture sets change every frame (which history
+            // buffer is "current" vs "previous" ping-pongs) and are updated
+            // in record_clouds_into_world_target() instead.
+            VkDescriptorBufferInfo target_buffer_info{s.cloud_ubo_target, 0, sizeof(CloudUniforms)};
+            VkWriteDescriptorSet target_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            target_write.dstSet = s.cloud_set_target;
+            target_write.dstBinding = 0u;
+            target_write.descriptorCount = 1u;
+            target_write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            target_write.pBufferInfo = &target_buffer_info;
+
+            VkDescriptorBufferInfo resolve_buffer_info{s.cloud_ubo_resolve, 0, sizeof(CloudUniforms)};
+            VkWriteDescriptorSet resolve_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            resolve_write.dstSet = s.cloud_set_resolve;
+            resolve_write.dstBinding = 2u;
+            resolve_write.descriptorCount = 1u;
+            resolve_write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            resolve_write.pBufferInfo = &resolve_buffer_info;
+
+            VkDescriptorBufferInfo composite_buffer_info{s.cloud_ubo_composite, 0,
+                                                          sizeof(CloudUniforms)};
+            VkWriteDescriptorSet composite_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            composite_write.dstSet = s.cloud_set_composite;
+            composite_write.dstBinding = 2u;
+            composite_write.descriptorCount = 1u;
+            composite_write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            composite_write.pBufferInfo = &composite_buffer_info;
+
+            std::array<VkWriteDescriptorSet, 3> writes{target_write, resolve_write, composite_write};
+            vkUpdateDescriptorSets(s.device, static_cast<std::uint32_t>(writes.size()), writes.data(),
+                                   0, nullptr);
+        }
+        if (cloud_ok) {
+            VkPipelineLayoutCreateInfo target_layout_info{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            target_layout_info.setLayoutCount = 1u;
+            target_layout_info.pSetLayouts = &s.cloud_ubo_only_layout;
+            VkPipelineLayoutCreateInfo dual_layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            dual_layout_info.setLayoutCount = 1u;
+            dual_layout_info.pSetLayouts = &s.cloud_dual_texture_layout;
+            if (vkCreatePipelineLayout(s.device, &target_layout_info, nullptr,
+                                       &s.cloud_target_pipeline_layout) != VK_SUCCESS ||
+                vkCreatePipelineLayout(s.device, &dual_layout_info, nullptr,
+                                       &s.cloud_dual_pipeline_layout) != VK_SUCCESS) {
+                cloud_ok = false;
+            }
+        }
+        if (cloud_ok) {
+            const auto make_pipeline = [&](VkShaderModule fragment_shader, VkPipelineLayout layout,
+                                           VkRenderPass render_pass, bool blend_and_depth_equal,
+                                           VkPipeline &pipeline) {
+                std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+                stages[0] = VkPipelineShaderStageCreateInfo{
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+                stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+                stages[0].module = s.cloud_vertex_shader;
+                stages[0].pName = "main";
+                stages[1] = VkPipelineShaderStageCreateInfo{
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+                stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+                stages[1].module = fragment_shader;
+                stages[1].pName = "main";
+
+                VkPipelineVertexInputStateCreateInfo vertex_input{
+                    VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+                VkPipelineInputAssemblyStateCreateInfo input_assembly{
+                    VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+                input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+                VkPipelineViewportStateCreateInfo viewport_state{
+                    VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+                viewport_state.viewportCount = 1u;
+                viewport_state.scissorCount = 1u;
+                VkPipelineRasterizationStateCreateInfo rasterization{
+                    VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+                rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+                rasterization.cullMode = VK_CULL_MODE_NONE;
+                rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+                rasterization.lineWidth = 1.0f;
+                VkPipelineMultisampleStateCreateInfo multisample{
+                    VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+                multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+                VkPipelineDepthStencilStateCreateInfo depth_stencil{
+                    VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+                VkPipelineColorBlendAttachmentState blend{};
+                if (blend_and_depth_equal) {
+                    // Composite only: blend the premultiplied cloud result
+                    // over the world target (ONE / INV_SRC_ALPHA on RGB,
+                    // ZERO / ONE on alpha -- alpha here is composition
+                    // metadata, not written back) and depth-test EQUAL
+                    // against the reverse-Z clear (0.0) with no depth write,
+                    // so clouds only fill sky pixels behind opaques, drawn
+                    // inline into the still-open main GE render pass.
+                    depth_stencil.depthTestEnable = VK_TRUE;
+                    depth_stencil.depthWriteEnable = VK_FALSE;
+                    depth_stencil.depthCompareOp = VK_COMPARE_OP_EQUAL;
+                    blend.blendEnable = VK_TRUE;
+                    blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+                    blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                    blend.colorBlendOp = VK_BLEND_OP_ADD;
+                    blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+                    blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                    blend.alphaBlendOp = VK_BLEND_OP_ADD;
+                    blend.colorWriteMask =
+                        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+                } else {
+                    blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+                }
+                VkPipelineColorBlendStateCreateInfo color_blend{
+                    VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+                color_blend.attachmentCount = 1u;
+                color_blend.pAttachments = &blend;
+                const std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                                    VK_DYNAMIC_STATE_SCISSOR};
+                VkPipelineDynamicStateCreateInfo dynamic{
+                    VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+                dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
+                dynamic.pDynamicStates = dynamic_states.data();
+
+                VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+                info.stageCount = static_cast<std::uint32_t>(stages.size());
+                info.pStages = stages.data();
+                info.pVertexInputState = &vertex_input;
+                info.pInputAssemblyState = &input_assembly;
+                info.pViewportState = &viewport_state;
+                info.pRasterizationState = &rasterization;
+                info.pMultisampleState = &multisample;
+                info.pDepthStencilState = &depth_stencil;
+                info.pColorBlendState = &color_blend;
+                info.pDynamicState = &dynamic;
+                info.layout = layout;
+                info.renderPass = render_pass;
+                info.subpass = 0u;
+                return vkCreateGraphicsPipelines(s.device, VK_NULL_HANDLE, 1, &info, nullptr,
+                                                 &pipeline) == VK_SUCCESS;
+            };
+            if (!make_pipeline(s.cloud_march_fragment_shader, s.cloud_target_pipeline_layout,
+                               s.cloud_target_render_pass, false, s.cloud_target_pipeline) ||
+                !make_pipeline(s.cloud_resolve_fragment_shader, s.cloud_dual_pipeline_layout,
+                               s.cloud_target_render_pass, false, s.cloud_resolve_pipeline) ||
+                !make_pipeline(s.cloud_composite_fragment_shader, s.cloud_dual_pipeline_layout,
+                               s.render_pass, true, s.cloud_composite_pipeline)) {
+                cloud_ok = false;
+            }
+        }
+
+        s.cloud_enabled = cloud_ok;
+        std::fprintf(stderr,
+                    "[clouds] setup %s history=%ux%u march=%ux%u downscale_div=%u\n",
+                    cloud_ok ? "OK" : "FAILED (feature left disabled)", cloud_width, cloud_height,
+                    march_width, march_height, divisor);
+    }
+
     // 1x1 white texture, bound for untextured draws so one pipeline layout and
     // one descriptor slot serve every batch.
     const std::array<std::byte, 4> white{std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
@@ -2960,6 +3524,435 @@ void destroy_backend(VulkanGeState &s) noexcept {
            (static_cast<std::uint32_t>(enabled ? 1u : 0u) << 24u);
 }
 
+// Direct port of ge_gpu_backend_dx12.cpp's invert_cloud_matrix(): Gauss-Jordan
+// in double precision. GE projection matrices are small, but the far plane
+// can still make a float-only inverse needlessly fragile.
+bool invert_cloud_matrix(const std::array<float, 16> &matrix,
+                         std::array<double, 16> &inverse) noexcept {
+    double rows[4][8]{};
+    double scale = 0.0;
+    for (std::size_t row = 0u; row < 4u; ++row) {
+        for (std::size_t column = 0u; column < 4u; ++column) {
+            const double value = matrix[column * 4u + row];
+            if (!std::isfinite(value)) return false;
+            rows[row][column] = value;
+            scale = std::max(scale, std::abs(value));
+        }
+        rows[row][4u + row] = 1.0;
+    }
+    if (!(scale > 0.0)) return false;
+    const double epsilon = scale * 1.0e-12;
+    for (std::size_t column = 0u; column < 4u; ++column) {
+        std::size_t pivot = column;
+        for (std::size_t row = column + 1u; row < 4u; ++row) {
+            if (std::abs(rows[row][column]) > std::abs(rows[pivot][column])) pivot = row;
+        }
+        if (std::abs(rows[pivot][column]) <= epsilon) return false;
+        if (pivot != column) {
+            for (std::size_t entry = 0u; entry < 8u; ++entry)
+                std::swap(rows[pivot][entry], rows[column][entry]);
+        }
+        const double divisor = rows[column][column];
+        for (double &entry : rows[column]) entry /= divisor;
+        for (std::size_t row = 0u; row < 4u; ++row) {
+            if (row == column) continue;
+            const double factor = rows[row][column];
+            for (std::size_t entry = 0u; entry < 8u; ++entry) rows[row][entry] -= factor * rows[column][entry];
+        }
+    }
+    std::array<double, 16> result{};
+    for (std::size_t row = 0u; row < 4u; ++row) {
+        for (std::size_t column = 0u; column < 4u; ++column) {
+            const double value = rows[row][4u + column];
+            if (!std::isfinite(value)) return false;
+            result[column * 4u + row] = value;
+        }
+    }
+    inverse = result;
+    return true;
+}
+
+// Picks the camera the cloud march should use. ge_gpu_backend_observe_camera
+// is called for every draw during accumulation, regardless of which
+// framebuffer-address bucket ends up "winning" the frame (see
+// VulkanGeState::FrameBucket) -- so s.cloud_cameras can hold candidates from
+// targets that never make it to the screen (reflections, minimap, scratch
+// render targets), not just the real 3D world camera. An earlier version of
+// this function picked the globally highest-occluding-weight candidate with
+// no target filter at all; that let a non-rotating (or differently-rotating)
+// camera from one of those other targets win, which is exactly what made the
+// composited cloud layer look pinned to the screen/mouse instead of the
+// world -- confirmed live by bypassing temporal resolve entirely (forcing a
+// fresh full-resolution march every frame) and the symptom persisting, which
+// ruled out reprojection and pointed back at camera selection. Filtering to
+// `target_address` (the actual winning bucket for this frame) is the fix,
+// mirroring ge_gpu_backend_dx12.cpp's kVcsWorldFramebuffer filter -- DX12
+// needs a full framebuffer-feedback ancestor graph to compute the equivalent
+// filter because it has to track many live render targets at once; this
+// backend already knows the single target that won this frame outright.
+const CloudCameraCandidate *select_cloud_camera(const VulkanGeState &s,
+                                                 std::uint32_t target_address) noexcept {
+    const CloudCameraCandidate *best = nullptr;
+    for (const CloudCameraCandidate &candidate : s.cloud_cameras) {
+        if (candidate.occluding_weight == 0u || candidate.target != target_address) continue;
+        if (best == nullptr || candidate.occluding_weight > best->occluding_weight ||
+            (candidate.occluding_weight == best->occluding_weight && candidate.weight > best->weight))
+            best = &candidate;
+    }
+    return best;
+}
+
+// Direct port of ge_gpu_backend_dx12.cpp's cloud_present_constants(): folds
+// the GE viewport into the camera's projection exactly as the transform
+// constants do for native geometry, inverts it to recover view-space ray
+// directions for the screen corners, and rotates those into world space
+// using the GE view matrix's exact (unnormalized) inverse. See
+// ge_cloud_camera_math.hpp for why that inverse is exact for every
+// nonsingular GE view.
+CloudUniforms cloud_present_constants(const VulkanGeState &s, std::uint32_t target_address) noexcept {
+    CloudUniforms out{};
+    const auto &config = vcs_configuration().volumetric_clouds;
+    if (!config.enabled || s.cloud_cameras.empty()) return out;
+    const CloudCameraCandidate *camera = select_cloud_camera(s, target_address);
+    if (camera == nullptr) return out;
+
+    GeCloudCameraFrame frame{};
+    if (!ge_cloud_camera_frame_from_view(camera->view, frame)) return out;
+    const float logical_width = static_cast<float>(std::max<std::uint32_t>(1u, kPspWidth));
+    const float logical_height = static_cast<float>(std::max<std::uint32_t>(1u, kPspHeight));
+    const float x_a = camera->viewport[0] * (2.0f / logical_width);
+    const float y_a = camera->viewport[1] * (2.0f / logical_height);
+    const float x_b =
+        (camera->viewport[2] - camera->viewport[4]) * (2.0f / logical_width) - 1.0f;
+    const float y_b =
+        (camera->viewport[3] - camera->viewport[5]) * (2.0f / logical_height) - 1.0f;
+    if (!std::isfinite(x_a) || !std::isfinite(y_a) || std::abs(x_a) < 1.0e-6f ||
+        std::abs(y_a) < 1.0e-6f)
+        return out;
+
+    std::array<float, 16> effective_projection{};
+    for (std::size_t column = 0u; column < 4u; ++column) {
+        const std::size_t base = column * 4u;
+        effective_projection[base + 0u] =
+            x_a * camera->projection[base + 0u] + x_b * camera->projection[base + 3u];
+        effective_projection[base + 1u] =
+            -y_a * camera->projection[base + 1u] - y_b * camera->projection[base + 3u];
+        effective_projection[base + 2u] = camera->projection[base + 2u];
+        effective_projection[base + 3u] = camera->projection[base + 3u];
+    }
+    std::array<double, 16> inverse_projection{};
+    if (!invert_cloud_matrix(effective_projection, inverse_projection)) return out;
+
+    const auto view_direction = [&](double ndc_x, double ndc_y, std::array<double, 3> &direction) {
+        constexpr double clip_z = 0.5;
+        const std::array<double, 4> clip{ndc_x, ndc_y, clip_z, 1.0};
+        std::array<double, 4> point{};
+        for (std::size_t row = 0u; row < 4u; ++row)
+            for (std::size_t column = 0u; column < 4u; ++column)
+                point[row] += inverse_projection[column * 4u + row] * clip[column];
+        if (!std::isfinite(point[3]) || std::abs(point[3]) < 1.0e-12) return false;
+        for (std::size_t axis = 0u; axis < 3u; ++axis) {
+            direction[axis] = point[axis] / point[3];
+            if (!std::isfinite(direction[axis])) return false;
+        }
+        return true;
+    };
+    std::array<double, 3> center_view{}, right_view{}, up_view{};
+    if (!view_direction(0.0, 0.0, center_view) || !view_direction(1.0, 0.0, right_view) ||
+        !view_direction(0.0, 1.0, up_view))
+        return out;
+    const auto to_world = [&](const std::array<double, 3> &value) {
+        return std::array<double, 3>{
+            frame.view_to_world[0] * value[0] + frame.view_to_world[1] * value[1] +
+                frame.view_to_world[2] * value[2],
+            frame.view_to_world[3] * value[0] + frame.view_to_world[4] * value[1] +
+                frame.view_to_world[5] * value[2],
+            frame.view_to_world[6] * value[0] + frame.view_to_world[7] * value[1] +
+                frame.view_to_world[8] * value[2]};
+    };
+    const std::array<double, 3> center_world = to_world(center_view);
+    const std::array<double, 3> right_world = to_world(right_view);
+    const std::array<double, 3> up_world = to_world(up_view);
+    for (std::size_t axis = 0u; axis < 3u; ++axis) {
+        const double ray_right = right_world[axis] - center_world[axis];
+        const double ray_up = up_world[axis] - center_world[axis];
+        if (!std::isfinite(ray_right) || !std::isfinite(ray_up) || !std::isfinite(center_world[axis]))
+            return CloudUniforms{};
+        out.ray_right_time[axis] = static_cast<float>(ray_right);
+        out.ray_up_seed[axis] = static_cast<float>(ray_up);
+        out.ray_forward_opacity[axis] = static_cast<float>(center_world[axis]);
+        out.camera_settings[axis] = camera->camera_position[axis];
+    }
+    // NOTE: camera-input smoothing used to live here as a hard
+    // round-to-grid quantization. Reverted: confirmed live to trade
+    // continuous idle jitter for discrete jumps whenever a value crossed a
+    // grid boundary, which only happens while the camera is moving --
+    // exactly reproducing "flickers only when moving". Replaced with a
+    // continuous exponential low-pass filter applied in
+    // record_cloud_offscreen_passes (the caller, which can hold persistent
+    // state across frames; this function is call-by-const-ref and cannot).
+    out.ray_right_time[3] = static_cast<float>(s.frame_epoch) * (1.0f / 60.0f);
+    out.ray_up_seed[3] = config.random_seed;
+    out.ray_forward_opacity[3] = config.opacity;
+    const std::uint32_t settings = std::clamp<std::uint32_t>(config.layers, 1u, 3u) |
+        (std::clamp<std::uint32_t>(config.shadow_steps, 2u, 8u) << 8u) | 0x10000u;
+    out.camera_settings[3] = std::bit_cast<float>(settings);
+    out.coverage_speed = {config.coverage_low, config.coverage_mid, config.coverage_high, config.speed};
+    out.sun_direction_day = {config.sun_direction_x, config.sun_direction_y, config.sun_direction_z,
+                             config.day_progression};
+    out.sun_color_atmosphere = {config.sun_color_r, config.sun_color_g, config.sun_color_b,
+                                config.atmosphere_density};
+    out.cloud_color_mist = {config.cloud_base_color_r, config.cloud_base_color_g,
+                            config.cloud_base_color_b, config.mist};
+    out.fog_color_start = {config.fog_color_r, config.fog_color_g, config.fog_color_b,
+                           config.fog_start};
+    out.brightness_padding[0] = config.brightness;
+    return out;
+}
+
+// Direct port of ge_gpu_backend_dx12.cpp's record_clouds_into_world_target(),
+// restructured for Vulkan: the march/resolve passes are independent offscreen
+// render passes (see s.cloud_target_render_pass), and the composite draw is
+// issued by the caller as an ordinary batch inline in the still-open main GE
+// render pass -- this function only fills in per-draw UBO contents, updates
+// the two dual-texture descriptor sets' image bindings for this frame, and
+// records the march/resolve passes. It does not touch s.color_image/
+// s.depth_image or any render pass targeting them.
+struct CloudFrameDraws {
+    // False whenever no composite draw should happen this frame: clouds
+    // disabled/unavailable, no camera candidate, or cloud_present_constants
+    // rejected the camera (non-finite/singular matrix). Gates the caller's
+    // FadingEntities-boundary composite draw so it never samples a
+    // cloud_set_composite descriptor that record_cloud_offscreen_passes
+    // never actually wrote for this frame (stale data from an earlier frame,
+    // or fully uninitialized on the very first attempt).
+    bool ready{};
+    bool full_current_frame{};
+    std::uint32_t current_history_index{};
+};
+
+CloudFrameDraws record_cloud_offscreen_passes(VulkanGeState &s, const CloudUniforms &clouds) noexcept {
+    CloudFrameDraws result{};
+    if (!s.cloud_enabled) return result;
+    CloudUniforms base = clouds;
+    const std::uint32_t settings = std::bit_cast<std::uint32_t>(base.camera_settings[3]);
+    if ((settings & 0x10000u) == 0u) return result;
+
+    const std::uint32_t previous_index = s.cloud_history_index & 1u;
+    const std::uint32_t current_index = 1u - previous_index;
+    VulkanGeState::CloudTarget &previous = s.cloud_history[previous_index];
+    VulkanGeState::CloudTarget &current = s.cloud_history[current_index];
+    const auto &config = vcs_configuration().volumetric_clouds;
+
+    float camera_delta_squared = 0.0f;
+    if (s.cloud_history_valid) {
+        for (std::size_t axis = 0u; axis < 3u; ++axis) {
+            const float delta = base.camera_settings[axis] - s.cloud_previous_camera[axis];
+            camera_delta_squared += delta * delta;
+        }
+    }
+    // VCS' third-person camera translates while orbiting the player.
+    // Reproject ordinary translation against the physical cloud slabs in the
+    // shader and reset only for an actual cut/teleport (50 world units in
+    // one frame).
+    const bool camera_cut = s.cloud_history_valid && camera_delta_squared > 2500.0f;
+
+    // Camera-input smoothing (first a round-to-grid quantization, then a
+    // low-pass filter) was tried here to damp standing-still flicker.
+    // Reverted: standing-still flicker was actually fully fixed by removing
+    // the g_Time offset from the march step dither (see CloudAtRay's step
+    // computation below) -- this smoothing was solving an already-solved
+    // problem, and its side effects (discrete snapping with quantization,
+    // then visible lag/drag under fast rotation with the low-pass filter,
+    // reported live as clouds "moving with my mouse" again) were net
+    // negative. Camera inputs are used raw.
+    // Sparse temporal march + resolve (the DX12-equivalent path) produces
+    // severe blocky artifacts under real, continuous camera rotation on this
+    // backend -- confirmed live, and not yet root-caused (the reprojection
+    // math in cloud_resolve.frag's PreviousCloudNdc/PreviousCloudDirection
+    // was never independently validated this session, unlike the march
+    // path). Forcing a full-resolution march every frame bypasses resolve
+    // and its reprojection entirely, trading some GPU cost (mitigated by
+    // DownscaleDiv already halving the march target) for a known-clean
+    // result. Revisit if the reprojection bug gets root-caused later.
+    // Sparse temporal march + resolve (the DX12-equivalent path): two real
+    // bugs in it were found and fixed this session (an ineffective safety-
+    // rail floor, and an uninitialized-history NaN leak -- see
+    // cloud_resolve.frag and the history-slot clear in this function's
+    // cloud setup block), but live testing after both fixes still showed
+    // severe blocky corruption, worse than before. There is at least one
+    // more defect in this path that further inline fixes did not reach in
+    // the time available. Given the zero-artifact requirement, forcing a
+    // full-resolution march every frame is the only configuration verified
+    // clean end-to-end; flicker (a separate, much smaller problem) is
+    // addressed directly at its own root cause instead -- see
+    // cloud_march.frag's smoothed density gate.
+    const bool full_current_frame = true;
+    (void)camera_cut;
+    for (std::size_t axis = 0u; axis < 3u; ++axis)
+        base.brightness_padding[1u + axis] =
+            s.cloud_history_valid ? s.cloud_previous_camera[axis] : base.camera_settings[axis];
+    constexpr std::array<std::array<float, 2>, 4> kBayerSlots{
+        {{{0.0f, 0.0f}}, {{1.0f, 1.0f}}, {{1.0f, 0.0f}}, {{0.0f, 1.0f}}}};
+    const auto &subpixel = kBayerSlots[s.cloud_temporal_frame & 3u];
+
+    const auto copy_previous_basis = [&](std::array<float, 4> &destination, int which) {
+        for (std::size_t axis = 0u; axis < 3u; ++axis)
+            destination[axis] = s.cloud_history_valid
+                ? s.cloud_previous_ray_basis[static_cast<std::size_t>(which) * 3u + axis]
+                : (which == 0 ? base.ray_right_time[axis]
+                   : which == 1 ? base.ray_up_seed[axis]
+                                : base.ray_forward_opacity[axis]);
+    };
+    copy_previous_basis(base.previous_right_history, 0);
+    copy_previous_basis(base.previous_up_blend, 1);
+    copy_previous_basis(base.previous_forward_spatial, 2);
+    base.previous_right_history[3] = s.cloud_history_valid && !camera_cut ? 1.0f : 0.0f;
+    base.previous_up_blend[3] = std::clamp(config.temporal_blend, 0.0f, 0.95f);
+    base.previous_forward_spatial[3] = std::clamp(config.temporal_denoise * 0.012f, 0.0f, 0.25f);
+    base.texel_subpixel = {1.0f / static_cast<float>(current.width),
+                           1.0f / static_cast<float>(current.height), subpixel[0], subpixel[1]};
+    base.control = {full_current_frame ? 1.0f : 0.0f,
+                    config.temporal_clamp <= 0.0f
+                        ? 1000.0f
+                        : std::clamp(config.temporal_clamp * 2.0f, 0.5f, 16.0f),
+                    0.0f, 0.0f};
+
+    VkCommandBuffer cmd = s.command_buffer;
+    const auto draw_into = [&](VulkanGeState::CloudTarget &destination, VkPipeline pipeline,
+                               VkPipelineLayout layout, VkDescriptorSet set) {
+        VkClearValue clear{};
+        clear.color = VkClearColorValue{{0.0f, 0.0f, 0.0f, 1.0f}};
+        VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        begin.renderPass = s.cloud_target_render_pass;
+        begin.framebuffer = destination.framebuffer;
+        begin.renderArea.extent = {destination.width, destination.height};
+        begin.clearValueCount = 1u;
+        begin.pClearValues = &clear;
+        vkCmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
+        VkViewport viewport{0.0f, 0.0f, static_cast<float>(destination.width),
+                           static_cast<float>(destination.height), 0.0f, 1.0f};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        VkRect2D scissor{{0, 0}, {destination.width, destination.height}};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
+        vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
+        vkCmdEndRenderPass(cmd);
+        // The render pass's finalLayout (SHADER_READ_ONLY_OPTIMAL) performs
+        // the image LAYOUT transition, but Vulkan's implicit external
+        // subpass dependency (used because this render pass declares no
+        // explicit VkSubpassDependency) carries no access-mask guarantee
+        // beyond that -- it does not, on its own, guarantee this pass's
+        // fragment-shader color writes are actually visible to a later
+        // fragment-shader read of the same image as a sampled texture. An
+        // explicit barrier is the only thing that actually makes that
+        // promise. Every consumer of a cloud target (resolve reading march,
+        // composite reading the resolved/direct history) samples it inside
+        // the same command buffer shortly after this, so this is a real,
+        // always-relevant gap, not a theoretical one -- added while
+        // investigating a persistent, hard-to-reproduce garbage-block
+        // artifact that survived every purely shader-side fix attempted.
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = destination.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &barrier);
+    };
+
+    if (full_current_frame) {
+        std::memcpy(s.cloud_ubo_target_mapped, &base, sizeof(CloudUniforms));
+        draw_into(current, s.cloud_target_pipeline, s.cloud_target_pipeline_layout,
+                 s.cloud_set_target);
+    } else {
+        CloudUniforms march_constants = base;
+        march_constants.control[0] = 0.0f;
+        std::memcpy(s.cloud_ubo_target_mapped, &march_constants, sizeof(CloudUniforms));
+        draw_into(s.cloud_march, s.cloud_target_pipeline, s.cloud_target_pipeline_layout,
+                 s.cloud_set_target);
+
+        VkDescriptorImageInfo resolve_tex0{s.cloud_sampler, s.cloud_march.view,
+                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo resolve_tex1{s.cloud_sampler, previous.view,
+                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        std::array<VkWriteDescriptorSet, 2> resolve_writes{};
+        resolve_writes[0] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        resolve_writes[0].dstSet = s.cloud_set_resolve;
+        resolve_writes[0].dstBinding = 0u;
+        resolve_writes[0].descriptorCount = 1u;
+        resolve_writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        resolve_writes[0].pImageInfo = &resolve_tex0;
+        resolve_writes[1] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        resolve_writes[1].dstSet = s.cloud_set_resolve;
+        resolve_writes[1].dstBinding = 1u;
+        resolve_writes[1].descriptorCount = 1u;
+        resolve_writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        resolve_writes[1].pImageInfo = &resolve_tex1;
+        vkUpdateDescriptorSets(s.device, static_cast<std::uint32_t>(resolve_writes.size()),
+                               resolve_writes.data(), 0, nullptr);
+
+        std::memcpy(s.cloud_ubo_resolve_mapped, &base, sizeof(CloudUniforms));
+        draw_into(current, s.cloud_resolve_pipeline, s.cloud_dual_pipeline_layout,
+                 s.cloud_set_resolve);
+    }
+
+    s.cloud_history_index = current_index;
+    ++s.cloud_temporal_frame;
+    for (std::size_t axis = 0u; axis < 3u; ++axis) {
+        s.cloud_previous_camera[axis] = base.camera_settings[axis];
+        s.cloud_previous_ray_basis[axis] = base.ray_right_time[axis];
+        s.cloud_previous_ray_basis[3u + axis] = base.ray_up_seed[axis];
+        s.cloud_previous_ray_basis[6u + axis] = base.ray_forward_opacity[axis];
+    }
+    s.cloud_history_valid = true;
+
+    // Composite's UBO/descriptor set is prepared here (current history +
+    // output resolution) but the draw itself is issued by the caller inline
+    // in the main GE render pass, since that render pass is not open yet at
+    // this point in frame recording.
+    CloudUniforms composite_constants = base;
+    composite_constants.control[0] = 0.0f;
+    composite_constants.control[2] = static_cast<float>(s.width);
+    composite_constants.control[3] = static_cast<float>(s.height);
+    std::memcpy(s.cloud_ubo_composite_mapped, &composite_constants, sizeof(CloudUniforms));
+    // binding1 is declared but unread by cloud_composite.frag (a screen-
+    // space temporal blend that used to read it here was tried and reverted
+    // -- see cloud_composite.frag's comment); still bound to a real,
+    // known-initialized image rather than left stale so the descriptor
+    // itself is never in an undefined state.
+    VkDescriptorImageInfo composite_tex0{s.cloud_sampler, current.view,
+                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo composite_tex1{s.cloud_sampler, current.view,
+                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    std::array<VkWriteDescriptorSet, 2> composite_writes{};
+    composite_writes[0] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    composite_writes[0].dstSet = s.cloud_set_composite;
+    composite_writes[0].dstBinding = 0u;
+    composite_writes[0].descriptorCount = 1u;
+    composite_writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    composite_writes[0].pImageInfo = &composite_tex0;
+    composite_writes[1] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    composite_writes[1].dstSet = s.cloud_set_composite;
+    composite_writes[1].dstBinding = 1u;
+    composite_writes[1].descriptorCount = 1u;
+    composite_writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    composite_writes[1].pImageInfo = &composite_tex1;
+    vkUpdateDescriptorSets(s.device, static_cast<std::uint32_t>(composite_writes.size()),
+                           composite_writes.data(), 0, nullptr);
+
+    result.ready = true;
+    result.full_current_frame = full_current_frame;
+    result.current_history_index = current_index;
+    return result;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -3028,9 +4021,44 @@ void ge_gpu_backend_record_draw(const GeGpuDrawDescriptor &draw) noexcept {
     if (draw.framebuffer_address != 0u) ++s.report.framebuffer_targets_observed;
 }
 
-void ge_gpu_backend_observe_camera(const std::array<float, 12> &, const std::array<float, 16> &,
-                                   const std::array<float, 6> &, const std::array<float, 3> &,
-                                   const GeGpuDrawDescriptor &, std::uint32_t) noexcept {}
+void ge_gpu_backend_observe_camera(const std::array<float, 12> &view,
+                                   const std::array<float, 16> &projection,
+                                   const std::array<float, 6> &viewport,
+                                   const std::array<float, 3> &camera_position,
+                                   const GeGpuDrawDescriptor &draw,
+                                   std::uint32_t vertex_weight) noexcept {
+    VulkanGeState &s = state();
+    if (!s.enabled || !vcs_configuration().volumetric_clouds.enabled || vertex_weight == 0u ||
+        !draw.depth_test_enabled)
+        return;
+    if (!std::all_of(view.begin(), view.end(), [](float value) { return std::isfinite(value); }) ||
+        !std::all_of(projection.begin(), projection.end(),
+                     [](float value) { return std::isfinite(value); }) ||
+        !std::all_of(viewport.begin(), viewport.end(),
+                     [](float value) { return std::isfinite(value); }) ||
+        !std::all_of(camera_position.begin(), camera_position.end(),
+                     [](float value) { return std::isfinite(value); }))
+        return;
+    const std::uint32_t target = draw.framebuffer_address & 0x001FFFF0u;
+    const auto found = std::find_if(
+        s.cloud_cameras.begin(), s.cloud_cameras.end(),
+        [&](const CloudCameraCandidate &candidate) {
+            return candidate.target == target && candidate.view == view &&
+                   candidate.projection == projection && candidate.viewport == viewport;
+        });
+    if (found != s.cloud_cameras.end()) {
+        found->weight += vertex_weight;
+        found->camera_position = camera_position;
+        if ((draw.depth_function & 7u) >= 2u) found->occluding_weight += vertex_weight;
+        return;
+    }
+    // Normal gameplay has only a handful of camera variants per frame. A hard
+    // cap prevents malformed guest state from growing this host-only observer.
+    if (s.cloud_cameras.size() >= 16u) return;
+    const std::uint64_t occluding_weight = (draw.depth_function & 7u) >= 2u ? vertex_weight : 0u;
+    s.cloud_cameras.push_back({view, projection, viewport, camera_position, target, vertex_weight,
+                               occluding_weight});
+}
 
 bool ge_gpu_backend_stage_vertices(const GeGpuDrawDescriptor &,
                                    std::span<const GeGpuVertex>) noexcept {
@@ -3308,6 +4336,9 @@ void ge_gpu_backend_accumulate_color_triangles(
     batch.descriptor = descriptor;
     batch.scissor = {draw.scissor_x0, draw.scissor_y0, draw.scissor_x1, draw.scissor_y1};
     batch.framebuffer_stride = draw.framebuffer_stride;
+    batch.clear_mode = draw.clear_mode;
+    batch.depth_test_enabled = draw.depth_test_enabled;
+    batch.depth_write_enabled = draw.depth_write_enabled;
     if (blend_variant(draw) == 4u) {
         const std::uint32_t fixed = draw.blend_fix_source;
         batch.blend_constants = {static_cast<float>(fixed & 0xFFu) / 255.0f,
@@ -3964,6 +4995,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     s.report.frames_without_displayed_target += rejected_vertices;
     if (winner == nullptr || (winner->batches.empty() && winner->hw_batches.empty())) {
         s.frame_buckets.clear();
+        s.cloud_cameras.clear();
         return produced_frame;
     }
     s.last_winner_address = winner->address;
@@ -3993,12 +5025,14 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             s.enabled = false;
             s.report.message = "vertex buffer growth failed; reverted to software GE";
             s.frame_buckets.clear();
+        s.cloud_cameras.clear();
             return produced_frame;
         }
         s.vertex_capacity = capacity;
         s.report.upload_capacity_bytes = capacity;
         ++s.report.game_vertex_overflows;
         s.frame_buckets.clear();
+        s.cloud_cameras.clear();
         return produced_frame;
     }
 
@@ -4043,6 +5077,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(s.command_buffer, &begin) != VK_SUCCESS) {
         s.frame_buckets.clear();
+        s.cloud_cameras.clear();
         return produced_frame;
     }
 
@@ -4050,6 +5085,38 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         vkCmdResetQueryPool(s.command_buffer, s.timestamp_pool, 0u, 2u);
         vkCmdWriteTimestamp(s.command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s.timestamp_pool,
                             0u);
+    }
+
+    // Volumetric clouds: the march/temporal-resolve passes are independent
+    // offscreen render passes (their own small history/march targets, never
+    // touching s.color_image/s.depth_image), so they run here, before the
+    // main GE render pass opens. select_cloud_camera filters to
+    // winner->address (this frame's actual displayed target) since
+    // s.cloud_cameras can otherwise hold candidates from targets that never
+    // make it to the screen -- see that function's comment. The composite
+    // draw itself is issued later, inline in the main render pass
+    // loop below, at the FadingEntities boundary (see cloud_camera use
+    // there) -- it needs s.depth_image live for its EQUAL depth test, which
+    // this backend only keeps valid while that render pass is still open
+    // (see VulkanGeState::cloud_history's comment for why).
+    const CloudCameraCandidate *cloud_camera = select_cloud_camera(s, winner->address);
+    const CloudUniforms clouds = cloud_present_constants(s, winner->address);
+    const CloudFrameDraws cloud_draws =
+        cloud_camera != nullptr ? record_cloud_offscreen_passes(s, clouds) : CloudFrameDraws{};
+    if (std::getenv("PSPRECOMP_CLOUD_DIAG") != nullptr) {
+        static std::uint64_t cloud_diag_frame = 0u;
+        if (!s.cloud_cameras.empty() && (cloud_diag_frame % 15u) == 0u) {
+            std::fprintf(stderr,
+                "[cloud-diag] frame=%llu cameras=%zu right=(%.3f,%.3f,%.3f) "
+                "up=(%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) camerapos=(%.1f,%.1f,%.1f)\n",
+                static_cast<unsigned long long>(cloud_diag_frame), s.cloud_cameras.size(),
+                clouds.ray_right_time[0], clouds.ray_right_time[1], clouds.ray_right_time[2],
+                clouds.ray_up_seed[0], clouds.ray_up_seed[1], clouds.ray_up_seed[2],
+                clouds.ray_forward_opacity[0], clouds.ray_forward_opacity[1],
+                clouds.ray_forward_opacity[2], clouds.camera_settings[0], clouds.camera_settings[1],
+                clouds.camera_settings[2]);
+        }
+        ++cloud_diag_frame;
     }
 
     std::array<VkClearValue, 2> clears{};
@@ -4089,8 +5156,52 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             winner->batches.size(), static_cast<unsigned long long>(batches_merged_away));
     }
 
+    // FadingEntities boundary detection for the cloud composite draw: the
+    // run of opaque, depth-writing world geometry ends and the first
+    // depth-tested-but-not-depth-writing draw begins. Direct port of
+    // ge_gpu_backend_dx12.cpp's cloud_depth_writing_world_seen /
+    // fading_entities_boundary heuristic -- see
+    // docs/VCS_CLOUDWORKS_GAME_INTEGRATION.md for why this heuristic (rather
+    // than a game-side marker, which the PSP GE doesn't expose) is the
+    // insertion point.
+    bool cloud_depth_writing_world_seen = false;
+    bool clouds_composited = false;
+
     VkPipeline bound = VK_NULL_HANDLE;
     for (const Batch &batch : winner->batches) {
+        if (!batch.clear_mode && batch.depth_test_enabled && batch.depth_write_enabled)
+            cloud_depth_writing_world_seen = true;
+        const bool fading_entities_boundary = cloud_depth_writing_world_seen && !batch.clear_mode &&
+            batch.depth_test_enabled && !batch.depth_write_enabled;
+        if (!clouds_composited && cloud_draws.ready && fading_entities_boundary) {
+            clouds_composited = true;
+            if (std::getenv("PSPRECOMP_CLOUD_DIAG") != nullptr) {
+                static std::uint64_t composite_diag_count = 0u;
+                if (composite_diag_count < 60u) {
+                    std::fprintf(stderr, "[cloud-diag] composite draw issued, batch_clear=%d\n",
+                                batch.clear_mode ? 1 : 0);
+                    ++composite_diag_count;
+                }
+            }
+            VkRect2D composite_scissor{{0, 0}, {s.width, s.height}};
+            vkCmdSetScissor(s.command_buffer, 0, 1, &composite_scissor);
+            const std::array<float, 4> no_blend_constants{1.0f, 1.0f, 1.0f, 1.0f};
+            vkCmdSetBlendConstants(s.command_buffer, no_blend_constants.data());
+            vkCmdBindPipeline(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              s.cloud_composite_pipeline);
+            vkCmdBindDescriptorSets(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    s.cloud_dual_pipeline_layout, 0, 1, &s.cloud_set_composite, 0,
+                                    nullptr);
+            vkCmdDraw(s.command_buffer, 3u, 1u, 0u, 0u);
+            // Every piece of bound state below is pipeline-layout-specific
+            // (cloud draws use their own descriptor set layout, distinct
+            // from the GE pipeline layout) or was simply overwritten above
+            // (scissor/blend constants) -- force every batch after this one
+            // to rebind everything rather than trust stale "already bound"
+            // tracking across the cloud draw.
+            bound = VK_NULL_HANDLE;
+        }
+
         if (batch.pipeline != bound) {
             vkCmdBindPipeline(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, batch.pipeline);
             bound = batch.pipeline;
@@ -4357,6 +5468,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
 
     if (vkEndCommandBuffer(s.command_buffer) != VK_SUCCESS) {
         s.frame_buckets.clear();
+        s.cloud_cameras.clear();
         return produced_frame;
     }
 
@@ -4388,6 +5500,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     }
 
     s.frame_buckets.clear();
+    s.cloud_cameras.clear();
     return produced_frame;
 }
 

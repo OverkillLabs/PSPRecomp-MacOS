@@ -157,6 +157,14 @@ enum GameLocation {
     static var iniURL: URL {
         appURL.appendingPathComponent("Contents/MacOS/VCSNative.ini")
     }
+    // CloudWorks/ProperShaders' own settings (see [VolumetricClouds] in the
+    // ini) live in a separate file from VCSNative.ini, bundled alongside it
+    // in the same Contents/MacOS directory -- a second IniDocument instance
+    // below points at this one specifically, since IniDocument itself is
+    // file-agnostic (just a section/key editor over whatever URL it's given).
+    static var properShadersURL: URL {
+        appURL.appendingPathComponent("Contents/MacOS/ProperShaders.ini")
+    }
 }
 
 // MARK: - Small shared row/note styles
@@ -201,6 +209,7 @@ enum Category: String, CaseIterable, Identifiable {
 
 struct ContentView: View {
     @ObservedObject var doc: IniDocument
+    @ObservedObject var properShadersDoc: IniDocument
     @State private var selection: Category? = .window
     @State private var saveMessage: String?
     @State private var launching = false
@@ -240,6 +249,19 @@ struct ContentView: View {
     private var bloomEnabled: Binding<Bool> { doc.binding("SimulateHDR", "Enabled", default: false) }
     private var bloomThreshold: Binding<Double> { doc.binding("SimulateHDR", "Threshold", default: 0.80) }
     private var bloomIntensity: Binding<Double> { doc.binding("SimulateHDR", "Intensity", default: 0.60) }
+
+    // Volumetric clouds (CloudWorks/ProperShaders port, Vulkan backend only)
+    // -- lives in ProperShaders.ini, not VCSNative.ini, hence the separate
+    // properShadersDoc. Off by default: functional and visually verified
+    // live, but the underlying temporal-reprojection system (the DX12-
+    // equivalent design, which would let clouds march at a lower per-frame
+    // cost) has an unresolved defect and stays disabled in code, so this
+    // runs a full-resolution march every frame -- correct and stable, but a
+    // real, measured ~2ms/frame GPU cost with no user-facing quality knob
+    // for that tradeoff yet. Experimental until that's revisited.
+    private var cloudsEnabled: Binding<Bool> {
+        properShadersDoc.binding("VolumetricClouds", "Enabled", default: false)
+    }
 
     // Color grading ("Vice Neon" preset)
     private var gradingEnabled: Binding<Bool> { doc.binding("ColorGrading", "Enabled", default: false) }
@@ -488,6 +510,12 @@ struct ContentView: View {
                     }
                 }
 
+                Section("Volumetric clouds") {
+                    Toggle("Volumetric clouds (experimental)", isOn: cloudsEnabled)
+                        .help("A direct port of ProperShaders/CloudWorks' raymarched clouds. Vulkan GE backend only (this Mac build, or a Windows build compiled with PSPRECOMP_VCS_WIN32_VULKAN=ON) -- a default Windows (DirectX12) build silently ignores this toggle. Verified live: stable, no flicker or corruption. Marked experimental because it currently costs a real ~2ms of GPU time every frame with no quality/performance tradeoff exposed yet (the design that would let it march at a lower cost has a known unresolved bug and stays off).")
+                    Note(text: "Adds noticeable GPU cost. If you're chasing frame rate, leave this off.", tint: .orange)
+                }
+
                 Section("Color grading") {
                     Toggle("\"Vice Neon\" look", isOn: gradingEnabled)
                         .help("A researched approximation of GTA:VC's classic Miami neon aesthetic (boosted saturation, a warm sunset-leaning tint) — tuned against real ENB/ReShade community presets, not a guess. Purely optional and off by default. Honest limitation: this is one static grade, not the original game's actual day/night color-cycle system, so it can't separately push warm daytime vs cool neon-night tones.")
@@ -664,6 +692,7 @@ struct ContentView: View {
     private func save() {
         do {
             try doc.save()
+            try properShadersDoc.save()
             withAnimation { saveMessage = "Saved" }
         } catch {
             withAnimation { saveMessage = "Could not save: \(error.localizedDescription)" }
@@ -712,9 +741,10 @@ struct ContentView: View {
 @main
 struct VCSLauncherApp: App {
     @StateObject private var doc = IniDocument(fileURL: GameLocation.iniURL)
+    @StateObject private var properShadersDoc = IniDocument(fileURL: GameLocation.properShadersURL)
     var body: some Scene {
         WindowGroup {
-            ContentView(doc: doc)
+            ContentView(doc: doc, properShadersDoc: properShadersDoc)
         }
         .windowResizability(.contentSize)
         .windowToolbarStyle(.unifiedCompact)

@@ -174,11 +174,17 @@ else()
     # in the .ini), same fullscreen-triangle vertex stage too.
     # color_grade.frag: parametric color grading ([ColorGrading] in the
     # .ini), same fullscreen-triangle vertex stage.
+    # cloud_march/cloud_resolve/cloud_composite.frag: the CloudWorks
+    # volumetric cloud port ([VolumetricClouds] in ProperShaders.ini, see
+    # ge_cloudworks_present_shader.hpp for the HLSL source of truth) -- share
+    # bloom.vert's fullscreen-triangle vertex stage too (they read
+    # gl_FragCoord directly, never the vertex-interpolated UV).
     set(VCS_SHADER_STEMS psp_ge psp_ge psp_ge_hw psp_ge_hw_packed0115 bloom bloom present fxaa
-        color_grade)
-    set(VCS_SHADER_EXTS vert frag vert vert vert frag frag frag frag)
+        color_grade cloud_march cloud_resolve cloud_composite)
+    set(VCS_SHADER_EXTS vert frag vert vert vert frag frag frag frag frag frag frag)
     set(VCS_SHADER_SYMBOLS kPspGeVertSpv kPspGeFragSpv kPspGeHwVertSpv kPspGeHwPacked0115VertSpv
-        kBloomVertSpv kBloomFragSpv kPresentFragSpv kFxaaFragSpv kColorGradeFragSpv)
+        kBloomVertSpv kBloomFragSpv kPresentFragSpv kFxaaFragSpv kColorGradeFragSpv
+        kCloudMarchFragSpv kCloudResolveFragSpv kCloudCompositeFragSpv)
     list(LENGTH VCS_SHADER_STEMS VCS_SHADER_COUNT)
     math(EXPR VCS_SHADER_LAST "${VCS_SHADER_COUNT} - 1")
     foreach(VCS_SHADER_INDEX RANGE ${VCS_SHADER_LAST})

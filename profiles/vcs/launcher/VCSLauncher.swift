@@ -162,6 +162,74 @@ enum GameLocation {
     // in the same Contents/MacOS directory -- a second IniDocument instance
     // below points at this one specifically, since IniDocument itself is
     // file-agnostic (just a section/key editor over whatever URL it's given).
+    static var texturesURL: URL {
+        appURL.appendingPathComponent("Contents/MacOS/Textures")
+    }
+    static let packMarker = "VCSNative-TexturePack.txt"
+    static let packManifest = ".installed-texture-pack"
+    static var manifestURL: URL { texturesURL.appendingPathComponent(packManifest) }
+    /// Number of textures installed through the launcher (0 when nothing was installed).
+    static func texturePackCount() -> Int {
+        guard let text = try? String(contentsOf: manifestURL, encoding: .utf8) else { return 0 }
+        return text.split(separator: "\n").count
+    }
+    static func removeTexturePack() {
+        let fm = FileManager.default
+        if let text = try? String(contentsOf: manifestURL, encoding: .utf8) {
+            for name in text.split(separator: "\n") where name.hasSuffix(".png") && !name.contains("/") {
+                try? fm.removeItem(at: texturesURL.appendingPathComponent(String(name)))
+            }
+        }
+        try? fm.removeItem(at: manifestURL)
+    }
+    private static func isPackTexture(_ name: String) -> Bool {
+        let stem = name.dropLast(4)
+        return name.hasSuffix(".png") && stem.count == 16 && stem.allSatisfy { $0.isHexDigit && !$0.isUppercase }
+    }
+    /// Installs only the official texture pack zip: it must contain the pack marker file and
+    /// nothing but hash-named PNGs, so an unrelated zip is rejected without touching the game.
+    static func installTexturePack(from source: URL) -> Result<Int, Error> {
+        let fm = FileManager.default
+        let t = fm.temporaryDirectory.appendingPathComponent("vcs_pack_\(UUID().uuidString)")
+        func fail(_ m: String) -> Result<Int, Error> {
+            .failure(NSError(domain: "VCSLauncher", code: 1, userInfo: [NSLocalizedDescriptionKey: m]))
+        }
+        do {
+            guard source.pathExtension.lowercased() == "zip" else { return fail("Please choose the VCSNative texture pack .zip.") }
+            try fm.createDirectory(at: t, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: t) }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            p.arguments = ["-x", "-k", source.path, t.path]
+            try p.run(); p.waitUntilExit()
+            guard p.terminationStatus == 0 else { return fail("Could not open that zip.") }
+            var files: [URL] = []
+            var marker = false
+            if let walker = fm.enumerator(at: t, includingPropertiesForKeys: [.isDirectoryKey]) {
+                for case let f as URL in walker {
+                    if f.path.contains("__MACOSX") || f.lastPathComponent == ".DS_Store" || f.lastPathComponent.hasPrefix("._") { continue }
+                    if (try? f.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true { continue }
+                    if f.lastPathComponent == packMarker { marker = true; continue }
+                    files.append(f)
+                }
+            }
+            guard marker else { return fail("This is not a VCSNative texture pack.") }
+            guard !files.isEmpty, files.allSatisfy({ isPackTexture($0.lastPathComponent) }) else {
+                return fail("This is not a valid VCSNative texture pack.")
+            }
+            try fm.createDirectory(at: texturesURL, withIntermediateDirectories: true)
+            removeTexturePack()
+            var names: [String] = []
+            for f in files {
+                let dest = texturesURL.appendingPathComponent(f.lastPathComponent)
+                try? fm.removeItem(at: dest)
+                try fm.copyItem(at: f, to: dest)
+                names.append(f.lastPathComponent)
+            }
+            try names.joined(separator: "\n").write(to: manifestURL, atomically: true, encoding: .utf8)
+            return .success(names.count)
+        } catch { return .failure(error) }
+    }
     static var properShadersURL: URL {
         appURL.appendingPathComponent("Contents/MacOS/ProperShaders.ini")
     }
@@ -213,6 +281,11 @@ struct ContentView: View {
     @State private var selection: Category? = .window
     @State private var saveMessage: String?
     @State private var launching = false
+    @State private var packCount = GameLocation.texturePackCount()
+    private var packStatus: String {
+        packCount == 0 ? "" : "Installed (\(packCount) textures)"
+    }
+
 
     // Launcher-only preference (not an .ini key -- this toggles Apple's own
     // built-in Metal HUD overlay via the MTL_HUD_ENABLED environment
@@ -246,7 +319,7 @@ struct ContentView: View {
     private var project2dfx: Binding<Bool> { doc.binding("Project2DFX", "Enabled", default: false) }
 
     // Bloom (Vulkan backend only -- see the [SimulateHDR] comment in the ini)
-    private var bloomEnabled: Binding<Bool> { doc.binding("SimulateHDR", "Enabled", default: false) }
+    private var bloomEnabled: Binding<Bool> { doc.binding("SimulateHDR", "Enabled", default: true) }
     private var bloomThreshold: Binding<Double> { doc.binding("SimulateHDR", "Threshold", default: 0.80) }
     private var bloomIntensity: Binding<Double> { doc.binding("SimulateHDR", "Intensity", default: 0.60) }
 
@@ -259,21 +332,30 @@ struct ContentView: View {
     // runs a full-resolution march every frame -- correct and stable, but a
     // real, measured ~2ms/frame GPU cost with no user-facing quality knob
     // for that tradeoff yet. Experimental until that's revisited.
+    private var smaaEnabled: Binding<Bool> {
+        properShadersDoc.binding("SMAA", "Enabled", default: true)
+    }
+    private var ditherEnabled: Binding<Bool> { properShadersDoc.binding("Dither", "Enabled", default: true) }
+    private var casEnabled: Binding<Bool> { properShadersDoc.binding("CAS", "Enabled", default: true) }
+    private var casSharpness: Binding<Double> { properShadersDoc.binding("CAS", "Sharpness", default: 0.5) }
+    private var skyPaletteEnabled: Binding<Bool> { properShadersDoc.binding("SkyPalette", "Enabled", default: true) }
+    private var todGradeEnabled: Binding<Bool> { properShadersDoc.binding("TimeOfDayGrade", "Enabled", default: true) }
+    private var vhsEnabled: Binding<Bool> { properShadersDoc.binding("VHS", "Enabled", default: false) }
     private var cloudsEnabled: Binding<Bool> {
-        properShadersDoc.binding("VolumetricClouds", "Enabled", default: false)
+        properShadersDoc.binding("VolumetricClouds", "Enabled", default: true)
     }
 
     // Color grading ("Vice Neon" preset)
-    private var gradingEnabled: Binding<Bool> { doc.binding("ColorGrading", "Enabled", default: false) }
-    private var gradingSaturation: Binding<Double> { doc.binding("ColorGrading", "Saturation", default: 1.25) }
-    private var gradingContrast: Binding<Double> { doc.binding("ColorGrading", "Contrast", default: 1.08) }
+    private var gradingEnabled: Binding<Bool> { doc.binding("ColorGrading", "Enabled", default: true) }
+    private var gradingSaturation: Binding<Double> { doc.binding("ColorGrading", "Saturation", default: 1.18) }
+    private var gradingContrast: Binding<Double> { doc.binding("ColorGrading", "Contrast", default: 1.05) }
     private var gradingBrightness: Binding<Double> { doc.binding("ColorGrading", "Brightness", default: 0.0) }
     private var gradingTintR: Binding<Double> { doc.binding("ColorGrading", "TintR", default: 1.05) }
     private var gradingTintG: Binding<Double> { doc.binding("ColorGrading", "TintG", default: 0.98) }
     private var gradingTintB: Binding<Double> { doc.binding("ColorGrading", "TintB", default: 1.02) }
 
     // Draw distance
-    private var drawDistanceEnabled: Binding<Bool> { doc.binding("DrawDistance", "Enabled", default: false) }
+    private var drawDistanceEnabled: Binding<Bool> { doc.binding("DrawDistance", "Enabled", default: true) }
     private var drawDistanceWorld: Binding<Double> { doc.binding("DrawDistance", "World", default: 1.00) }
     private var drawDistanceVehicles: Binding<Double> { doc.binding("DrawDistance", "Vehicles", default: 1.00) }
     private var drawDistanceNPCs: Binding<Double> { doc.binding("DrawDistance", "NPCs", default: 1.00) }
@@ -458,7 +540,7 @@ struct ContentView: View {
                         Text("32-bit").tag(32)
                     }
                     .help("Precision of the depth (Z) buffer used to decide which surface is in front of another. Higher precision reduces \"z-fighting\" flicker between overlapping surfaces, especially over VCS's long draw distances. 24-bit isn't natively available on Apple's Metal, so this automatically falls back to the closest format the GPU actually supports (usually 32-bit).")
-                    Note(text: "Both genuinely affect rendering on this Vulkan/MoltenVK build. Depth precision falls back automatically to the closest format Metal actually supports if the exact bit depth isn't available.")
+                    Note(text: "Anisotropic filtering and depth precision both affect rendering on this Vulkan/MoltenVK build. Depth precision falls back automatically to the closest format Metal actually supports if the exact bit depth isn't available.")
                     LabeledContent("Texture sharpening") {
                         Slider(value: sharpen, in: 0.0...1.0, step: 0.05)
                             .frame(width: 160)
@@ -490,7 +572,7 @@ struct ContentView: View {
                 }
 
                 Section("Bloom") {
-                    Toggle("Bloom (experimental)", isOn: bloomEnabled)
+                    Toggle("Bloom", isOn: bloomEnabled)
                         .help("Adds a soft glow around bright highlights (streetlights, headlights, neon signs, sun glare). A genuinely new single-pass implementation, verified live — but only on the Vulkan GE backend: this Mac build, or a Windows build compiled with PSPRECOMP_VCS_WIN32_VULKAN=ON. A default Windows (DirectX12) build silently ignores this toggle.")
                     if bloomEnabled.wrappedValue {
                         LabeledContent("Threshold") {
@@ -510,10 +592,44 @@ struct ContentView: View {
                     }
                 }
 
+                Section("Texture pack") {
+                    if packCount > 0 {
+                        LabeledContent("Status") {
+                            Text(packStatus).foregroundStyle(.secondary)
+                        }
+                    }
+                    HStack {
+                        Button("Install…") { installTexturePack() }
+                        Button("Uninstall") { uninstallTexturePack() }.disabled(packCount == 0)
+                    }
+                    Note(text: "Optional higher-quality replacement textures. Choose the official texture pack .zip to install it, then restart the game. Uninstall removes it.")
+                }
+
                 Section("Volumetric clouds") {
-                    Toggle("Volumetric clouds (experimental)", isOn: cloudsEnabled)
-                        .help("A direct port of ProperShaders/CloudWorks' raymarched clouds. Vulkan GE backend only (this Mac build, or a Windows build compiled with PSPRECOMP_VCS_WIN32_VULKAN=ON) -- a default Windows (DirectX12) build silently ignores this toggle. Verified live: stable, no flicker or corruption. Marked experimental because it currently costs a real ~2ms of GPU time every frame with no quality/performance tradeoff exposed yet (the design that would let it march at a lower cost has a known unresolved bug and stays off).")
-                    Note(text: "Adds noticeable GPU cost. If you're chasing frame rate, leave this off.", tint: .orange)
+                    Toggle("Volumetric clouds", isOn: cloudsEnabled)
+                        .help("A direct port of ProperShaders/CloudWorks' raymarched clouds. Vulkan GE backend only (this Mac build, or a Windows build compiled with PSPRECOMP_VCS_WIN32_VULKAN=ON) -- a default Windows (DirectX12) build silently ignores this toggle. Verified live: stable, no flicker or corruption. On by default; it costs about 2ms of GPU time per frame and still holds 60 FPS on Apple M1.")
+                    Note(text: "On by default. Costs about 2ms of GPU time per frame; turn it off if you need more frame rate.")
+                }
+
+                Section("Post effects (ProperShaders)") {
+                    Toggle("Anti-banding dither", isOn: ditherEnabled)
+                        .help("Adds a one-step noise pattern to break up color banding in gradients and dark areas. Off by default.")
+                    Toggle("AMD CAS sharpening", isOn: casEnabled)
+                        .help("FidelityFX Contrast Adaptive Sharpening. Sharpens detail without haloing hard edges. Off by default.")
+                    if casEnabled.wrappedValue {
+                        LabeledContent("CAS sharpness") {
+                            Slider(value: casSharpness, in: 0.0...1.0, step: 0.05)
+                                .frame(width: 160)
+                            Text(String(format: "%.2f", casSharpness.wrappedValue))
+                                .monospacedDigit()
+                        }
+                    }
+                    Toggle("Vice City sky palette", isOn: skyPaletteEnabled)
+                        .help("Replaces the game's flat sky and distance-fog color with a Vice City palette that follows the clock: pink-magenta dawn and dusk, teal-cyan days, violet nights. Weather is preserved (grey skies stay grey). Strength is in ProperShaders.ini [SkyPalette]. Off by default.")
+                    Toggle("Time-of-day grade", isOn: todGradeEnabled)
+                        .help("Warms and saturates the picture around sunrise and sunset and cools it at night, following the in-game clock. A color grade only; the game's own lighting is unchanged. Strength is in ProperShaders.ini [TimeOfDayGrade]. Off by default.")
+                    Toggle("VHS filter", isOn: vhsEnabled)
+                        .help("Optional stylistic VHS look: tape wiggle and horizontal color smear across the whole frame, HUD included. Off by default.")
                 }
 
                 Section("Color grading") {
@@ -558,38 +674,40 @@ struct ContentView: View {
                         .help("Scales up how far away world objects, vehicles and pedestrians render/despawn, instead of the PSP's original short pop-in range. A real patch to the game's own LOD/culling code, verified live.")
                     if drawDistanceEnabled.wrappedValue {
                         LabeledContent("World objects") {
-                            Slider(value: drawDistanceWorld, in: 1.0...8.0, step: 0.25)
+                            Slider(value: drawDistanceWorld, in: 1.0...6.0, step: 0.25)
                                 .frame(width: 160)
                             Text(String(format: "%.2f×", drawDistanceWorld.wrappedValue))
                                 .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
                         }
-                        .help("Multiplies world/scenery draw distance and the game's far clip plane. 1.0 = original PSP distance, up to 8.0×.")
+                        .help("Multiplies world/scenery draw distance and the game's far clip plane. 1.0 = original PSP distance, up to 6.0×.")
                         LabeledContent("Vehicles") {
-                            Slider(value: drawDistanceVehicles, in: 1.0...4.0, step: 0.25)
+                            Slider(value: drawDistanceVehicles, in: 1.0...2.0, step: 0.25)
                                 .frame(width: 160)
                             Text(String(format: "%.2f×", drawDistanceVehicles.wrappedValue))
                                 .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
                         }
-                        .help("Multiplies vehicle spawn/despawn range, up to 4.0×. Values above 2.0× are untested for mission-trigger compatibility.")
+                        .help("Multiplies vehicle spawn/despawn range, up to 2.0×; higher values make vehicles and pedestrians despawn, so it is capped.")
                         LabeledContent("Pedestrians") {
-                            Slider(value: drawDistanceNPCs, in: 1.0...4.0, step: 0.25)
+                            Slider(value: drawDistanceNPCs, in: 1.0...2.0, step: 0.25)
                                 .frame(width: 160)
                             Text(String(format: "%.2f×", drawDistanceNPCs.wrappedValue))
                                 .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
                         }
-                        .help("Multiplies pedestrian spawn/population range, up to 4.0×. Values above 2.0× are untested for mission-trigger compatibility.")
-                        Note(text: "Above 2.0× on Vehicles/Pedestrians is untested for mission compatibility — the underlying patch itself caps at 4.0×.", tint: .orange)
+                        .help("Multiplies pedestrian spawn/population range, up to 2.0×; higher values make vehicles and pedestrians despawn, so it is capped.")
+                        Note(text: "Vehicles and pedestrians are capped at 2.0× to keep them from despawning.")
                         LabeledContent("Model detail switch") {
-                            Slider(value: drawDistanceLOD, in: 1.0...10.0, step: 0.5)
+                            Slider(value: drawDistanceLOD, in: 1.0...6.0, step: 0.5)
                                 .frame(width: 160)
                             Text(String(format: "%.2f×", drawDistanceLOD.wrappedValue))
                                 .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
                         }
-                        .help("Distance at which a vehicle/pedestrian switches from its low-poly to high-poly model — purely visual, no population-density downside (unlike Vehicles/Pedestrians above), so this can go much higher safely. Fixes the \"low-poly blob snapping to a full model a few meters away\" pop-in. Up to 10.0×.")
+                        .help("Distance at which a vehicle/pedestrian switches from its low-poly to high-poly model — purely visual, no population-density downside (unlike Vehicles/Pedestrians above), so this can go much higher safely. Fixes the \"low-poly blob snapping to a full model a few meters away\" pop-in. Up to 6.0×.")
                     }
                 }
 
                 Section("Anti-aliasing") {
+                    Toggle("SMAA", isOn: smaaEnabled)
+                        .help("Three-pass SMAA 1x (edge detection, blend weights, neighborhood blending) with the reference lookup textures. Sharper than FXAA, especially on the HUD. Takes priority over FXAA when both are on. On by default; lives in ProperShaders.ini.")
                     Toggle("FXAA", isOn: fxaaEnabled)
                         .help("Fast approximate anti-aliasing — smooths jagged polygon edges with a single post-process pass. A genuinely new, working Vulkan implementation, verified live. Not the real SMAA algorithm (which needs precomputed lookup textures and three passes) — kept under the historical \"SMAA\" .ini key for compatibility, but this is FXAA.")
                 }
@@ -700,6 +818,42 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             withAnimation { saveMessage = nil }
         }
+    }
+
+    private func installTexturePack() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose the texture pack (.zip)"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.zip]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        saveMessage = "Installing texture pack…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = GameLocation.installTexturePack(from: url)
+            DispatchQueue.main.async {
+                packCount = GameLocation.texturePackCount()
+                withAnimation {
+                    switch result {
+                    case .success(let n): saveMessage = "Installed \(n) textures. Restart the game to use them."
+                    case .failure(let e): saveMessage = "Install failed: \(e.localizedDescription)"
+                    }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { withAnimation { saveMessage = nil } }
+            }
+        }
+    }
+
+    private func uninstallTexturePack() {
+        let alert = NSAlert()
+        alert.messageText = "Remove all installed replacement textures?"
+        alert.informativeText = "Deletes the PNG files in the Textures folder inside VCSNative.app. The game itself is not touched."
+        alert.addButton(withTitle: "Remove"); alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        GameLocation.removeTexturePack()
+        packCount = GameLocation.texturePackCount()
+        withAnimation { saveMessage = "Texture pack removed." }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { withAnimation { saveMessage = nil } }
     }
 
     private func launch() {

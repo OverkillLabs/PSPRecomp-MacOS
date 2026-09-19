@@ -180,11 +180,12 @@ else()
     # bloom.vert's fullscreen-triangle vertex stage too (they read
     # gl_FragCoord directly, never the vertex-interpolated UV).
     set(VCS_SHADER_STEMS psp_ge psp_ge psp_ge_hw psp_ge_hw_packed0115 bloom bloom present fxaa
-        color_grade cloud_march cloud_resolve cloud_composite)
-    set(VCS_SHADER_EXTS vert frag vert vert vert frag frag frag frag frag frag frag)
+        color_grade cloud_march cloud_resolve cloud_composite smaa_edge smaa_weights smaa_blend sky_palette)
+    set(VCS_SHADER_EXTS vert frag vert vert vert frag frag frag frag frag frag frag frag frag frag frag)
     set(VCS_SHADER_SYMBOLS kPspGeVertSpv kPspGeFragSpv kPspGeHwVertSpv kPspGeHwPacked0115VertSpv
         kBloomVertSpv kBloomFragSpv kPresentFragSpv kFxaaFragSpv kColorGradeFragSpv
-        kCloudMarchFragSpv kCloudResolveFragSpv kCloudCompositeFragSpv)
+        kCloudMarchFragSpv kCloudResolveFragSpv kCloudCompositeFragSpv
+        kSmaaEdgeFragSpv kSmaaWeightsFragSpv kSmaaBlendFragSpv kSkyPaletteFragSpv)
     list(LENGTH VCS_SHADER_STEMS VCS_SHADER_COUNT)
     math(EXPR VCS_SHADER_LAST "${VCS_SHADER_COUNT} - 1")
     foreach(VCS_SHADER_INDEX RANGE ${VCS_SHADER_LAST})
@@ -198,6 +199,7 @@ else()
             COMMAND "${VCS_GLSLC}" -O
                     -mfmt=c
                     --target-env=vulkan1.1
+                    -I "${VCS_PROFILE_DIR}/host/shaders"
                     -o "${VCS_SHADER_HEADER}.inc"
                     "${VCS_SHADER_SOURCE}"
             # -mfmt=c emits a bare {0x07230203, ...} initializer list; wrap it
@@ -208,7 +210,7 @@ else()
                     "static const std::uint32_t ${VCS_SHADER_SYMBOL}[] =" >> "${VCS_SHADER_HEADER}"
             COMMAND ${CMAKE_COMMAND} -E cat "${VCS_SHADER_HEADER}.inc" >> "${VCS_SHADER_HEADER}"
             COMMAND ${CMAKE_COMMAND} -E echo ";" >> "${VCS_SHADER_HEADER}"
-            DEPENDS "${VCS_SHADER_SOURCE}"
+            DEPENDS "${VCS_SHADER_SOURCE}" "${VCS_PROFILE_DIR}/host/shaders/SMAA.h"
             COMMENT "Compiling ${VCS_SHADER_STEM}.${VCS_SHADER_EXT} to SPIR-V"
             VERBATIM)
         list(APPEND VCS_SHADER_HEADERS "${VCS_SHADER_HEADER}")
@@ -224,6 +226,7 @@ set(VCS_HOST_SOURCES
     host/display_window.cpp
     host/audio_output.cpp
     host/vcs_config.cpp
+    host/vcs_texture_replace.cpp
     host/vcs_camera_input.cpp
     host/vcs_vehicle_input.cpp
     host/vcs_fps_overlay.cpp
@@ -530,3 +533,7 @@ if(WIN32)
     target_link_libraries(vcs_dx12_ge_probe PRIVATE d3d12 dxgi d3dcompiler dxguid)
     vcs_set_runtime_output(vcs_dx12_ge_probe)
 endif()
+
+# Offline texture tool: same classify/upscale code as the game, for evaluation and pack building.
+add_executable(vcs_texture_tool tools/texture_tool.cpp host/vcs_texture_replace.cpp)
+target_include_directories(vcs_texture_tool PRIVATE host)

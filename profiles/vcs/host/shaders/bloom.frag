@@ -39,8 +39,10 @@ void main() {
     for (int y = -2; y <= 2; ++y) {
         for (int x = -2; x <= 2; ++x) {
             float weight = w[x + 2] * w[y + 2];
-            sum += bright_pass(v_uv + vec2(float(x), float(y)) * pc.texel_size) * weight;
+            sum += bright_pass(v_uv + vec2(float(x), float(y)) * pc.texel_size * 3.0) * weight;
         }
     }
-    out_color = vec4(sum * pc.intensity, 1.0);
+    // Wider halo (taps spaced 3 texels apart) and a slight warm-pink cast:
+    // Vice City glow is soft and dreamy, not a tight neutral halo.
+    out_color = vec4(sum * pc.intensity * vec3(1.0, 0.93, 0.97), 1.0);
 }

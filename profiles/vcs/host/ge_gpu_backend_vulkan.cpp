@@ -27,6 +27,9 @@
 #include "ge_gpu_backend.hpp"
 #include "ge_cloud_camera_math.hpp"
 #include "vcs_config.hpp"
+#include "vcs_game_clock.hpp"
+#include "vcs_sky_palette.hpp"
+#include "vcs_texture_replace.hpp"
 #include "vcs_runtime_log.hpp"
 
 #include <vulkan/vulkan.h>
@@ -42,6 +45,12 @@
 #include "bloom_frag_spv.h"
 #include "present_frag_spv.h"
 #include "fxaa_frag_spv.h"
+#include "smaa_edge_frag_spv.h"
+#include "smaa_weights_frag_spv.h"
+#include "smaa_blend_frag_spv.h"
+#include "sky_palette_frag_spv.h"
+#include "../third_party/smaa/AreaTex.h"
+#include "../third_party/smaa/SearchTex.h"
 #include "color_grade_frag_spv.h"
 #include "cloud_march_frag_spv.h"
 #include "cloud_resolve_frag_spv.h"
@@ -57,6 +66,7 @@
 #include <cstdio>
 #include <unordered_set>
 #include <cstdlib>
+#include <filesystem>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -111,6 +121,75 @@ constexpr float kPspWidth = 480.0f;
 constexpr float kPspHeight = 272.0f;
 constexpr VkDeviceSize kInitialVertexBytes = 8u * 1024u * 1024u;
 
+// Vice City time-of-day palette weights from the in-game clock: `golden` peaks
+// just after sunrise and before sunset (pink/orange light), `night` ramps in
+// once the sun is down (violet-blue, neon-friendly). Follows the real game
+// clock.
+struct VicePalette {
+    float golden{0.0f};
+    float night{0.0f};
+    bool valid{false};
+};
+
+[[nodiscard]] VicePalette vice_palette() noexcept {
+    const float hours = vcs::game_clock_hours();
+    if (hours < 0.0f) return {};
+    // Windows measured against the game's own timecycle: dawn glow around
+    // 6:30, full day until about 19:00, dusk 19:00-20:30, dark from ~21:00.
+    const auto bump = [&](float center, float width) {
+        const float x = (hours - center) / width;
+        return std::exp(-x * x);
+    };
+    const auto smooth = [](float a, float b, float x) {
+        const float u = std::clamp((x - a) / (b - a), 0.0f, 1.0f);
+        return u * u * (3.0f - 2.0f * u);
+    };
+    const float golden = std::max(bump(6.6f, 0.9f), bump(19.7f, 0.9f));
+    const float night = std::max(smooth(20.0f, 21.5f, hours), 1.0f - smooth(4.5f, 6.0f, hours));
+    return {golden, night, true};
+}
+
+// How the clouds are lit by hour. Real clouds keep glowing orange-pink while
+// they still catch light from below the horizon after sunset, then fade fast
+// through magenta to a dark violet-grey, and stay dim at night. Mirrored at dawn.
+struct CloudLightKey {
+    float hour;
+    std::array<float, 3> color;  // cloud body color (0..1)
+    float brightness;            // multiplier on cloud brightness
+};
+
+inline constexpr std::array<CloudLightKey, 14> kCloudLight{{
+    {0.0f, {0.30f, 0.30f, 0.52f}, 0.12f},
+    {4.8f, {0.30f, 0.30f, 0.52f}, 0.12f},
+    {5.6f, {0.80f, 0.50f, 0.70f}, 0.45f},
+    {6.3f, {1.00f, 0.68f, 0.68f}, 1.00f},
+    {7.3f, {0.92f, 0.86f, 0.94f}, 1.00f},
+    {9.0f, {0.90f, 0.88f, 0.94f}, 1.00f},
+    {17.5f, {0.90f, 0.88f, 0.94f}, 1.00f},
+    {18.6f, {0.98f, 0.84f, 0.80f}, 1.00f},
+    {19.3f, {1.00f, 0.66f, 0.52f}, 1.00f},
+    {19.9f, {0.98f, 0.52f, 0.62f}, 0.80f},
+    {20.4f, {0.66f, 0.36f, 0.62f}, 0.36f},
+    {21.0f, {0.36f, 0.30f, 0.56f}, 0.16f},
+    {22.0f, {0.30f, 0.30f, 0.52f}, 0.12f},
+    {24.0f, {0.30f, 0.30f, 0.52f}, 0.12f},
+}};
+
+[[nodiscard]] CloudLightKey cloud_light(float hours) noexcept {
+    for (std::size_t i = 1u; i < kCloudLight.size(); ++i) {
+        if (hours <= kCloudLight[i].hour) {
+            const CloudLightKey &a = kCloudLight[i - 1u];
+            const CloudLightKey &b = kCloudLight[i];
+            const float x = (hours - a.hour) / std::max(b.hour - a.hour, 1.0e-4f);
+            const float s = x * x * (3.0f - 2.0f * x);
+            CloudLightKey out{hours, {}, a.brightness + (b.brightness - a.brightness) * s};
+            for (std::size_t c = 0u; c < 3u; ++c) out.color[c] = a.color[c] + (b.color[c] - a.color[c]) * s;
+            return out;
+        }
+    }
+    return kCloudLight.back();
+}
+
 struct PushConstants {
     float inverse_viewport[2];
     std::uint32_t framebuffer_format;
@@ -137,7 +216,14 @@ struct ColorGradePushConstants {
     float tint_g;
     float tint_b;
     float sharpen_strength;
-    float texel_size[2];
+    float texel_x;
+    float texel_y;
+    float dither_strength;
+    float cas_sharpness;
+    float vhs_wiggle;
+    float vhs_smear;
+    float vhs_enabled;
+    float time_seconds;
 };
 
 // One observed GE draw camera, tracked so the cloud march can pick the same
@@ -335,6 +421,10 @@ struct TextureEntry {
     VkDescriptorSet descriptor{VK_NULL_HANDLE};
     std::uint32_t width{};
     std::uint32_t height{};
+    // log2 of how much larger this texture is than the game's own (replacement or
+    // upscale); the shader divides it back out of the size it normalizes UVs by.
+    std::uint8_t scale_shift{0u};
+    VkSampler sampler{VK_NULL_HANDLE};
     // Stamped with VulkanGeState::frame_epoch every time this entry is
     // uploaded or looked up by a draw. Lets upload() evict the least
     // recently used entry instead of refusing every texture past whatever
@@ -596,6 +686,24 @@ struct VulkanGeState {
     VkShaderModule fxaa_vertex_shader{VK_NULL_HANDLE};
     VkShaderModule fxaa_fragment_shader{VK_NULL_HANDLE};
 
+    // Real SMAA 1x (Jimenez et al.), replacing the FXAA pass's shader when
+    // ProperShaders.ini [SMAA] Enabled is set and setup succeeds. It writes fxaa_image, so
+    // everything downstream of FXAA is unchanged.
+    bool smaa_ready{false};
+    std::array<VkImage, 4> smaa_image{};       // edges, blend, area, search
+    std::array<VkDeviceMemory, 4> smaa_memory{};
+    std::array<VkImageView, 4> smaa_view{};
+    std::array<VkRenderPass, 2> smaa_pass{};    // edges (RG8), blend (RGBA8)
+    std::array<VkFramebuffer, 2> smaa_framebuffer{};
+    VkSampler smaa_linear_sampler{VK_NULL_HANDLE};
+    VkSampler smaa_point_sampler{VK_NULL_HANDLE};
+    std::array<VkDescriptorSetLayout, 3> smaa_set_layout{};
+    VkDescriptorPool smaa_pool{VK_NULL_HANDLE};
+    std::array<VkDescriptorSet, 3> smaa_set{};
+    std::array<VkPipelineLayout, 3> smaa_pipeline_layout{};
+    std::array<VkPipeline, 3> smaa_pipeline{};
+    std::array<VkShaderModule, 3> smaa_module{};
+
     // Parametric color grading ([ColorGrading] -- see vcs_config.hpp).
     // Reads whichever image is "current" at this point in the pass chain
     // (fxaa_image if FXAA ran, else color_image -- see the descriptor
@@ -608,6 +716,14 @@ struct VulkanGeState {
     float color_grading_brightness{0.0f};
     float color_grading_tint[3]{1.0f, 1.0f, 1.0f};
     float color_grading_sharpen{0.0f};
+    PostFxConfiguration postfx{};
+    // Vice City sky fill (see shaders/sky_palette.frag).
+    bool sky_palette_ready{false};
+    VkShaderModule sky_vertex_module{VK_NULL_HANDLE};
+    VkShaderModule sky_fragment_module{VK_NULL_HANDLE};
+    VkPipelineLayout sky_pipeline_layout{VK_NULL_HANDLE};
+    VkPipeline sky_pipeline{VK_NULL_HANDLE};
+    std::chrono::steady_clock::time_point postfx_epoch{std::chrono::steady_clock::now()};
     VkImage grading_image{VK_NULL_HANDLE};
     VkDeviceMemory grading_memory{VK_NULL_HANDLE};
     VkImageView grading_view{VK_NULL_HANDLE};
@@ -896,7 +1012,9 @@ void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout from, Vk
     VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     info.magFilter = draw.texture_mag_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     info.minFilter = draw.texture_min_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    info.minLod = 0.0f;
+    info.maxLod = VK_LOD_CLAMP_NONE;
     info.addressModeU = draw.texture_clamp_u ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
                                              : VK_SAMPLER_ADDRESS_MODE_REPEAT;
     info.addressModeV = draw.texture_clamp_v ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
@@ -952,11 +1070,17 @@ void destroy_texture_entry(VulkanGeState &s, TextureEntry &entry) noexcept {
     image_info.imageType = VK_IMAGE_TYPE_2D;
     image_info.format = kColorFormat;
     image_info.extent = {width, height, 1u};
-    image_info.mipLevels = 1u;
+    // Full mip chain (generated below by blitting), so distant and grazing-angle
+    // surfaces stay stable and sharp and anisotropic filtering has levels to use.
+    std::uint32_t mip_levels = 1u;
+    for (std::uint32_t largest = std::max(width, height); largest > 1u; largest >>= 1u) ++mip_levels;
+    mip_levels = vcs_configuration().textures.mipmaps ? std::min(mip_levels, 12u) : 1u;
+    image_info.mipLevels = mip_levels;
     image_info.arrayLayers = 1u;
     image_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    image_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                       VK_IMAGE_USAGE_SAMPLED_BIT;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(s.device, &image_info, nullptr, &out.image) != VK_SUCCESS) return false;
 
@@ -1002,10 +1126,45 @@ void destroy_texture_entry(VulkanGeState &s, TextureEntry &entry) noexcept {
     region.imageExtent = {width, height, 1u};
     vkCmdCopyBufferToImage(cmd, s.staging_buffer, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                            1, &region);
-    transition_image(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    // Build the mip chain: each level is blitted (linear) from the previous one.
+    const auto mip_barrier = [&](std::uint32_t level, VkImageLayout from, VkImageLayout to,
+                                 VkAccessFlags src_access, VkAccessFlags dst_access,
+                                 VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = from;
+        barrier.newLayout = to;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = out.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, 0u, 1u};
+        barrier.srcAccessMask = src_access;
+        barrier.dstAccessMask = dst_access;
+        vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    };
+    std::int32_t mip_w = static_cast<std::int32_t>(width);
+    std::int32_t mip_h = static_cast<std::int32_t>(height);
+    for (std::uint32_t level = 1u; level < mip_levels; ++level) {
+        mip_barrier(level - 1u, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        const std::int32_t next_w = std::max(1, mip_w / 2);
+        const std::int32_t next_h = std::max(1, mip_h / 2);
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 0u, 1u};
+        blit.srcOffsets[1] = {mip_w, mip_h, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, 1u};
+        blit.dstOffsets[1] = {next_w, next_h, 1};
+        vkCmdBlitImage(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        mip_barrier(level - 1u, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        mip_w = next_w;
+        mip_h = next_h;
+    }
+    mip_barrier(mip_levels - 1u, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     if (!end_one_shot(s, cmd)) return false;
 
     VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1013,7 +1172,7 @@ void destroy_texture_entry(VulkanGeState &s, TextureEntry &entry) noexcept {
     view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
     view_info.format = kColorFormat;
     view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view_info.subresourceRange.levelCount = 1u;
+    view_info.subresourceRange.levelCount = mip_levels;
     view_info.subresourceRange.layerCount = 1u;
     if (vkCreateImageView(s.device, &view_info, nullptr, &out.view) != VK_SUCCESS) return false;
 
@@ -1422,6 +1581,33 @@ void destroy_backend(VulkanGeState &s) noexcept {
         if (s.bloom_view != VK_NULL_HANDLE) vkDestroyImageView(s.device, s.bloom_view, nullptr);
         if (s.bloom_image != VK_NULL_HANDLE) vkDestroyImage(s.device, s.bloom_image, nullptr);
         if (s.bloom_memory != VK_NULL_HANDLE) vkFreeMemory(s.device, s.bloom_memory, nullptr);
+        if (s.sky_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(s.device, s.sky_pipeline, nullptr);
+        if (s.sky_pipeline_layout != VK_NULL_HANDLE)
+            vkDestroyPipelineLayout(s.device, s.sky_pipeline_layout, nullptr);
+        if (s.sky_fragment_module != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.sky_fragment_module, nullptr);
+        if (s.sky_vertex_module != VK_NULL_HANDLE)
+            vkDestroyShaderModule(s.device, s.sky_vertex_module, nullptr);
+        for (std::size_t i = 0u; i < 3u; ++i) {
+            if (s.smaa_pipeline[i] != VK_NULL_HANDLE) vkDestroyPipeline(s.device, s.smaa_pipeline[i], nullptr);
+            if (s.smaa_pipeline_layout[i] != VK_NULL_HANDLE)
+                vkDestroyPipelineLayout(s.device, s.smaa_pipeline_layout[i], nullptr);
+            if (s.smaa_set_layout[i] != VK_NULL_HANDLE)
+                vkDestroyDescriptorSetLayout(s.device, s.smaa_set_layout[i], nullptr);
+            if (s.smaa_module[i] != VK_NULL_HANDLE) vkDestroyShaderModule(s.device, s.smaa_module[i], nullptr);
+        }
+        if (s.smaa_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(s.device, s.smaa_pool, nullptr);
+        if (s.smaa_linear_sampler != VK_NULL_HANDLE) vkDestroySampler(s.device, s.smaa_linear_sampler, nullptr);
+        if (s.smaa_point_sampler != VK_NULL_HANDLE) vkDestroySampler(s.device, s.smaa_point_sampler, nullptr);
+        for (std::size_t i = 0u; i < 2u; ++i) {
+            if (s.smaa_framebuffer[i] != VK_NULL_HANDLE) vkDestroyFramebuffer(s.device, s.smaa_framebuffer[i], nullptr);
+            if (s.smaa_pass[i] != VK_NULL_HANDLE) vkDestroyRenderPass(s.device, s.smaa_pass[i], nullptr);
+        }
+        for (std::size_t i = 0u; i < 4u; ++i) {
+            if (s.smaa_view[i] != VK_NULL_HANDLE) vkDestroyImageView(s.device, s.smaa_view[i], nullptr);
+            if (s.smaa_image[i] != VK_NULL_HANDLE) vkDestroyImage(s.device, s.smaa_image[i], nullptr);
+            if (s.smaa_memory[i] != VK_NULL_HANDLE) vkFreeMemory(s.device, s.smaa_memory[i], nullptr);
+        }
         if (s.fxaa_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(s.device, s.fxaa_pipeline, nullptr);
         if (s.fxaa_pipeline_layout != VK_NULL_HANDLE)
             vkDestroyPipelineLayout(s.device, s.fxaa_pipeline_layout, nullptr);
@@ -2299,7 +2485,7 @@ void destroy_backend(VulkanGeState &s) noexcept {
 
     // --- FXAA (Rendering.SMAA/AntiAliasing) ---------------------------------
     s.fxaa_enabled = false;
-    if (bloom_config.initialized && bloom_config.rendering.smaa) {
+    if (bloom_config.initialized && (bloom_config.rendering.smaa || bloom_config.smaa_1x)) {
         bool fxaa_ok = true;
         if (!create_attachment(kColorFormat,
                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -2501,6 +2687,252 @@ void destroy_backend(VulkanGeState &s) noexcept {
         std::fprintf(stderr, "[fxaa] setup %s\n", fxaa_ok ? "OK" : "FAILED (feature left disabled)");
     }
 
+    // --- SMAA 1x (ProperShaders.ini [SMAA] Enabled; replaces the FXAA shader) -------
+    s.smaa_ready = false;
+    if (s.fxaa_enabled && bloom_config.smaa_1x) {
+        bool ok = true;
+        const VkImageUsageFlags target_usage =
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ok = ok && create_attachment(VK_FORMAT_R8G8_UNORM, target_usage, VK_IMAGE_ASPECT_COLOR_BIT,
+                                     s.smaa_image[0], s.smaa_memory[0], s.smaa_view[0]);
+        ok = ok && create_attachment(VK_FORMAT_R8G8B8A8_UNORM, target_usage, VK_IMAGE_ASPECT_COLOR_BIT,
+                                     s.smaa_image[1], s.smaa_memory[1], s.smaa_view[1]);
+        ok = ok && create_attachment(VK_FORMAT_R8G8_UNORM,
+                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                     VK_IMAGE_ASPECT_COLOR_BIT, s.smaa_image[2], s.smaa_memory[2],
+                                     s.smaa_view[2], AREATEX_WIDTH, AREATEX_HEIGHT);
+        ok = ok && create_attachment(VK_FORMAT_R8_UNORM,
+                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                     VK_IMAGE_ASPECT_COLOR_BIT, s.smaa_image[3], s.smaa_memory[3],
+                                     s.smaa_view[3], SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT);
+
+        const auto upload_lookup = [&](VkImage image, const unsigned char *data, std::size_t bytes,
+                                       std::uint32_t width, std::uint32_t height) -> bool {
+            VkBuffer staging = VK_NULL_HANDLE;
+            VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+            bool done = false;
+            if (create_buffer(s, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              staging, staging_memory)) {
+                void *mapped = nullptr;
+                if (vkMapMemory(s.device, staging_memory, 0, bytes, 0, &mapped) == VK_SUCCESS) {
+                    std::memcpy(mapped, data, bytes);
+                    vkUnmapMemory(s.device, staging_memory);
+                    VkCommandBuffer cmd = begin_one_shot(s);
+                    if (cmd != VK_NULL_HANDLE) {
+                        transition_image(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED,
+                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                         VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        VkBufferImageCopy region{};
+                        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                        region.imageSubresource.layerCount = 1u;
+                        region.imageExtent = {width, height, 1u};
+                        vkCmdCopyBufferToImage(cmd, staging, image,
+                                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                        transition_image(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                        done = end_one_shot(s, cmd);
+                    }
+                }
+            }
+            if (staging != VK_NULL_HANDLE) vkDestroyBuffer(s.device, staging, nullptr);
+            if (staging_memory != VK_NULL_HANDLE) vkFreeMemory(s.device, staging_memory, nullptr);
+            return done;
+        };
+        ok = ok && upload_lookup(s.smaa_image[2], areaTexBytes, AREATEX_SIZE, AREATEX_WIDTH,
+                                 AREATEX_HEIGHT);
+        ok = ok && upload_lookup(s.smaa_image[3], searchTexBytes, SEARCHTEX_SIZE, SEARCHTEX_WIDTH,
+                                 SEARCHTEX_HEIGHT);
+
+        const auto make_pass = [&](VkFormat format, VkRenderPass &pass) -> bool {
+            VkAttachmentDescription attachment{};
+            attachment.format = format;
+            attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkAttachmentReference reference{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+            VkSubpassDescription subpass{};
+            subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            subpass.colorAttachmentCount = 1u;
+            subpass.pColorAttachments = &reference;
+            VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+            info.attachmentCount = 1u;
+            info.pAttachments = &attachment;
+            info.subpassCount = 1u;
+            info.pSubpasses = &subpass;
+            return vkCreateRenderPass(s.device, &info, nullptr, &pass) == VK_SUCCESS;
+        };
+        ok = ok && make_pass(VK_FORMAT_R8G8_UNORM, s.smaa_pass[0]);
+        ok = ok && make_pass(VK_FORMAT_R8G8B8A8_UNORM, s.smaa_pass[1]);
+        for (std::size_t i = 0u; ok && i < 2u; ++i) {
+            VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            info.renderPass = s.smaa_pass[i];
+            info.attachmentCount = 1u;
+            info.pAttachments = &s.smaa_view[i];
+            info.width = s.width;
+            info.height = s.height;
+            info.layers = 1u;
+            ok = vkCreateFramebuffer(s.device, &info, nullptr, &s.smaa_framebuffer[i]) == VK_SUCCESS;
+        }
+
+        for (const auto sampler_filter : {VK_FILTER_LINEAR, VK_FILTER_NEAREST}) {
+            VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            info.magFilter = sampler_filter;
+            info.minFilter = sampler_filter;
+            info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            info.maxAnisotropy = 1.0f;
+            VkSampler &target = sampler_filter == VK_FILTER_LINEAR ? s.smaa_linear_sampler
+                                                                   : s.smaa_point_sampler;
+            ok = ok && vkCreateSampler(s.device, &info, nullptr, &target) == VK_SUCCESS;
+        }
+
+        // Per-pass sampler bindings: edge {color}, weights {edges, area, search},
+        // blend {color, blend weights}. Area/search are read with point sampling.
+        const std::array<std::uint32_t, 3> binding_counts{1u, 3u, 2u};
+        const std::array<const std::uint32_t *, 3> spv_code{kSmaaEdgeFragSpv, kSmaaWeightsFragSpv,
+                                                            kSmaaBlendFragSpv};
+        const std::array<std::size_t, 3> spv_size{sizeof(kSmaaEdgeFragSpv), sizeof(kSmaaWeightsFragSpv),
+                                                  sizeof(kSmaaBlendFragSpv)};
+        for (std::size_t i = 0u; ok && i < 3u; ++i) {
+            std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
+            for (std::uint32_t b = 0u; b < binding_counts[i]; ++b) {
+                bindings[b].binding = b;
+                bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                bindings[b].descriptorCount = 1u;
+                bindings[b].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            }
+            VkDescriptorSetLayoutCreateInfo layout_info{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            layout_info.bindingCount = binding_counts[i];
+            layout_info.pBindings = bindings.data();
+            ok = vkCreateDescriptorSetLayout(s.device, &layout_info, nullptr,
+                                             &s.smaa_set_layout[i]) == VK_SUCCESS;
+            VkPushConstantRange push_range{VK_SHADER_STAGE_FRAGMENT_BIT, 0u, 16u};
+            VkPipelineLayoutCreateInfo pipeline_layout_info{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            pipeline_layout_info.setLayoutCount = 1u;
+            pipeline_layout_info.pSetLayouts = &s.smaa_set_layout[i];
+            pipeline_layout_info.pushConstantRangeCount = 1u;
+            pipeline_layout_info.pPushConstantRanges = &push_range;
+            ok = ok && vkCreatePipelineLayout(s.device, &pipeline_layout_info, nullptr,
+                                              &s.smaa_pipeline_layout[i]) == VK_SUCCESS;
+            ok = ok && create_shader_module(s, spv_code[i], spv_size[i], s.smaa_module[i]);
+        }
+        if (ok) {
+            const std::array<VkDescriptorPoolSize, 1> pool_size{
+                VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6u}};
+            VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            pool_info.maxSets = 3u;
+            pool_info.poolSizeCount = 1u;
+            pool_info.pPoolSizes = pool_size.data();
+            ok = vkCreateDescriptorPool(s.device, &pool_info, nullptr, &s.smaa_pool) == VK_SUCCESS;
+        }
+        for (std::size_t i = 0u; ok && i < 3u; ++i) {
+            VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            allocate.descriptorPool = s.smaa_pool;
+            allocate.descriptorSetCount = 1u;
+            allocate.pSetLayouts = &s.smaa_set_layout[i];
+            ok = vkAllocateDescriptorSets(s.device, &allocate, &s.smaa_set[i]) == VK_SUCCESS;
+        }
+        if (ok) {
+            // set0: color | set1: edges, area, search | set2: color, blend weights
+            struct Binding { std::size_t set; std::uint32_t slot; VkImageView view; VkSampler sampler; };
+            const std::array<Binding, 6> writes{{
+                {0u, 0u, s.color_view, s.smaa_linear_sampler},
+                {1u, 0u, s.smaa_view[0], s.smaa_linear_sampler},
+                {1u, 1u, s.smaa_view[2], s.smaa_point_sampler},
+                {1u, 2u, s.smaa_view[3], s.smaa_point_sampler},
+                {2u, 0u, s.color_view, s.smaa_linear_sampler},
+                {2u, 1u, s.smaa_view[1], s.smaa_linear_sampler},
+            }};
+            for (const Binding &w : writes) {
+                VkDescriptorImageInfo image_info{w.sampler, w.view,
+                                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                write.dstSet = s.smaa_set[w.set];
+                write.dstBinding = w.slot;
+                write.descriptorCount = 1u;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                write.pImageInfo = &image_info;
+                vkUpdateDescriptorSets(s.device, 1, &write, 0, nullptr);
+            }
+        }
+        const std::array<VkRenderPass, 3> pass_for{s.smaa_pass[0], s.smaa_pass[1], s.fxaa_render_pass};
+        for (std::size_t i = 0u; ok && i < 3u; ++i) {
+            std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+            stages[0] = VkPipelineShaderStageCreateInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = s.fxaa_vertex_shader;
+            stages[0].pName = "main";
+            stages[1] = VkPipelineShaderStageCreateInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = s.smaa_module[i];
+            stages[1].pName = "main";
+            VkPipelineVertexInputStateCreateInfo vertex_input{
+                VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            VkPipelineInputAssemblyStateCreateInfo input_assembly{
+                VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            VkPipelineViewportStateCreateInfo viewport_state{
+                VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+            viewport_state.viewportCount = 1u;
+            viewport_state.scissorCount = 1u;
+            VkPipelineRasterizationStateCreateInfo rasterization{
+                VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+            rasterization.cullMode = VK_CULL_MODE_NONE;
+            rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rasterization.lineWidth = 1.0f;
+            VkPipelineMultisampleStateCreateInfo multisample{
+                VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineDepthStencilStateCreateInfo depth_stencil{
+                VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+            VkPipelineColorBlendAttachmentState blend{};
+            blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo color_blend{
+                VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            color_blend.attachmentCount = 1u;
+            color_blend.pAttachments = &blend;
+            const std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                               VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dynamic{
+                VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
+            dynamic.pDynamicStates = dynamic_states.data();
+            VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            info.stageCount = 2u;
+            info.pStages = stages.data();
+            info.pVertexInputState = &vertex_input;
+            info.pInputAssemblyState = &input_assembly;
+            info.pViewportState = &viewport_state;
+            info.pRasterizationState = &rasterization;
+            info.pMultisampleState = &multisample;
+            info.pDepthStencilState = &depth_stencil;
+            info.pColorBlendState = &color_blend;
+            info.pDynamicState = &dynamic;
+            info.layout = s.smaa_pipeline_layout[i];
+            info.renderPass = pass_for[i];
+            ok = vkCreateGraphicsPipelines(s.device, VK_NULL_HANDLE, 1, &info, nullptr,
+                                           &s.smaa_pipeline[i]) == VK_SUCCESS;
+        }
+        s.smaa_ready = ok;
+        std::fprintf(stderr, "[smaa] setup %s\n", ok ? "OK" : "FAILED (FXAA stays)");
+    }
+
     // --- Color grading ([ColorGrading]) -------------------------------------
     s.color_grading_enabled = false;
     // Sharpen shares this same pass/shader with color grading (see
@@ -2508,8 +2940,13 @@ void destroy_backend(VulkanGeState &s) noexcept {
     // and each applies independently of whether the other is on (grading
     // params fall back to identity below when ColorGrading.Enabled is
     // false, so a sharpen-only setup doesn't also apply the neon grade).
+    const PostFxConfiguration &postfx_config = bloom_config.postfx;
+    const bool postfx_wanted = postfx_config.dither_enabled ||
+                               postfx_config.cas_enabled || postfx_config.vhs_enabled ||
+                               postfx_config.time_of_day_enabled;
     if (bloom_config.initialized &&
-        (bloom_config.color_grading.enabled || bloom_config.rendering.sharpen > 0.0f)) {
+        (bloom_config.color_grading.enabled || bloom_config.rendering.sharpen > 0.0f ||
+         postfx_wanted)) {
         bool grading_ok = true;
         if (!create_attachment(kColorFormat,
                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -2735,12 +3172,104 @@ void destroy_backend(VulkanGeState &s) noexcept {
             s.color_grading_tint[2] = 1.0f;
         }
         s.color_grading_sharpen = bloom_config.rendering.sharpen;
+        s.postfx = postfx_config;
         std::fprintf(stderr,
                     "[color-grading] setup %s grading_enabled=%d saturation=%.2f contrast=%.2f "
                     "sharpen=%.2f\n",
                     grading_ok ? "OK" : "FAILED (feature left disabled)",
                     bloom_config.color_grading.enabled ? 1 : 0, s.color_grading_saturation,
                     s.color_grading_contrast, s.color_grading_sharpen);
+    }
+
+    // --- Vice City sky fill ([SkyPalette]) ----------------------------------
+    s.sky_palette_ready = false;
+    if (bloom_config.initialized && bloom_config.postfx.sky_palette_enabled) {
+        bool ok = create_shader_module(s, kBloomVertSpv, sizeof(kBloomVertSpv), s.sky_vertex_module) &&
+                  create_shader_module(s, kSkyPaletteFragSpv, sizeof(kSkyPaletteFragSpv),
+                                       s.sky_fragment_module);
+        if (ok) {
+            VkPushConstantRange push_range{VK_SHADER_STAGE_FRAGMENT_BIT, 0u, 32u};
+            VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layout.pushConstantRangeCount = 1u;
+            layout.pPushConstantRanges = &push_range;
+            ok = vkCreatePipelineLayout(s.device, &layout, nullptr, &s.sky_pipeline_layout) == VK_SUCCESS;
+        }
+        if (ok) {
+            std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+            stages[0] = VkPipelineShaderStageCreateInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = s.sky_vertex_module;
+            stages[0].pName = "main";
+            stages[1] = VkPipelineShaderStageCreateInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = s.sky_fragment_module;
+            stages[1].pName = "main";
+            VkPipelineVertexInputStateCreateInfo vertex_input{
+                VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            VkPipelineInputAssemblyStateCreateInfo input_assembly{
+                VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            VkPipelineViewportStateCreateInfo viewport_state{
+                VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+            viewport_state.viewportCount = 1u;
+            viewport_state.scissorCount = 1u;
+            VkPipelineRasterizationStateCreateInfo rasterization{
+                VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+            rasterization.cullMode = VK_CULL_MODE_NONE;
+            rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rasterization.lineWidth = 1.0f;
+            VkPipelineMultisampleStateCreateInfo multisample{
+                VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            // Sky pixels only: depth EQUAL against the reverse-Z far clear, no
+            // depth write, premultiplied blend over what the game drew there.
+            VkPipelineDepthStencilStateCreateInfo depth_stencil{
+                VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+            depth_stencil.depthTestEnable = VK_TRUE;
+            depth_stencil.depthWriteEnable = VK_FALSE;
+            depth_stencil.depthCompareOp = VK_COMPARE_OP_EQUAL;
+            VkPipelineColorBlendAttachmentState blend{};
+            blend.blendEnable = VK_TRUE;
+            blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            blend.colorBlendOp = VK_BLEND_OP_ADD;
+            blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            blend.alphaBlendOp = VK_BLEND_OP_ADD;
+            blend.colorWriteMask =
+                VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+            VkPipelineColorBlendStateCreateInfo color_blend{
+                VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            color_blend.attachmentCount = 1u;
+            color_blend.pAttachments = &blend;
+            const std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
+                                                               VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dynamic{
+                VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
+            dynamic.pDynamicStates = dynamic_states.data();
+            VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            info.stageCount = 2u;
+            info.pStages = stages.data();
+            info.pVertexInputState = &vertex_input;
+            info.pInputAssemblyState = &input_assembly;
+            info.pViewportState = &viewport_state;
+            info.pRasterizationState = &rasterization;
+            info.pMultisampleState = &multisample;
+            info.pDepthStencilState = &depth_stencil;
+            info.pColorBlendState = &color_blend;
+            info.pDynamicState = &dynamic;
+            info.layout = s.sky_pipeline_layout;
+            info.renderPass = s.render_pass;
+            info.subpass = 0u;
+            ok = vkCreateGraphicsPipelines(s.device, VK_NULL_HANDLE, 1, &info, nullptr,
+                                           &s.sky_pipeline) == VK_SUCCESS;
+        }
+        s.sky_palette_ready = ok;
+        std::fprintf(stderr, "[sky-palette] setup %s\n", ok ? "OK" : "FAILED (feature left disabled)");
     }
 
     // --- Volumetric clouds ([VolumetricClouds]) -----------------------------
@@ -3516,10 +4045,19 @@ void destroy_backend(VulkanGeState &s) noexcept {
 // branch never runs, and every draw shows its raw (often white/unused,
 // since REPLACE-mode geometry doesn't care about vertex color) vertex color
 // instead -- which is exactly the flat white screen this was chasing.
+[[nodiscard]] std::uint32_t texture_scale_shift(const GeGpuDrawDescriptor &draw) noexcept {
+    if (!draw.texture_enabled) return 0u;
+    const VulkanGeState &s = state();
+    const auto found = s.textures.find(texture_key(draw));
+    return found == s.textures.end() ? 0u : found->second.scale_shift;
+}
+
 [[nodiscard]] std::uint32_t packed_texture_control(const GeGpuDrawDescriptor &draw,
                                                    bool enabled) noexcept {
     return (draw.texture_function & 0xFFu) |
-           (static_cast<std::uint32_t>(draw.texture_use_alpha ? 1u : 0u) << 8u) |
+           ((static_cast<std::uint32_t>(draw.texture_use_alpha ? 1u : 0u) |
+             (texture_scale_shift(draw) << 4u) |
+             ((!draw.through && vcs_configuration().textures.detail) ? 0x40u : 0u)) << 8u) |
            (static_cast<std::uint32_t>(draw.texture_double_color ? 1u : 0u) << 16u) |
            (static_cast<std::uint32_t>(enabled ? 1u : 0u) << 24u);
 }
@@ -3707,6 +4245,62 @@ CloudUniforms cloud_present_constants(const VulkanGeState &s, std::uint32_t targ
     out.fog_color_start = {config.fog_color_r, config.fog_color_g, config.fog_color_b,
                            config.fog_start};
     out.brightness_padding[0] = config.brightness;
+    // Vice City sky palette: cloud light shifts pink/peach toward dusk and dawn
+    // and violet at night, on top of the soft pastel ini defaults.
+    const VicePalette palette = vice_palette();
+    if (palette.valid) {
+        const auto tint = [&](std::array<float, 4> &color, const std::array<float, 3> &dusk,
+                              const std::array<float, 3> &dark, float dusk_amount, float dark_amount) {
+            for (std::size_t c = 0u; c < 3u; ++c) {
+                color[c] += (dusk[c] - color[c]) * palette.golden * dusk_amount;
+                color[c] += (dark[c] - color[c]) * palette.night * dark_amount;
+            }
+        };
+        // The cloud pass fills the whole sky with its fog and sun colors, so
+        // these stay gentle and pastel: only the cloud bodies pick up a soft
+        // pink at dusk; the fog color is left alone.
+        // Light the cloud sun a little warm toward sunset; the cloud body
+        // color and brightness follow the hour-by-hour light table.
+        const CloudLightKey light = cloud_light(vcs::game_clock_hours());
+        // The cloud sun takes the same hue as the cloud light, so dim twilight
+        // clouds stay violet instead of going muddy olive.
+        for (std::size_t c = 0u; c < 3u; ++c)
+            out.sun_color_atmosphere[c] += (light.color[c] - out.sun_color_atmosphere[c]) * 0.7f;
+        out.cloud_color_mist[0] = light.color[0];
+        out.cloud_color_mist[1] = light.color[1];
+        out.cloud_color_mist[2] = light.color[2];
+        out.brightness_padding[0] *= light.brightness;
+        // Weather: each type has its own Vice City look (see WeatherLook): rain is
+        // a blue-violet slate, fog pale and milky, cloudy soft lavender-grey. Dusk
+        // keeps some pink through the weather, and overcast nights glow faintly
+        // violet from the city instead of going black.
+        const vcs::WeatherBlend weather = vcs::weather_look();
+        if (weather.known && weather.look.overcast > 0.0f) {
+            const vcs::WeatherLook &wx = weather.look;
+            // Overcast decks stay soft: take the dawn/dusk pink down to a pastel
+            // peach-grey before the weather color mixes in, so a cloudy sunrise is
+            // not a uniform rose slab.
+            const float table_luma = 0.299f * out.cloud_color_mist[0] + 0.587f * out.cloud_color_mist[1] +
+                                     0.114f * out.cloud_color_mist[2];
+            for (std::size_t c = 0u; c < 3u; ++c)
+                out.cloud_color_mist[c] += (table_luma - out.cloud_color_mist[c]) * 0.55f * wx.overcast;
+            const float amount = std::clamp(wx.overcast * (1.0f - 0.2f * palette.golden), 0.0f, 1.0f);
+            for (std::size_t c = 0u; c < 3u; ++c) {
+                out.cloud_color_mist[c] += (wx.cloud_color[c] - out.cloud_color_mist[c]) * amount;
+                out.sun_color_atmosphere[c] += (wx.cloud_color[c] - out.sun_color_atmosphere[c]) * 0.6f * amount;
+            }
+            out.brightness_padding[0] *= 1.0f + (wx.cloud_brightness - 1.0f) * (1.0f - palette.night);
+            if (palette.night > 0.0f) {
+                const std::array<float, 3> glow{0.42f, 0.32f, 0.58f};
+                for (std::size_t c = 0u; c < 3u; ++c)
+                    out.cloud_color_mist[c] += (glow[c] - out.cloud_color_mist[c]) * 0.6f * palette.night * wx.overcast;
+                out.brightness_padding[0] = std::max(out.brightness_padding[0],
+                                                     (0.10f + 0.28f * palette.night * wx.overcast) * config.brightness);
+            }
+            for (std::size_t c = 0u; c < 3u; ++c)
+                out.coverage_speed[c] = std::min(out.coverage_speed[c] * (1.0f + 1.2f * wx.coverage_boost), 0.92f);
+        }
+    }
     return out;
 }
 
@@ -3969,6 +4563,14 @@ bool initialize_ge_gpu_backend(std::string &error) {
     s.frame_valid = false;
     s.has_last_winner = false;
 
+    {
+        const TexturesConfiguration &tx = vcs_configuration().textures;
+        std::filesystem::path texture_directory = tx.directory;
+        if (texture_directory.is_relative())
+            texture_directory = vcs_configuration().executable_directory / texture_directory;
+        vcs::texture_pipeline_configure(texture_directory.string(), tx.replacement, tx.dump_originals,
+                                        tx.upscale, tx.upscale_scale, tx.upscale_sharpen);
+    }
     const RenderingConfiguration &rendering = vcs_configuration().rendering;
     s.report.requested = rendering.backend == RenderingBackend::DirectX12
         ? GeGpuBackendKind::Vulkan : GeGpuBackendKind::Software;
@@ -4005,7 +4607,10 @@ bool initialize_ge_gpu_backend(std::string &error) {
     return true;
 }
 
-void shutdown_ge_gpu_backend() noexcept { destroy_backend(state()); }
+void shutdown_ge_gpu_backend() noexcept {
+    vcs::texture_pipeline_shutdown();
+    destroy_backend(state());
+}
 
 void ge_gpu_backend_lock() noexcept { backend_mutex().lock(); }
 void ge_gpu_backend_unlock() noexcept { backend_mutex().unlock(); }
@@ -4188,6 +4793,18 @@ bool ge_gpu_backend_upload_decoded_texture(const GeGpuDrawDescriptor &draw, std:
         ++s.report.rejected_texture_decodes;
         return false;
     }
+    entry.sampler = sampler;
+    // Hand the decoded texture to the background pipeline (dump / replacement /
+    // upscale); a finished result is swapped in at a later frame boundary.
+    std::uint32_t usage = 0u;
+    if (draw.through) usage |= vcs::kUsageThrough;
+    if (draw.hud_candidate) usage |= vcs::kUsageHudCandidate;
+    if (draw.alpha_test_enabled) usage |= vcs::kUsageAlphaTest;
+    if (draw.blend_enabled) usage |= vcs::kUsageBlend;
+    if (draw.depth_write_enabled) usage |= vcs::kUsageDepthWrite;
+    if ((draw.texture_function & 7u) == 3u) usage |= vcs::kUsageReplace;
+    if ((draw.texture_function & 7u) == 4u) usage |= vcs::kUsageAdd;
+    vcs::texture_pipeline_submit(key, rgba8, width, height, usage);
     entry.last_used_epoch = s.frame_epoch;
     s.textures.emplace(key, entry);
     ++s.report.texture_images_created;
@@ -4579,7 +5196,7 @@ bool ge_gpu_backend_accumulate_hardware_packed_0115(
     batch.constants.draw_control[1] = packed_texture_control(draw, draw.texture_enabled);
     batch.constants.draw_control[2] = draw.texture_env;
     batch.constants.draw_control[3] =
-        (draw.fog_color & 0x00FFFFFFu) |
+        (vcs::remap_sky_color(draw.fog_color) & 0x00FFFFFFu) |
         (static_cast<std::uint32_t>(draw.fog_enabled ? 0xFFu : 0u) << 24u);
 
     bucket->hw_packed.resize(bucket->hw_packed.size() + vertex_count);
@@ -4721,7 +5338,30 @@ void coalesce_batches(std::vector<Batch> &batches, std::uint64_t &merged_away) n
     batches.swap(merged);
 }
 
-bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+// Swaps in finished replacement / upscaled textures. Runs at a frame boundary
+// (after the fence wait), so no in-flight draw still references the old image.
+void apply_texture_replacements(VulkanGeState &s) noexcept {
+    static thread_local std::vector<vcs::TextureResult> finished;
+    finished.clear();
+    vcs::texture_pipeline_poll(finished, 4u);  // a few per frame keeps uploads hitch-free
+    for (vcs::TextureResult &r : finished) {
+        const auto found = s.textures.find(r.key);
+        if (found == s.textures.end()) continue;
+        TextureEntry &old = found->second;
+        if (old.scale_shift != 0u || old.width != r.original_width || old.height != r.original_height) continue;
+        TextureEntry fresh{};
+        const std::span<const std::byte> pixels(reinterpret_cast<const std::byte *>(r.texture.rgba.data()),
+                                                r.texture.rgba.size());
+        if (!create_texture(s, r.texture.width, r.texture.height, pixels, old.sampler, fresh)) continue;
+        fresh.scale_shift = r.texture.scale_shift;
+        fresh.sampler = old.sampler;
+        fresh.last_used_epoch = old.last_used_epoch;
+        destroy_texture_entry(s, old);
+        old = fresh;
+    }
+}
+
+static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
     VulkanGeState &s = state();
     if (!s.enabled) return false;
 
@@ -5166,6 +5806,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     // insertion point.
     bool cloud_depth_writing_world_seen = false;
     bool clouds_composited = false;
+    bool sky_filled = false;
 
     VkPipeline bound = VK_NULL_HANDLE;
     for (const Batch &batch : winner->batches) {
@@ -5173,6 +5814,36 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             cloud_depth_writing_world_seen = true;
         const bool fading_entities_boundary = cloud_depth_writing_world_seen && !batch.clear_mode &&
             batch.depth_test_enabled && !batch.depth_write_enabled;
+        if (!sky_filled && s.sky_palette_ready && fading_entities_boundary) {
+            sky_filled = true;
+            const float sky_hours = vcs::game_clock_hours();
+            if (sky_hours >= 0.0f) {
+                vcs::SkyColors sky = vcs::sky_palette_colors(sky_hours);
+                // Weather pulls the sky toward that weather's grey-out colors (a soft
+                // slate, not a neutral grey), strongest in daylight.
+                const vcs::WeatherBlend sky_weather = vcs::weather_look();
+                if (sky_weather.known && sky_weather.look.sky_grey > 0.0f) {
+                    const vcs::WeatherLook &wx = sky_weather.look;
+                    const float daylight = std::clamp(1.0f - vice_palette().night, 0.0f, 1.0f);
+                    const float pull = wx.sky_grey * daylight;
+                    for (std::size_t c = 0u; c < 3u; ++c) {
+                        sky.horizon[c] += (wx.horizon[c] - sky.horizon[c]) * pull;
+                        sky.zenith[c] += (wx.zenith[c] - sky.zenith[c]) * pull;
+                    }
+                }
+                const float sky_alpha = std::clamp(s.postfx.sky_palette_strength, 0.0f, 1.0f);
+                const std::array<float, 8> sky_push{
+                    sky.zenith[0] / 255.0f, sky.zenith[1] / 255.0f, sky.zenith[2] / 255.0f, sky_alpha,
+                    sky.horizon[0] / 255.0f, sky.horizon[1] / 255.0f, sky.horizon[2] / 255.0f, 0.62f};
+                VkRect2D sky_scissor{{0, 0}, {s.width, s.height}};
+                vkCmdSetScissor(s.command_buffer, 0, 1, &sky_scissor);
+                vkCmdBindPipeline(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s.sky_pipeline);
+                vkCmdPushConstants(s.command_buffer, s.sky_pipeline_layout,
+                                   VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(sky_push), sky_push.data());
+                vkCmdDraw(s.command_buffer, 3u, 1u, 0u, 0u);
+                bound = VK_NULL_HANDLE;
+            }
+        }
         if (!clouds_composited && cloud_draws.ready && fading_entities_boundary) {
             clouds_composited = true;
             if (std::getenv("PSPRECOMP_CLOUD_DIAG") != nullptr) {
@@ -5370,6 +6041,49 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                          VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
+        if (s.smaa_ready) {
+            const std::array<VkRenderPass, 3> passes{s.smaa_pass[0], s.smaa_pass[1], s.fxaa_render_pass};
+            const std::array<VkFramebuffer, 3> targets{s.smaa_framebuffer[0], s.smaa_framebuffer[1],
+                                                        s.fxaa_framebuffer};
+            const std::array<float, 4> metrics{1.0f / static_cast<float>(s.width),
+                                               1.0f / static_cast<float>(s.height),
+                                               static_cast<float>(s.width),
+                                               static_cast<float>(s.height)};
+            for (std::size_t i = 0u; i < 3u; ++i) {
+                VkClearValue smaa_clear{};
+                smaa_clear.color = VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}};
+                VkRenderPassBeginInfo smaa_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+                smaa_begin.renderPass = passes[i];
+                smaa_begin.framebuffer = targets[i];
+                smaa_begin.renderArea.extent = {s.width, s.height};
+                smaa_begin.clearValueCount = 1u;
+                smaa_begin.pClearValues = &smaa_clear;
+                vkCmdBeginRenderPass(s.command_buffer, &smaa_begin, VK_SUBPASS_CONTENTS_INLINE);
+                VkViewport smaa_viewport{};
+                smaa_viewport.width = static_cast<float>(s.width);
+                smaa_viewport.height = static_cast<float>(s.height);
+                smaa_viewport.maxDepth = 1.0f;
+                vkCmdSetViewport(s.command_buffer, 0, 1, &smaa_viewport);
+                VkRect2D smaa_scissor{{0, 0}, {s.width, s.height}};
+                vkCmdSetScissor(s.command_buffer, 0, 1, &smaa_scissor);
+                vkCmdBindPipeline(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s.smaa_pipeline[i]);
+                vkCmdBindDescriptorSets(s.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        s.smaa_pipeline_layout[i], 0, 1, &s.smaa_set[i], 0, nullptr);
+                vkCmdPushConstants(s.command_buffer, s.smaa_pipeline_layout[i],
+                                   VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(metrics), metrics.data());
+                vkCmdDraw(s.command_buffer, 3u, 1u, 0u, 0u);
+                vkCmdEndRenderPass(s.command_buffer);
+                if (i < 2u) {
+                    VkMemoryBarrier smaa_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                    smaa_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    smaa_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    vkCmdPipelineBarrier(s.command_buffer,
+                                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &smaa_barrier,
+                                         0, nullptr, 0, nullptr);
+                }
+            }
+        } else {
         VkClearValue fxaa_clear{};
         fxaa_clear.color = VkClearColorValue{{0.0f, 0.0f, 0.0f, 1.0f}};
         VkRenderPassBeginInfo fxaa_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -5399,6 +6113,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         vkCmdDraw(s.command_buffer, 3u, 1u, 0u, 0u);
 
         vkCmdEndRenderPass(s.command_buffer);
+        }
     }
 
     // Color grading: one more fullscreen pass, reading whichever image is
@@ -5435,15 +6150,42 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                                 s.grading_pipeline_layout, 0, 1, &s.grading_descriptor_set, 0,
                                 nullptr);
         ColorGradePushConstants grading_push{};
-        grading_push.saturation = s.color_grading_saturation;
-        grading_push.contrast = s.color_grading_contrast;
-        grading_push.brightness = s.color_grading_brightness;
-        grading_push.tint_r = s.color_grading_tint[0];
-        grading_push.tint_g = s.color_grading_tint[1];
-        grading_push.tint_b = s.color_grading_tint[2];
+        float tod_saturation = 1.0f, tod_contrast = 1.0f, tod_lift = 0.0f;
+        std::array<float, 3> tod_tint{1.0f, 1.0f, 1.0f};
+        if (s.postfx.time_of_day_enabled) {
+            const VicePalette palette = vice_palette();
+            if (palette.valid) {
+                const float golden = palette.golden;
+                const float night = palette.night;
+                const float k = s.postfx.time_of_day_strength;
+                // Dawn/dusk lean pink-magenta (not plain orange); nights lean
+                // violet-blue with extra saturation so neon reads.
+                const std::array<float, 3> warm{1.06f, 0.94f, 1.08f};
+                const std::array<float, 3> cool{0.90f, 0.93f, 1.16f};
+                for (std::size_t c = 0u; c < 3u; ++c) {
+                    tod_tint[c] = 1.0f + (warm[c] - 1.0f) * golden * k + (cool[c] - 1.0f) * night * k;
+                }
+                tod_saturation = 1.0f + 0.08f * golden * k + 0.12f * night * k;
+                // Moonlit lift: keeps nights from going flat black.
+                tod_lift = 0.07f * night * k;
+            }
+        }
+        grading_push.saturation = s.color_grading_saturation * tod_saturation;
+        grading_push.contrast = s.color_grading_contrast * tod_contrast;
+        grading_push.brightness = s.color_grading_brightness + tod_lift;
+        grading_push.tint_r = s.color_grading_tint[0] * tod_tint[0];
+        grading_push.tint_g = s.color_grading_tint[1] * tod_tint[1];
+        grading_push.tint_b = s.color_grading_tint[2] * tod_tint[2];
         grading_push.sharpen_strength = s.color_grading_sharpen;
-        grading_push.texel_size[0] = 1.0f / static_cast<float>(s.width);
-        grading_push.texel_size[1] = 1.0f / static_cast<float>(s.height);
+        grading_push.texel_x = 1.0f / static_cast<float>(s.width);
+        grading_push.texel_y = 1.0f / static_cast<float>(s.height);
+        grading_push.dither_strength = s.postfx.dither_enabled ? s.postfx.dither_strength : 0.0f;
+        grading_push.cas_sharpness = s.postfx.cas_enabled ? std::max(s.postfx.cas_sharpness, 0.001f) : 0.0f;
+        grading_push.vhs_enabled = s.postfx.vhs_enabled ? 1.0f : 0.0f;
+        grading_push.vhs_wiggle = s.postfx.vhs_wiggle;
+        grading_push.vhs_smear = s.postfx.vhs_smear;
+        grading_push.time_seconds = std::chrono::duration<float>(
+            std::chrono::steady_clock::now() - s.postfx_epoch).count() * s.postfx.vhs_speed * 0.04f;
         vkCmdPushConstants(s.command_buffer, s.grading_pipeline_layout,
                            VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(grading_push), &grading_push);
         vkCmdDraw(s.command_buffer, 3u, 1u, 0u, 0u);
@@ -5502,6 +6244,13 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     s.frame_buckets.clear();
     s.cloud_cameras.clear();
     return produced_frame;
+}
+
+bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+    const bool produced = finish_color_frame_impl(vblank);
+    // The frame is submitted and its fence waited on: safe to swap textures now.
+    if (state().enabled) apply_texture_replacements(state());
+    return produced;
 }
 
 bool ge_gpu_backend_copy_game_frame_rgba(std::span<std::byte> destination) noexcept {

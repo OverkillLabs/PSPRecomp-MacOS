@@ -2,6 +2,7 @@
 #include "ge_gpu_backend.hpp"
 #include "vcs_config.hpp"
 #include "vcs_project2dfx.hpp"
+#include "vcs_sky_palette.hpp"
 #include "vcs_fps_overlay.hpp"
 
 #include "psprecomp/common.hpp"
@@ -3476,7 +3477,8 @@ std::uint32_t pack_gpu_alpha_control(const GeGpuDrawDescriptor &draw) noexcept {
 }
 
 std::uint32_t pack_gpu_fog_control(const GeGpuDrawDescriptor &draw) noexcept {
-    return (draw.fog_color & 0x00FFFFFFu) |
+    if (draw.fog_enabled) note_game_sky_color(draw.fog_color);
+    return (remap_sky_color(draw.fog_color) & 0x00FFFFFFu) |
            (static_cast<std::uint32_t>(draw.fog_enabled ? 0xFFu : 0u) << 24u);
 }
 
@@ -3622,6 +3624,18 @@ void accumulate_gpu_rectangle(const GeGpuDrawDescriptor &draw,
         ge_gpu_backend_texture_available(effective_draw);
 
     Color color = b.color;
+    if (effective_draw.clear_mode && effective_draw.clear_color) {
+        // The sky is a flat clear that matches the fog color exactly, so a
+        // clear whose color equals it is the sky (other clears stay untouched).
+        const std::uint32_t clear_abgr = static_cast<std::uint32_t>(color.r) |
+            (static_cast<std::uint32_t>(color.g) << 8u) | (static_cast<std::uint32_t>(color.b) << 16u);
+        if (clear_abgr == (draw.fog_color & 0x00FFFFFFu)) {
+            const std::uint32_t mapped = remap_sky_color(clear_abgr);
+            color.r = static_cast<std::uint8_t>(mapped & 0xFFu);
+            color.g = static_cast<std::uint8_t>((mapped >> 8u) & 0xFFu);
+            color.b = static_cast<std::uint8_t>((mapped >> 16u) & 0xFFu);
+        }
+    }
     if (!effective_draw.clear_mode && gpu_force_white_vertex_colors_enabled()) {
         color = Color{255u, 255u, 255u, 255u};
     } else if (!effective_draw.clear_mode && gpu_geometry_debug_colors_enabled()) {

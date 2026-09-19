@@ -40,7 +40,7 @@ bool alpha_pass(uint function_id, uint lhs, uint rhs) {
 
 vec4 apply_texture_function(vec4 vertex, vec4 texture_value, uvec4 control, uvec3 env_bytes) {
     uint function_id = control.x & 7u;
-    bool use_alpha = control.y != 0u;
+    bool use_alpha = (control.y & 1u) != 0u;
     bool double_color = control.z != 0u;
     vec4 result = vertex;
     vec3 env = vec3(env_bytes) * (1.0 / 255.0);
@@ -89,6 +89,40 @@ vec4 quantize_framebuffer(vec4 color, uint format) {
     return color;
 }
 
+float detail_hash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float detail_noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(detail_hash(i), detail_hash(i + vec2(1.0, 0.0)), f.x),
+               mix(detail_hash(i + vec2(0.0, 1.0)), detail_hash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+
+// Zero-mean luminance grit at 2x/4x/8x the texel frequency, anchored to texel
+// space so it never swims. Each octave fades in only once its period spans a few
+// pixels (no aliasing), and the whole layer only when the texture is really blown up.
+float detail_modulation(vec2 uv_texels) {
+    float texels_per_pixel = max(length(dFdx(uv_texels)), length(dFdy(uv_texels)));
+    float pixels_per_texel = 1.0 / max(texels_per_pixel, 1.0e-4);
+    float ramp = smoothstep(1.5, 5.0, pixels_per_texel);
+    if (ramp <= 0.0) return 0.0;
+    float sum = 0.0;
+    float weight = 0.0;
+    float freq = 2.0;
+    for (int i = 0; i < 3; ++i) {
+        float w = smoothstep(2.5, 6.0, pixels_per_texel / freq);
+        sum += (detail_noise(uv_texels * freq + float(i) * 17.3) - 0.5) * w;
+        weight += 1.0;
+        freq *= 2.0;
+    }
+    return sum / weight * 2.0 * ramp;
+}
+
 void main() {
     uvec4 texture_control = uvec4(v_texture_control & 0xFFu,
                                   (v_texture_control >> 8u) & 0xFFu,
@@ -118,8 +152,13 @@ void main() {
         // unnormalizedCoordinates (which would forbid mipmapping/filtering).
         float q = abs(v_q) < 1.0e-20 ? 1.0 : v_q;
         vec2 uv_texels = v_uv / q;
-        vec2 uv_normalized = uv_texels / vec2(textureSize(source_texture, 0));
+        // A replacement texture can be 2x/4x/8x the game's: bits 4-5 of the
+        // use-alpha byte carry log2 of that, so UVs keep the original scale.
+        float texture_scale = float(1u << ((texture_control.y >> 4u) & 3u));
+        vec2 uv_normalized = uv_texels / (vec2(textureSize(source_texture, 0)) / texture_scale);
         vec4 texel = texture(source_texture, uv_normalized);
+        if ((texture_control.y & 0x40u) != 0u && texel.a > 0.99)
+            texel.rgb *= 1.0 + detail_modulation(uv_texels) * 0.55;
         color = apply_texture_function(color, texel, texture_control, texture_env);
     }
 

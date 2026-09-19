@@ -9,6 +9,7 @@
 #include "framebuffer_capture.hpp"
 #include "ge_renderer.hpp"
 #include "ge_gpu_backend.hpp"
+#include "vcs_game_clock.hpp"
 #include "vcs_project2dfx.hpp"
 #include "vcs_fps_overlay.hpp"
 
@@ -7355,6 +7356,21 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         // silently vanished the moment real gameplay's multi-pass
         // compositing started -- confirmed live, exactly that split.
         fps_overlay_render_frame(ge_gpu_backend_last_winner_target());
+        {
+            // gp+0x1DE0/0x1DE1: hour and minute (confirmed by Project2DFX).
+            const std::uint32_t clock_gp = ctx.gpr[28];
+            if (rt.memory().contains(clock_gp + 0x2098u, 0x140u)) {
+                const auto weather_old = static_cast<std::int16_t>(rt.memory().load16(clock_gp + 0x2098u));
+                const auto weather_new = static_cast<std::int16_t>(rt.memory().load16(clock_gp + 0x20A0u));
+                publish_game_weather(weather_old, weather_new,
+                                     std::bit_cast<float>(rt.memory().load32(clock_gp + 0x21D8u)));
+            }
+            if (rt.memory().contains(clock_gp + 0x1DE0u, 2u)) {
+                const std::uint32_t clock_hour = rt.memory().load8(clock_gp + 0x1DE0u);
+                const std::uint32_t clock_minute = rt.memory().load8(clock_gp + 0x1DE1u);
+                if (clock_hour < 24u && clock_minute < 60u) publish_game_clock(clock_hour, clock_minute);
+            }
+        }
         project2dfx_render_frame(
             rt.memory(), ctx.gpr[28], display_vblank_index, display_state.frame_buffer);
         // A movie frame is a finished 480x272 picture with no more image at the

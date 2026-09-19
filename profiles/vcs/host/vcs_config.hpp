@@ -221,6 +221,36 @@ struct ColorGradingConfiguration {
     float tint_b{1.0f};
 };
 
+// Texture replacement and upscaling. Replacement PNGs live in <directory> named
+// <content hash>.png and must be exactly 2x/4x/8x the game's texture size.
+struct TexturesConfiguration {
+    bool mipmaps{true};           // generate a full mip chain for every texture
+    bool replacement{true};
+    bool detail{true};            // procedural sub-texel detail where a texture is heavily magnified
+    bool dump_originals{false};   // write each new game texture to <directory>/originals
+    bool upscale{false};          // conservative built-in upscaler for textures without a replacement
+    std::uint32_t upscale_scale{0u};   // 0 = automatic by texture size
+    float upscale_sharpen{0.25f};
+    std::string directory{"Textures"};
+};
+
+// Color-only ProperShaders-style post effects, all read from ProperShaders.ini
+// and all off by default. They ride the existing grading pass.
+struct PostFxConfiguration {
+    bool dither_enabled{false};    // [Dither] Enabled
+    float dither_strength{1.0f};   // [Dither] Strength
+    bool cas_enabled{false};       // [CAS] Enabled
+    float cas_sharpness{0.3f};     // [CAS] Sharpness
+    bool vhs_enabled{false};       // [VHS] Enabled
+    float vhs_wiggle{0.03f};
+    float vhs_smear{1.0f};
+    float vhs_speed{25.0f};
+    bool sky_palette_enabled{false};   // [SkyPalette] Enabled
+    float sky_palette_strength{0.85f}; // [SkyPalette] Strength
+    bool time_of_day_enabled{false};   // [TimeOfDayGrade] Enabled
+    float time_of_day_strength{0.35f};  // [TimeOfDayGrade] Strength
+};
+
 // Standalone ProperShaders.ini feature. Values normally supplied by the San
 // Andreas timecycle/weather integration remain explicit placeholders until the
 // equivalent VCS guest hooks exist. Keeping the inputs separate is important:
@@ -231,9 +261,9 @@ struct VolumetricCloudsConfiguration {
     std::uint32_t downscale_div{2u};
     std::uint32_t layers{2u};
     std::uint32_t shadow_steps{8u};
-    float coverage_low{0.35f};
-    float coverage_mid{0.25f};
-    float coverage_high{0.18f};
+    float coverage_low{0.52f};
+    float coverage_mid{0.34f};
+    float coverage_high{0.20f};
     float opacity{1.0f};
     float speed{0.0f};
     float brightness{1.0f};
@@ -242,16 +272,16 @@ struct VolumetricCloudsConfiguration {
     float sun_direction_y{-0.28f};
     float sun_direction_z{0.88f};
     float sun_color_r{1.0f};
-    float sun_color_g{0.97f};
-    float sun_color_b{0.88f};
-    float cloud_base_color_r{0.70f};
-    float cloud_base_color_g{0.70f};
-    float cloud_base_color_b{0.70f};
+    float sun_color_g{0.94f};
+    float sun_color_b{0.86f};
+    float cloud_base_color_r{0.86f};
+    float cloud_base_color_g{0.82f};
+    float cloud_base_color_b{0.90f};
     float atmosphere_density{0.0f};
     float mist{0.50f};
-    float fog_color_r{0.58f};
-    float fog_color_g{0.68f};
-    float fog_color_b{0.78f};
+    float fog_color_r{0.72f};
+    float fog_color_g{0.80f};
+    float fog_color_b{0.92f};
     float fog_start{4500.0f};
     float day_progression{0.88f};
     float temporal_blend{0.50f};
@@ -291,6 +321,7 @@ struct ControlsConfiguration {
 
 struct VcsConfiguration {
     ControlsConfiguration controls{};
+    TexturesConfiguration textures{};
     DisplayConfiguration display{};
     RenderingConfiguration rendering{};
     AudioConfiguration audio{};
@@ -300,6 +331,10 @@ struct VcsConfiguration {
     BloomConfiguration bloom{};
     ColorGradingConfiguration color_grading{};
     VolumetricCloudsConfiguration volumetric_clouds{};
+    // ProperShaders.ini [SMAA] Enabled: real three-pass SMAA 1x (Vulkan backend),
+    // replacing FXAA. Off by default.
+    bool smaa_1x{false};
+    PostFxConfiguration postfx{};
     std::filesystem::path source_path{};
     // Where the executable lives. Saves go beside it rather than into the game
     // data, so a player who points the runtime at a read-only or shared copy of

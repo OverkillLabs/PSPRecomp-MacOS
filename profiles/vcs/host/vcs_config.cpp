@@ -149,6 +149,50 @@ void load_proper_shaders_configuration(VcsConfiguration &config,
             section = lowercase_copy(trim_copy(line.substr(1u, line.size() - 2u)));
             continue;
         }
+        if (section == "smaa") {
+            const std::size_t smaa_separator = line.find('=');
+            if (smaa_separator != std::string::npos &&
+                lowercase_copy(trim_copy(line.substr(0u, smaa_separator))) == "enabled" &&
+                !parse_bool(strip_inline_comment(line.substr(smaa_separator + 1u)), config.smaa_1x)) {
+                warning(config, line_number, "ProperShaders.ini: [SMAA] Enabled expects true/false");
+            }
+            continue;
+        }
+        if (section == "dither" || section == "cas" || section == "vhs" ||
+            section == "timeofdaygrade" || section == "skypalette") {
+            const std::size_t eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string k = lowercase_copy(trim_copy(line.substr(0u, eq)));
+            const std::string v = strip_inline_comment(line.substr(eq + 1u));
+            PostFxConfiguration &fx = config.postfx;
+            bool ok = true;
+            if (k == "enabled") {
+                bool &flag = section == "dither"  ? fx.dither_enabled
+                           : section == "cas"     ? fx.cas_enabled
+                           : section == "timeofdaygrade" ? fx.time_of_day_enabled
+                           : section == "skypalette" ? fx.sky_palette_enabled
+                                                  : fx.vhs_enabled;
+                ok = parse_bool(v, flag);
+            } else if (section == "dither" && k == "strength") {
+                ok = parse_float(v, 0.0f, 4.0f, fx.dither_strength);
+            } else if (section == "cas" && k == "sharpness") {
+                ok = parse_float(v, 0.0f, 1.0f, fx.cas_sharpness);
+            } else if (section == "skypalette" && k == "strength") {
+                ok = parse_float(v, 0.0f, 1.0f, fx.sky_palette_strength);
+            } else if (section == "timeofdaygrade" && k == "strength") {
+                ok = parse_float(v, 0.0f, 1.0f, fx.time_of_day_strength);
+            } else if (section == "vhs" && k == "wiggle") {
+                ok = parse_float(v, 0.0f, 1.5f, fx.vhs_wiggle);
+            } else if (section == "vhs" && k == "smear") {
+                ok = parse_float(v, 0.0f, 2.0f, fx.vhs_smear);
+            } else if (section == "vhs" && k == "wigglespeed") {
+                ok = parse_float(v, 0.0f, 100.0f, fx.vhs_speed);
+            } else {
+                warning(config, line_number, "ProperShaders.ini: unknown [" + section + "] key '" + k + "'");
+            }
+            if (!ok) warning(config, line_number, "ProperShaders.ini: invalid [" + section + "] " + k);
+            continue;
+        }
         if (section != "volumetricclouds" && section != "volumetric clouds") continue;
         const std::size_t separator = line.find('=');
         if (separator == std::string::npos) {
@@ -512,6 +556,38 @@ void apply_widescreen_key(VcsConfiguration &config, const std::string &key,
     warning(config, line, "unknown [Widescreen] key '" + key + "'");
 }
 
+void apply_textures_key(VcsConfiguration &config, const std::string &key,
+                        const std::string &value, std::size_t line) {
+    TexturesConfiguration &tx = config.textures;
+    if (key == "mipmaps") {
+        if (!parse_bool(value, tx.mipmaps)) warning(config, line, "Textures.Mipmaps expects true/false");
+    } else if (key == "replacement") {
+        if (!parse_bool(value, tx.replacement)) warning(config, line, "Textures.Replacement expects true/false");
+    } else if (key == "detail") {
+        if (!parse_bool(value, tx.detail)) warning(config, line, "Textures.Detail expects true/false");
+    } else if (key == "dumporiginals") {
+        if (!parse_bool(value, tx.dump_originals)) warning(config, line, "Textures.DumpOriginals expects true/false");
+    } else if (key == "upscale") {
+        if (!parse_bool(value, tx.upscale)) warning(config, line, "Textures.Upscale expects true/false");
+    } else if (key == "upscalescale") {
+        if (lowercase_copy(trim_copy(value)) == "auto") {
+            tx.upscale_scale = 0u;
+        } else {
+            std::uint32_t scale = tx.upscale_scale;
+            if (!parse_u32(value, 2u, 8u, scale)) warning(config, line, "Textures.UpscaleScale must be Auto, 2, 4 or 8");
+            else tx.upscale_scale = scale;
+        }
+    } else if (key == "upscalesharpen") {
+        if (!parse_float(value, 0.0f, 1.0f, tx.upscale_sharpen))
+            warning(config, line, "Textures.UpscaleSharpen must be between 0.0 and 1.0");
+    } else if (key == "directory") {
+        const std::string dir = trim_copy(value);
+        if (!dir.empty()) tx.directory = dir;
+    } else {
+        warning(config, line, "unknown Textures key '" + key + "'");
+    }
+}
+
 void apply_color_grading_key(VcsConfiguration &config, const std::string &key,
                              const std::string &value, std::size_t line) {
     if (key == "enabled") {
@@ -852,6 +928,8 @@ VcsConfiguration load_vcs_configuration(const std::filesystem::path &path) {
         // VCSNative.ini sections and must not be reported as unknown here.
         else if (section == "simulatehdr" || section == "simulate hdr")
             apply_simulate_hdr_key(config, key, value, line_number);
+        else if (section == "textures")
+            apply_textures_key(config, key, value, line_number);
         else if (section == "colorgrading" || section == "color grading")
             apply_color_grading_key(config, key, value, line_number);
         else if (section == "project2dfx" || section == "project 2dfx" ||

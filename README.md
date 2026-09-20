@@ -1,21 +1,25 @@
-# PSPRecomp (macOS / Apple Silicon fork)
+# VCSNative: GTA Vice City Stories for macOS and Windows (PSPRecomp fork)
 
 This is a fork of [jessicanataliagta/PSPRecomp](https://github.com/jessicanataliagta/PSPRecomp),
 the original PSPRecomp created by **Jessica Natalia**
-([@jessicanataliagta](https://github.com/jessicanataliagta)), adding a
-**native macOS ARM (Apple Silicon) port of the VCS profile** (GTA:
-Vice City Stories) alongside the original Windows/DirectX12 build. None of
-this port would exist without her original recompiler, VCS profile and
-DX12 host to build on top of — all credit for the framework and the game
-profile itself belongs to her. The two builds share the same recompiler
-framework and profile; only the GE (graphics) backend and host platform
-layer differ.
+([@jessicanataliagta](https://github.com/jessicanataliagta)). It adds a
+**native macOS ARM (Apple Silicon) port** and a **Windows Vulkan build** of the VCS profile (GTA: Vice City
+Stories), alongside the original Windows/DirectX12 build. None of this would exist without her original recompiler,
+VCS profile and DX12 host to build on top of — all credit for the framework and the game profile itself belongs to
+her. All builds share the same recompiler framework and profile; only the GE (graphics) backend and the host
+platform layer differ.
 
-On macOS, VCSNative runs through a native **Vulkan/MoltenVK** GE backend
-(`profiles/vcs/host/ge_gpu_backend_vulkan.cpp`) instead of DirectX12, real
-CoreGraphics-based display/resolution handling, and a native SwiftUI
-settings launcher (`VCSLauncher.app`, built alongside `VCSNative.app`) for
-editing `VCSNative.ini` without hand-editing the file.
+- **macOS (Apple Silicon):** a native Vulkan/MoltenVK GE backend
+  (`profiles/vcs/host/ge_gpu_backend_vulkan.cpp`), CoreGraphics-based display and resolution handling, and a native
+  SwiftUI launcher. The finished `VCSNative.app` is a single self-contained app: FFmpeg, SDL and MoltenVK are inside
+  it, so nothing has to be installed.
+- **Windows (experimental):** the same Vulkan backend running natively on Windows, with a single-exe launcher
+  (`VCSLauncher.exe`) and every DLL the game needs in the download. The original DirectX 12 backend is still in the
+  source.
+- Both platforms support keyboard and mouse as well as gamepads, and both launchers edit `VCSNative.ini` and
+  `ProperShaders.ini` for you, so nothing has to be edited by hand.
+
+Ready-to-play builds are on the [Releases page](../../releases); see "Download and play" below.
 
 PSPRecomp itself is a static recompilation framework for PSP software. It
 reads an Allegrex/MIPS executable, analyzes guest code, emits C++

@@ -19,12 +19,19 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include <cstdint>
 #include <limits>
+#include <optional>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -130,10 +137,53 @@ std::filesystem::path native_executable_directory(const char *argv0) {
         }
         buffer.resize(buffer.size() * 2u);
     }
+#elif defined(__APPLE__)
+    // argv[0] is not reliable inside an app bundle (Launch Services, translocation), so ask dyld.
+    std::vector<char> buffer(1024u);
+    std::uint32_t size = static_cast<std::uint32_t>(buffer.size());
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+        buffer.resize(size);
+        if (_NSGetExecutablePath(buffer.data(), &size) != 0)
+            return std::filesystem::absolute(argv0 != nullptr ? argv0 : "VCSNative").parent_path();
+    }
+    std::error_code error;
+    const std::filesystem::path resolved = std::filesystem::weakly_canonical(buffer.data(), error);
+    return (error ? std::filesystem::absolute(buffer.data()) : resolved).parent_path();
 #else
     return std::filesystem::absolute(argv0 != nullptr ? argv0 : "VCSNative").parent_path();
 #endif
 }
+
+#if defined(__APPLE__)
+// A packaged app (Contents/Resources/Defaults present) is sealed and may run from a read-only copy that
+// macOS makes of a freshly downloaded app, so settings, saves, textures and logs live in the per-user
+// data folder instead. The first run seeds it with the defaults shipped in the app. Development builds
+// have no Defaults folder and keep everything beside the executable as before.
+struct MacDataLayout {
+    std::filesystem::path data_directory;
+    std::vector<std::filesystem::path> psp_data_search_roots;
+};
+
+std::optional<MacDataLayout> prepare_macos_data_layout(const std::filesystem::path &executable_directory) {
+    namespace fs = std::filesystem;
+    const fs::path defaults = executable_directory.parent_path() / "Resources" / "Defaults";
+    std::error_code error;
+    if (executable_directory.filename() != "MacOS" || !fs::is_directory(defaults, error)) return std::nullopt;
+
+    const char *home = std::getenv("HOME");
+    if (home == nullptr || *home == '\0') return std::nullopt;
+    const fs::path data = fs::path(home) / "Library" / "Application Support" / "VCSNative";
+    fs::create_directories(data, error);
+    if (error) return std::nullopt;
+    for (const auto &entry : fs::directory_iterator(defaults, error)) {
+        const fs::path target = data / entry.path().filename();
+        if (!fs::exists(target, error)) fs::copy_file(entry.path(), target, error);
+    }
+    // .../VCSNative.app/Contents/MacOS -> the folder that holds the .app
+    const fs::path beside_app = executable_directory.parent_path().parent_path().parent_path();
+    return MacDataLayout{data, {data, beside_app}};
+}
+#endif
 
 void validate_vcs_game_root(const std::filesystem::path &root) {
     if (std::getenv("PSPRECOMP_ALLOW_INCOMPLETE_ROOT") != nullptr) return;
@@ -171,11 +221,19 @@ int main(int argc, char **argv) {
     try {
         const std::filesystem::path executable_directory =
             native_executable_directory(argc > 0 ? argv[0] : nullptr);
+        std::filesystem::path data_directory = executable_directory;
+        std::vector<std::filesystem::path> psp_data_search_roots;
+#if defined(__APPLE__)
+        if (const auto layout = prepare_macos_data_layout(executable_directory)) {
+            data_directory = layout->data_directory;
+            psp_data_search_roots = layout->psp_data_search_roots;
+        }
+#endif
         const vcs::BootstrapPaths paths =
-            vcs::resolve_bootstrap_paths(argc, argv, executable_directory);
+            vcs::resolve_bootstrap_paths(argc, argv, executable_directory, psp_data_search_roots);
         const std::filesystem::path &executable = paths.psp_executable;
         const std::filesystem::path &root = paths.game_root;
-        vcs::initialize_vcs_configuration(executable_directory);
+        vcs::initialize_vcs_configuration(data_directory);
         const vcs::VcsConfiguration &configuration = vcs::vcs_configuration();
         vcs::runtime_log_initialize(configuration);
         vcs::runtime_log_line(std::string("bootstrap executable=") + executable.string());

@@ -24,6 +24,31 @@ shipping a PSP interpreter or JIT.
 
 The repository is split between a reusable framework and game-specific profiles. The first working profile is GTA: Vice City Stories (`profiles/vcs`).
 
+## Download and play
+
+Nothing has to be installed and no terminal is needed. Get the latest build from the
+[Releases page](../../releases), unzip it, and open the launcher.
+
+You need your own legally obtained copy of the game, extracted to a folder called `PSP_DATA` (it holds
+`PSP_GAME/SYSDIR/EBOOT_DECRYPTED.ELF` and `PSP_GAME/USRDIR`). No game files are included.
+
+**macOS (Apple Silicon, macOS 13 or later)**
+1. Unzip `VCSNative-macOS.zip` and double-click **VCSNative**. The first time, macOS asks whether you want to open an
+   app downloaded from the Internet: click **Open**. (On recent macOS versions, if it only offers "Done", open
+   System Settings > Privacy & Security and click **Open Anyway**.)
+2. On the Window page, next to *Game folder*, click **Choose...** and pick your `PSP_DATA` folder. It can be anywhere,
+   including an external drive; nothing is copied. **Play** stays greyed out until the game files are found.
+3. Press **Play**. Settings, saves and textures are kept in `~/Library/Application Support/VCSNative`.
+
+**Windows 10/11 (64-bit)**
+1. Unzip the whole `VCSNative` folder somewhere you can write to (not `Program Files`).
+2. Put your `PSP_DATA` folder right next to `VCSNative.exe` and `VCSLauncher.exe`.
+3. Double-click **VCSLauncher.exe** and press **Play**. If Windows shows "Windows protected your PC", click
+   *More info* and then *Run anyway*. You need a graphics driver with Vulkan 1.1 support, which the normal NVIDIA,
+   AMD and Intel drivers include; everything else is in the folder.
+
+The optional texture pack is a separate download: install it from the launcher's Quality page.
+
 ## Repository layout
 
 ```text
@@ -44,8 +69,9 @@ Game-specific addresses, HLE behavior, native fast paths, renderer integration a
 - A C++20 compiler
 - Visual Studio 2022 for the Windows/DX12 VCS build
 - macOS 13+ on Apple Silicon, Xcode command line tools (for `swiftc`, used
-  to build `VCSLauncher.app`), and `brew install vulkan-headers
-  vulkan-loader molten-vk shaderc` for the Vulkan/MoltenVK VCS build
+  to build the launcher), and `brew install cmake vulkan-headers vulkan-loader
+  molten-vk shaderc sdl2` for the Vulkan/MoltenVK VCS build. These are needed to
+  *build*; the app you build contains everything it needs to run.
 
 ## Build the framework only
 
@@ -68,10 +94,20 @@ cmake --build out/vcs --config Release
 
 Windows users working on the VCS profile can use the maintained scripts in `profiles/vcs/scripts`.
 
-On macOS this produces `VCSNative.app` and `VCSLauncher.app` side by side
-in `out/vcs/bin/Release/`. Launch `VCSLauncher.app` first to edit display,
-rendering and addon settings (it edits `VCSNative.app`'s bundled
-`VCSNative.ini` directly); its Play button launches `VCSNative.app`.
+On macOS, one command builds everything and produces a ready-to-play app:
+
+```bash
+profiles/vcs/scripts/build_macos.sh
+```
+
+It builds an LGPL FFmpeg (downloaded from ffmpeg.org, so nothing GPL ends up inside the app), the game and the
+launcher, then assembles **`out/vcs/dist/VCSNative.app`**: one self-contained, signed app with FFmpeg, SDL, the Vulkan
+loader and MoltenVK inside it, plus `out/vcs/dist/VCSNative-macOS.zip` to share. Double-click it; see "Download and
+play" above. A plain `cmake --build` produces the same `dist/VCSNative.app`. The individual `VCSNative.app` and
+`VCSLauncher.app` in `bin/Release/` are development outputs.
+
+On Windows, `profiles\vcs\BUILD_VCS.bat` produces a folder that also runs on any PC: the FFmpeg and Visual C++ runtime
+DLLs are copied next to the exe.
 
 ## Create another profile
 

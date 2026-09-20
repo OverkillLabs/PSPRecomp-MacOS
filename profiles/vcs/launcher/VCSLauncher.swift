@@ -139,6 +139,72 @@ extension IniDocument {
 // found relative to the launcher's own bundle rather than a hardcoded path.
 
 enum GameLocation {
+    /// A packaged app carries its default settings in Contents/Resources/Defaults. It is sealed (and macOS
+    /// may run a freshly downloaded copy from a read-only location), so settings, saves and textures live in
+    /// the per-user data folder and the game executable sits inside this same app. A development build has
+    /// no Defaults folder and keeps the old layout: the game app beside the launcher.
+    static var defaultsURL: URL? {
+        guard let dir = Bundle.main.resourceURL?.appendingPathComponent("Defaults"),
+              FileManager.default.fileExists(atPath: dir.path) else { return nil }
+        return dir
+    }
+    static var packaged: Bool { defaultsURL != nil }
+    static var dataURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("VCSNative")
+    }
+    /// Creates the data folder and copies any default file the user does not have yet.
+    static func seedDataFolder() {
+        guard let defaults = defaultsURL else { return }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: dataURL, withIntermediateDirectories: true)
+        for name in (try? fm.contentsOfDirectory(atPath: defaults.path)) ?? [] {
+            let target = dataURL.appendingPathComponent(name)
+            if !fm.fileExists(atPath: target.path) {
+                try? fm.copyItem(at: defaults.appendingPathComponent(name), to: target)
+            }
+        }
+    }
+    /// The executable Play starts: inside this app when packaged.
+    static var gameExecutableURL: URL {
+        Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/VCSNative")
+    }
+
+    // MARK: Game folder (PSP_DATA)
+    static let ebootRelative = "PSP_GAME/SYSDIR/EBOOT_DECRYPTED.ELF"
+    static func hasGame(at folder: URL) -> Bool {
+        FileManager.default.fileExists(atPath: folder.appendingPathComponent(ebootRelative).path)
+    }
+    /// Where the game will find PSP_DATA right now, if anywhere: the folder chosen in this launcher (a link
+    /// in the data folder), then a PSP_DATA next to the app, then one inside the app.
+    static var foundGameFolder: URL? {
+        let candidates = [
+            dataURL.appendingPathComponent("PSP_DATA"),
+            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("PSP_DATA"),
+            Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/PSP_DATA"),
+        ]
+        return candidates.first { hasGame(at: $0) }
+    }
+    /// Accepts the PSP_DATA folder itself, or a folder that contains one, and links it into the data folder.
+    static func chooseGameFolder(_ picked: URL) -> Result<URL, Error> {
+        func fail(_ m: String) -> Result<URL, Error> {
+            .failure(NSError(domain: "VCSLauncher", code: 2, userInfo: [NSLocalizedDescriptionKey: m]))
+        }
+        let root = [picked, picked.appendingPathComponent("PSP_DATA")].first { hasGame(at: $0) }
+        guard let root else {
+            return fail("That folder does not contain PSP_GAME/SYSDIR/EBOOT_DECRYPTED.ELF. Choose the folder that holds your extracted game (usually called PSP_DATA).")
+        }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: dataURL, withIntermediateDirectories: true)
+        let link = dataURL.appendingPathComponent("PSP_DATA")
+        if let attrs = try? fm.attributesOfItem(atPath: link.path), attrs[.type] as? FileAttributeType != .typeSymbolicLink {
+            return fail("\(link.path) already exists as a real folder. Remove or rename it first.")
+        }
+        try? fm.removeItem(at: link)
+        do { try fm.createSymbolicLink(at: link, withDestinationURL: root) } catch { return .failure(error) }
+        return .success(root)
+    }
+
     static var directory: URL {
         Bundle.main.bundleURL.deletingLastPathComponent()
     }
@@ -155,7 +221,8 @@ enum GameLocation {
     // no effect on the actual game no matter what was picked, while editing
     // the bundled ini directly worked correctly every time.
     static var iniURL: URL {
-        appURL.appendingPathComponent("Contents/MacOS/VCSNative.ini")
+        packaged ? dataURL.appendingPathComponent("VCSNative.ini")
+                 : appURL.appendingPathComponent("Contents/MacOS/VCSNative.ini")
     }
     // CloudWorks/ProperShaders' own settings (see [VolumetricClouds] in the
     // ini) live in a separate file from VCSNative.ini, bundled alongside it
@@ -163,7 +230,8 @@ enum GameLocation {
     // below points at this one specifically, since IniDocument itself is
     // file-agnostic (just a section/key editor over whatever URL it's given).
     static var texturesURL: URL {
-        appURL.appendingPathComponent("Contents/MacOS/Textures")
+        packaged ? dataURL.appendingPathComponent("Textures")
+                 : appURL.appendingPathComponent("Contents/MacOS/Textures")
     }
     static let packMarker = "VCSNative-TexturePack.txt"
     static let packManifest = ".installed-texture-pack"
@@ -231,7 +299,8 @@ enum GameLocation {
         } catch { return .failure(error) }
     }
     static var properShadersURL: URL {
-        appURL.appendingPathComponent("Contents/MacOS/ProperShaders.ini")
+        packaged ? dataURL.appendingPathComponent("ProperShaders.ini")
+                 : appURL.appendingPathComponent("Contents/MacOS/ProperShaders.ini")
     }
 }
 
@@ -284,6 +353,7 @@ struct ContentView: View {
     @State private var saveMessage: String?
     @State private var launching = false
     @State private var packCount = GameLocation.texturePackCount()
+    @State private var gameFolder: URL? = GameLocation.foundGameFolder
     private var packStatus: String {
         packCount == 0 ? "" : "Installed (\(packCount) textures)"
     }
@@ -447,6 +517,18 @@ struct ContentView: View {
             header("Window", "How VCSNative shows up on your display.")
 
             Form {
+                Section("Game data") {
+                    LabeledContent("Game folder") {
+                        HStack(spacing: 10) {
+                            Text(gameFolder?.path ?? "Not set")
+                                .foregroundStyle(gameFolder == nil ? Color.orange : Color.secondary)
+                                .lineLimit(1).truncationMode(.middle)
+                            Button(gameFolder == nil ? "Choose…" : "Change…") { _ = chooseGameFolder() }
+                        }
+                    }
+                    Note(text: "Choose the folder that holds your extracted game (the one with PSP_GAME inside it). Nothing is copied: VCSNative only remembers where it is, so it can live anywhere, including an external drive.")
+                }
+
                 Section {
                     Toggle("Fullscreen (borderless)", isOn: fullscreen)
                         .help("On: fills the entire display in a borderless window (alt-tab friendly, no real fullscreen switch). Off: runs in a regular titled window at the Resolution size below.")
@@ -846,6 +928,10 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .transition(.opacity)
+            } else if gameFolder == nil {
+                Text("Choose your game folder on the Window page to enable Play.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
             Spacer()
             Button("Save") { save() }
@@ -860,7 +946,11 @@ struct ContentView: View {
             }
             .keyboardShortcut(.defaultAction)
             .buttonStyle(.borderedProminent)
-            .disabled(launching)
+            .disabled(launching || gameFolder == nil)
+            .help(gameFolder == nil ? "Choose your game folder first (Window page, Game data)." : "Start the game")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            gameFolder = GameLocation.foundGameFolder
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
@@ -924,7 +1014,7 @@ struct ContentView: View {
     private func uninstallTexturePack() {
         let alert = NSAlert()
         alert.messageText = "Remove all installed replacement textures?"
-        alert.informativeText = "Deletes the PNG files in the Textures folder inside VCSNative.app. The game itself is not touched."
+        alert.informativeText = "Deletes the PNG files in the game's Textures folder. The game itself is not touched."
         alert.addButton(withTitle: "Remove"); alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         GameLocation.removeTexturePack()
@@ -933,7 +1023,38 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { withAnimation { saveMessage = nil } }
     }
 
+    /// Shows a folder picker and remembers the choice. Returns true when a valid game folder is set.
+    @discardableResult
+    private func chooseGameFolder() -> Bool {
+        let panel = NSOpenPanel()
+        panel.title = "Choose your game folder"
+        panel.message = "Select the folder that holds your extracted Vice City Stories game (it contains PSP_GAME)."
+        panel.prompt = "Choose"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return false }
+        switch GameLocation.chooseGameFolder(url) {
+        case .success(let root):
+            gameFolder = root
+            withAnimation { saveMessage = "Game folder set." }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { withAnimation { saveMessage = nil } }
+            return true
+        case .failure(let error):
+            let alert = NSAlert()
+            alert.messageText = "That is not the game folder"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+            return false
+        }
+    }
+
     private func launch() {
+        if GameLocation.foundGameFolder == nil, !chooseGameFolder() {
+            withAnimation { saveMessage = "Choose your game folder to play." }
+            return
+        }
+        gameFolder = GameLocation.foundGameFolder
         launching = true
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.createsNewApplicationInstance = true
@@ -956,6 +1077,21 @@ struct ContentView: View {
             environment["MTL_HUD_ENABLED"] = "1"
         }
         configuration.environment = environment
+        if GameLocation.packaged {
+            // The game executable lives inside this same app, so it is found wherever the app was put.
+            let process = Process()
+            process.executableURL = GameLocation.gameExecutableURL
+            process.currentDirectoryURL = GameLocation.dataURL
+            process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+            do {
+                try process.run()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { NSApp.terminate(nil) }
+            } catch {
+                launching = false
+                saveMessage = "Could not launch VCSNative: \(error.localizedDescription)"
+            }
+            return
+        }
         NSWorkspace.shared.openApplication(at: GameLocation.appURL, configuration: configuration) { _, error in
             DispatchQueue.main.async {
                 launching = false
@@ -971,6 +1107,7 @@ struct ContentView: View {
 
 @main
 struct VCSLauncherApp: App {
+    init() { GameLocation.seedDataFolder() }
     @StateObject private var doc = IniDocument(fileURL: GameLocation.iniURL)
     @StateObject private var properShadersDoc = IniDocument(fileURL: GameLocation.properShadersURL)
     var body: some Scene {

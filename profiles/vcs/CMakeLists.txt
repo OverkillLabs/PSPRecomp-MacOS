@@ -376,11 +376,22 @@ function(vcs_target_common target)
         # Homebrew's FFmpeg ships plain .dylib names, but its prefix (Apple
         # Silicon vs Intel) is not always on CMake's default search path.
         set(VCS_FFMPEG_HOMEBREW_HINTS /opt/homebrew/lib /usr/local/lib)
+        # A distributable build links our own LGPL FFmpeg 7.1 (see scripts/macos_release.sh) instead
+        # of Homebrew's GPL build, so it can be bundled inside the app.
+        set(VCS_FFMPEG_MACOS_PREFIX "" CACHE PATH "FFmpeg 7.1 install prefix to link on macOS (empty = Homebrew)")
         foreach(VCS_FFMPEG_LIB avcodec avformat avutil swresample swscale)
-            find_library(VCS_SYSTEM_${VCS_FFMPEG_LIB}
-                NAMES ${VCS_FFMPEG_LIB}
-                HINTS ${VCS_FFMPEG_HOMEBREW_HINTS}
-                REQUIRED)
+            if(VCS_FFMPEG_MACOS_PREFIX)
+                find_library(VCS_SYSTEM_${VCS_FFMPEG_LIB}
+                    NAMES ${VCS_FFMPEG_LIB}
+                    PATHS "${VCS_FFMPEG_MACOS_PREFIX}/lib"
+                    NO_DEFAULT_PATH
+                    REQUIRED)
+            else()
+                find_library(VCS_SYSTEM_${VCS_FFMPEG_LIB}
+                    NAMES ${VCS_FFMPEG_LIB}
+                    HINTS ${VCS_FFMPEG_HOMEBREW_HINTS}
+                    REQUIRED)
+            endif()
             target_link_libraries(${target} PRIVATE ${VCS_SYSTEM_${VCS_FFMPEG_LIB}})
         endforeach()
     else()
@@ -591,6 +602,14 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${VCS_PROFILE_DIR}/third_party/ffmpeg/COPYING.LGPLv2.1"
             "$<TARGET_FILE_DIR:VCSNative>/COPYING.LGPLv2.1")
+    # App-local Visual C++ runtime, so the game starts on a PC without the Visual C++ Redistributable
+    # installed (see third_party/vcruntime/README.txt).
+    foreach(VCS_VCRT msvcp140 msvcp140_atomic_wait vcruntime140 vcruntime140_1)
+        add_custom_command(TARGET VCSNative POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${VCS_PROFILE_DIR}/third_party/vcruntime/${VCS_VCRT}.dll"
+                "$<TARGET_FILE_DIR:VCSNative>/${VCS_VCRT}.dll")
+    endforeach()
 endif()
 add_custom_command(TARGET VCSNative POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -649,6 +668,28 @@ if(APPLE)
             COMMENT "Building VCSLauncher.app (Swift settings GUI)"
             VERBATIM)
         add_custom_target(vcs_launcher ALL DEPENDS "${CMAKE_BINARY_DIR}/vcs_launcher_stamp")
+
+        # The distributable app: ONE self-contained VCSNative.app (launcher + game + every library it needs,
+        # sealed and signed) in <build>/dist, so a build from source is ready to double-click and share.
+        # Set VCS_FFMPEG_MACOS_PREFIX (scripts/build_macos.sh does) to bundle an LGPL FFmpeg; without it the
+        # Homebrew FFmpeg is bundled, which is fine for your own use but is GPL and must not be redistributed.
+        find_package(Python3 COMPONENTS Interpreter)
+        if(Python3_FOUND)
+            if(VCS_FFMPEG_MACOS_PREFIX)
+                set(VCS_BUNDLE_FFMPEG_PREFIX "${VCS_FFMPEG_MACOS_PREFIX}")
+            else()
+                set(VCS_BUNDLE_FFMPEG_PREFIX "/opt/homebrew")
+            endif()
+            add_custom_target(vcs_macos_dist ALL
+                COMMAND "${Python3_EXECUTABLE}" "${VCS_PROFILE_DIR}/scripts/macos_bundle.py"
+                        --game "$<TARGET_BUNDLE_DIR:VCSNative>"
+                        --launcher "${VCS_LAUNCHER_APP_DIR}"
+                        --out "${CMAKE_BINARY_DIR}/dist/VCSNative.app"
+                        --ffmpeg-prefix "${VCS_BUNDLE_FFMPEG_PREFIX}"
+                DEPENDS VCSNative vcs_launcher
+                COMMENT "Assembling the self-contained VCSNative.app in dist/"
+                VERBATIM)
+        endif()
     else()
         message(WARNING
             "swiftc not found -- VCSLauncher.app will not be built. "

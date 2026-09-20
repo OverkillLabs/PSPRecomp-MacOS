@@ -46,6 +46,27 @@ int main() {
         require(explicit_paths.game_root == std::filesystem::path("custom/root"),
                 "explicit game root was not preserved");
 
+        // Extra search roots (macOS: the per-user data folder, the folder holding the app): used only when
+        // the executable folder has no game, and searched in the order given.
+        const std::filesystem::path empty_exe_dir = temp / "empty_exe_dir";
+        std::filesystem::create_directories(empty_exe_dir);
+        const std::filesystem::path missing_root = temp / "missing_root";
+        const vcs::BootstrapPaths from_extra =
+            vcs::resolve_bootstrap_paths(1, no_args, empty_exe_dir, {missing_root, temp});
+        require(from_extra.discovered_from_psp_data && from_extra.game_root == temp / "PSP_DATA",
+                "extra search root was not used");
+        const vcs::BootstrapPaths exe_dir_wins =
+            vcs::resolve_bootstrap_paths(1, no_args, temp, {temp / "elsewhere"});
+        require(exe_dir_wins.game_root == temp / "PSP_DATA",
+                "executable folder must be searched before the extra roots");
+        bool threw = false;
+        try {
+            (void)vcs::resolve_bootstrap_paths(1, no_args, empty_exe_dir, {missing_root});
+        } catch (const std::exception &) {
+            threw = true;
+        }
+        require(threw, "missing game data must be reported");
+
         std::filesystem::remove_all(temp);
         std::cout << "vcs_bootstrap_paths_tests passed\n";
         return 0;

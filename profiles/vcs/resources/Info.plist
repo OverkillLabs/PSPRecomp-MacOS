@@ -16,16 +16,10 @@
     <string>1.0</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
-    <!-- Declaring a game category is what lets macOS Sonoma+ offer Game Mode
-         for this process (elevated CPU/GPU scheduling priority, reduced
-         Bluetooth input latency, background-task throttling) while it runs
-         fullscreen -- without this it is invisible to Game Mode even though
-         the game is exactly the kind of fullscreen, latency-sensitive,
-         CPU/GPU-hungry workload Game Mode exists for. Embedded directly into
-         the executable's __TEXT,__info_plist section (see CMakeLists.txt)
-         rather than wrapping this in a full .app bundle, since PSP_DATA and
-         every other asset this binary loads are resolved relative to its own
-         path and a bundle would move that path under Contents/MacOS/. -->
+    <!-- Declaring a game category lets macOS Sonoma and later offer Game Mode for this process: elevated
+         CPU/GPU scheduling priority, reduced Bluetooth input latency and background-task throttling while
+         it runs fullscreen. Without it the game is invisible to Game Mode even though it is exactly the
+         kind of fullscreen, latency-sensitive, CPU/GPU-hungry workload Game Mode exists for. -->
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.games</string>
     <key>LSMinimumSystemVersion</key>

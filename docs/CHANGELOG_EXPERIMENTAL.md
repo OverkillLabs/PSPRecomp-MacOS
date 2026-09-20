@@ -1,6 +1,11 @@
 # VCSNative: Experimental Windows + macOS release
 
 ## New features
+- **macOS: one self-contained app.** `VCSNative.app` now contains the launcher, the game and every library it needs (FFmpeg, SDL, Vulkan loader, MoltenVK). Nothing has to be installed and no terminal is needed: unzip, open, choose your game folder, play.
+- **macOS: choose where your game is.** The launcher has a Game folder picker; the game files can live anywhere, including an external drive, and nothing is copied. Play stays greyed out until the game files are found.
+- **macOS: settings, saves and textures** are kept in `~/Library/Application Support/VCSNative`, so the app itself stays sealed and updating it never touches your saves.
+- **Windows: no runtime to install.** The Visual C++ runtime is included in the download, so the game starts on a PC that has never had it installed.
+- **Build from source, ready to play:** on macOS `profiles/vcs/scripts/build_macos.sh` builds everything and outputs the finished app and a zip; on Windows `BUILD_VCS.bat` outputs a folder with every DLL the game needs.
 - **Windows Vulkan build**, with a new single-exe Windows launcher (`VCSLauncher.exe`) that needs no dependencies.
 - **Windows launcher pages:** Window, Rendering, Quality, Controls, Addons and Performance. It edits `VCSNative.ini` and `ProperShaders.ini` in place, keeps comments and line endings, and lets you choose the GPU, present mode, swapchain and worker threads.
 - **Texture pack:** install and uninstall from the Windows launcher, with validation. It asks for the PSP_DATA folder if it's missing and warns if the display refresh rate isn't a multiple of 60.
@@ -22,3 +27,4 @@
 - **Sun-lit surface relief** option removed everywhere (shader, config, both launchers) because it looked broken.
 - **Controllers:** a deflected stick always wins over the mouse.
 - **Draw distance:** the macOS launcher shows only World objects and Model detail switch.
+- **macOS: "damaged" message on downloaded builds.** The app now carries a valid signature seal, so macOS no longer reports a downloaded copy as damaged.

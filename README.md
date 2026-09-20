@@ -16,8 +16,9 @@ platform layer differ.
 - **Windows (experimental):** the same Vulkan backend running natively on Windows, with a single-exe launcher
   (`VCSLauncher.exe`) and every DLL the game needs in the download. The original DirectX 12 backend is still in the
   source.
-- Both platforms support keyboard and mouse as well as gamepads, and both launchers edit `VCSNative.ini` and
-  `ProperShaders.ini` for you, so nothing has to be edited by hand.
+- Both platforms show your keyboard and mouse controls in the game's on-screen prompts instead of the PSP buttons
+  (Xbox button names when you use a controller), and both launchers edit `VCSNative.ini` and `ProperShaders.ini`
+  for you, so nothing has to be edited by hand.
 
 Ready-to-play builds are on the [Releases page](../../releases); see "Download and play" below.
 

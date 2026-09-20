@@ -1,4 +1,4 @@
-# VCSNative: GTA Vice City Stories for macOS and Windows (PSPRecomp fork)
+# VCSNative: GTA Vice City Stories for macOS and Windows (PSPRecomp Vulkan fork)
 
 This is a fork of [jessicanataliagta/PSPRecomp](https://github.com/jessicanataliagta/PSPRecomp),
 the original PSPRecomp created by **Jessica Natalia**

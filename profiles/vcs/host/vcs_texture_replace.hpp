@@ -45,8 +45,14 @@ enum TextureUsage : std::uint32_t {
     kUsageAdd = 1u << 6,          // ADD texture function: glows, coronas
 };
 
+// Cheap word-wise fingerprint of a decoded texture. The renderer stamps it on the
+// cache entry at upload and the worker stamps it on the result, so a finished
+// replacement is only applied to the texture it was made from.
+[[nodiscard]] std::uint64_t texture_signature(std::span<const std::byte> rgba8) noexcept;
+
 struct TextureResult {
     std::uint64_t key{};
+    std::uint64_t source_signature{};
     std::uint32_t original_width{};
     std::uint32_t original_height{};
     ReplacementTexture texture;

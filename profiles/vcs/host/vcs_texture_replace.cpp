@@ -8,9 +8,12 @@
 #include "../third_party/stb/stb_image_write.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <condition_variable>
 #include <deque>
@@ -106,6 +109,20 @@ std::uint64_t texture_content_hash(std::span<const std::byte> rgba8, std::uint32
     mix(width);
     mix(height);
     for (const std::byte b : rgba8) mix(static_cast<std::uint8_t>(b));
+    return hash;
+}
+
+std::uint64_t texture_signature(std::span<const std::byte> rgba8) noexcept {
+    std::uint64_t hash = 0xCBF29CE484222325ull ^ rgba8.size();
+    const std::byte *p = rgba8.data();
+    std::size_t n = rgba8.size();
+    for (; n >= 8u; n -= 8u, p += 8) {
+        std::uint64_t word;
+        std::memcpy(&word, p, 8);
+        hash = (hash ^ word) * 0x100000001B3ull;
+        hash ^= hash >> 29;
+    }
+    for (; n > 0u; --n, ++p) hash = (hash ^ static_cast<std::uint8_t>(*p)) * 0x100000001B3ull;
     return hash;
 }
 
@@ -513,15 +530,15 @@ bool process_job(const PipelineState::Job &job, ReplacementTexture &out) noexcep
             }
         }
     }
-    // 2D / HUD art is deliberately crisp pixel art: never touch it.
-    if ((job.usage & (kUsageThrough | kUsageHudCandidate)) != 0u) return false;
     if (replacement && std::filesystem::exists(file)) {
         int w = 0, h = 0, channels = 0;
         if (unsigned char *loaded = stbi_load(file.c_str(), &w, &h, &channels, 4)) {
             std::uint32_t k = 0u;
-            for (std::uint32_t s = 1u; s <= 3u; ++s)
+            for (std::uint32_t s = 0u; s <= 3u; ++s)
                 if (static_cast<std::uint32_t>(w) == (job.width << s) && static_cast<std::uint32_t>(h) == (job.height << s)) k = s;
-            if (k != 0u && w <= 8192 && h <= 8192) {
+            const bool exact_match = static_cast<std::uint32_t>(w) == (job.width << k) &&
+                                     static_cast<std::uint32_t>(h) == (job.height << k);
+            if (exact_match && w <= 8192 && h <= 8192) {
                 out.width = static_cast<std::uint32_t>(w);
                 out.height = static_cast<std::uint32_t>(h);
                 out.scale_shift = static_cast<std::uint8_t>(k);
@@ -533,6 +550,9 @@ bool process_job(const PipelineState::Job &job, ReplacementTexture &out) noexcep
         }
     }
     if (!upscale) return false;
+    // 2D / HUD art is deliberately crisp pixel art: explicit replacement files
+    // above may replace it, but the automatic upscaler never touches it.
+    if ((job.usage & (kUsageThrough | kUsageHudCandidate)) != 0u) return false;
     if (looks_like_noise(pixels, job.width, job.height)) return false;
     const std::uint32_t use_shift = shift == 0u ? auto_scale_shift(job.width, job.height) : shift;
     if (use_shift == 0u || (job.width << use_shift) > 4096u || (job.height << use_shift) > 4096u) return false;
@@ -563,6 +583,8 @@ void worker_main() {
         }
         TextureResult result;
         result.key = job.key;
+        result.source_signature = texture_signature(std::span<const std::byte>(
+            reinterpret_cast<const std::byte *>(job.rgba.data()), job.rgba.size()));
         result.original_width = job.width;
         result.original_height = job.height;
         if (process_job(job, result.texture)) {

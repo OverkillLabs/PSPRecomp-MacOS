@@ -1166,8 +1166,21 @@ void Runtime::invoke_import_cached(std::uint32_t slot, std::string_view library,
         import_bindings_[slot] = bound;
     }
 
+    const RuntimeExecutionContextToken caller_context = capture_runtime_execution_context();
+    const std::uint32_t import_pc = ctx.pc;
+    const std::uint32_t return_address = ctx.gpr[31];
     (*bound)(*this, ctx);
-    if (!stopped_ && g_post_import_hook != nullptr) g_post_import_hook(*this, ctx);
+    if (!stopped_ && g_post_import_hook != nullptr) {
+        // The generated import stub only advances PC to the return address after this
+        // function returns. The hook may divert this thread into a guest callback and
+        // saves the current context as where to resume; if that still pointed at the
+        // import, the finished call would run a second time when the callback returns
+        // (a lock wait would then wait on itself). Complete the return first, exactly
+        // as the stub does.
+        if (runtime_execution_context_matches(caller_context) && ctx.pc == import_pc)
+            ctx.pc = return_address;
+        g_post_import_hook(*this, ctx);
+    }
 }
 
 void Runtime::invoke_import(std::string_view library, std::uint32_t nid, AllegrexContext &ctx) {
@@ -1185,8 +1198,15 @@ void Runtime::invoke_import(std::string_view library, std::uint32_t nid, Allegre
         stop("Missing HLE import " + library_name + "::" + name);
         return;
     }
+    const RuntimeExecutionContextToken caller_context = capture_runtime_execution_context();
+    const std::uint32_t import_pc = ctx.pc;
+    const std::uint32_t return_address = ctx.gpr[31];
     function_it->second(*this, ctx);
-    if (!stopped_ && g_post_import_hook != nullptr) g_post_import_hook(*this, ctx);
+    if (!stopped_ && g_post_import_hook != nullptr) {
+        if (runtime_execution_context_matches(caller_context) && ctx.pc == import_pc)
+            ctx.pc = return_address;  // see invoke_import_cached()
+        g_post_import_hook(*this, ctx);
+    }
 }
 
 AllegrexContext &Runtime::cpu() noexcept { return cpu_; }

@@ -41,7 +41,7 @@ bool alpha_pass(uint function_id, uint lhs, uint rhs) {
 vec4 apply_texture_function(vec4 vertex, vec4 texture_value, uvec4 control, uvec3 env_bytes) {
     uint function_id = control.x & 7u;
     bool use_alpha = (control.y & 1u) != 0u;
-    bool double_color = control.z != 0u;
+    bool double_color = (control.z & 1u) != 0u;
     vec4 result = vertex;
     vec3 env = vec3(env_bytes) * (1.0 / 255.0);
 
@@ -159,6 +159,24 @@ void main() {
         vec4 texel = texture(source_texture, uv_normalized);
         if ((texture_control.y & 0x40u) != 0u && texel.a > 0.99)
             texel.rgb *= 1.0 + detail_modulation(uv_texels) * 0.55;
+        if ((texture_control.y & 0x80u) != 0u && texel.a > 0.99) {
+            // Sun-lit relief. The surface's own brightness is the height field; its
+            // slope, seen in the texture's orientation on screen, is lit from a sun
+            // that swings from east to west with the clock and never sits below
+            // the horizon, so bricks and cracks catch and shade the light.
+            // Height comes from a coarser mip so single-texel noise cannot drive it.
+            float h = dot(texture(source_texture, uv_normalized, 2.2).rgb, vec3(0.30, 0.59, 0.11));
+            vec2 grad = vec2(dFdx(h), dFdy(h));
+            grad = clamp(grad, vec2(-0.03), vec2(0.03));
+            float sun = float((texture_control.z >> 1u) & 0x7Fu) / 127.0;
+            float azimuth = mix(-1.0, 1.0, sun);
+            float height = 0.35 + 0.65 * sin(sun * 3.14159265);
+            vec3 light = normalize(vec3(azimuth * 0.8, 0.45, height));
+            vec3 normal = normalize(vec3(-grad * 14.0, 1.0));
+            float lit = dot(normal, light) / max(light.z, 0.2);
+            float amount = clamp(lit - 1.0, -0.25, 0.25) * 0.55;
+            texel.rgb *= 1.0 + amount;
+        }
         color = apply_texture_function(color, texel, texture_control, texture_env);
     }
 

@@ -258,6 +258,7 @@ enum Category: String, CaseIterable, Identifiable {
     case window = "Window"
     case rendering = "Rendering"
     case quality = "Quality"
+    case controls = "Controls"
     case addons = "Addons"
     case performance = "Performance"
 
@@ -267,6 +268,7 @@ enum Category: String, CaseIterable, Identifiable {
         case .window: return "macwindow"
         case .rendering: return "square.resize"
         case .quality: return "sparkles"
+        case .controls: return "keyboard"
         case .addons: return "wand.and.stars"
         case .performance: return "gauge.with.dots.needle.67percent"
         }
@@ -315,6 +317,7 @@ struct ContentView: View {
     private var fxaaEnabled: Binding<Bool> { doc.binding("Rendering", "SMAA", default: false) }
 
     // Timing / widescreen / addons
+    private var keyboardPrompts: Binding<Bool> { doc.binding("Controls", "KeyboardPrompts", default: true) }
     private var widescreen: Binding<Bool> { doc.binding("Widescreen", "Enabled", default: true) }
     private var project2dfx: Binding<Bool> { doc.binding("Project2DFX", "Enabled", default: false) }
 
@@ -340,6 +343,7 @@ struct ContentView: View {
     private var casSharpness: Binding<Double> { properShadersDoc.binding("CAS", "Sharpness", default: 0.5) }
     private var skyPaletteEnabled: Binding<Bool> { properShadersDoc.binding("SkyPalette", "Enabled", default: true) }
     private var todGradeEnabled: Binding<Bool> { properShadersDoc.binding("TimeOfDayGrade", "Enabled", default: true) }
+    private var reliefEnabled: Binding<Bool> { properShadersDoc.binding("ReliefShading", "Enabled", default: false) }
     private var vhsEnabled: Binding<Bool> { properShadersDoc.binding("VHS", "Enabled", default: false) }
     private var cloudsEnabled: Binding<Bool> {
         properShadersDoc.binding("VolumetricClouds", "Enabled", default: true)
@@ -421,6 +425,7 @@ struct ContentView: View {
         case .window: windowSection
         case .rendering: renderingSection
         case .quality: qualitySection
+        case .controls: controlsSection
         case .addons: addonsSection
         case .performance: performanceSection
         }
@@ -628,6 +633,8 @@ struct ContentView: View {
                         .help("Replaces the game's flat sky and distance-fog color with a Vice City palette that follows the clock: pink-magenta dawn and dusk, teal-cyan days, violet nights. Weather is preserved (grey skies stay grey). Strength is in ProperShaders.ini [SkyPalette]. Off by default.")
                     Toggle("Time-of-day grade", isOn: todGradeEnabled)
                         .help("Warms and saturates the picture around sunrise and sunset and cools it at night, following the in-game clock. A color grade only; the game's own lighting is unchanged. Strength is in ProperShaders.ini [TimeOfDayGrade]. Off by default.")
+                    Toggle("Sun-lit surface relief (experimental)", isOn: reliefEnabled)
+                        .help("Raised detail in walls, roads and bricks catches the sun as it moves across the sky during the day, giving surfaces some depth. Derived from the textures themselves. Off by default; strength is in ProperShaders.ini [ReliefShading].")
                     Toggle("VHS filter", isOn: vhsEnabled)
                         .help("Optional stylistic VHS look: tape wiggle and horizontal color smear across the whole frame, HUD included. Off by default.")
                 }
@@ -722,6 +729,72 @@ struct ContentView: View {
         }
     }
 
+    private func keyRow(_ action: String, _ keys: String) -> some View {
+        LabeledContent(action) { Text(keys).foregroundStyle(.secondary).monospacedDigit() }
+    }
+
+    private var controlsSection: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header("Controls")
+
+            Form {
+                Section("On foot") {
+                    keyRow("Move", "W A S D")
+                    keyRow("Walk slowly", "Left Alt + move")
+                    keyRow("Look / aim camera", "Mouse")
+                    keyRow("Sprint", "Space")
+                    keyRow("Jump", "Left Shift")
+                    keyRow("Enter / exit vehicle", "F  or  Return")
+                    keyRow("Fire / punch", "Left mouse")
+                    keyRow("Target / aim", "Right mouse")
+                    keyRow("Look behind", "Middle mouse")
+                    keyRow("Previous / next weapon", "Q / E  or  mouse wheel")
+                }
+
+                Section("In a vehicle") {
+                    keyRow("Steer", "A / D")
+                    keyRow("Accelerate", "W  or  Up arrow")
+                    keyRow("Brake / reverse", "S  or  Down arrow")
+                    keyRow("Handbrake", "Space")
+                    keyRow("Brake (alternate)", "Left Shift")
+                    keyRow("Horn", "H")
+                    keyRow("Fire vehicle weapon", "Left mouse")
+                    keyRow("Change radio station", "Q / E  or  mouse wheel")
+                    keyRow("Look around", "Mouse")
+                }
+
+                Section("Menus") {
+                    keyRow("Navigate", "Arrow keys")
+                    keyRow("Confirm", "Space")
+                    keyRow("Back / cancel", "F")
+                    keyRow("Pause", "Esc")
+                    keyRow("Map / select", "Tab")
+                }
+
+                Section("Gamepad (Xbox layout)") {
+                    keyRow("Move / look", "Left stick / Right stick")
+                    keyRow("Sprint, handbrake, confirm", "A")
+                    keyRow("Jump, brake / reverse", "X")
+                    keyRow("Enter / exit vehicle", "Y")
+                    keyRow("Fire / punch", "B")
+                    keyRow("Horn / look behind", "Left bumper")
+                    keyRow("Target / aim", "Right bumper")
+                    keyRow("Weapon / radio", "D-pad left and right")
+                    keyRow("Pause / map", "Start / Back")
+                    Note(text: "In-game prompts switch automatically between these keyboard and mouse controls and the controller layout, depending on which you used last.")
+                }
+
+                Section("Prompts") {
+                    Toggle("Show control names in prompts", isOn: keyboardPrompts)
+                        .help("Rewrites the game's button prompts so they name your actual controls. They follow the device you used last: keyboard and mouse names while you play with keyboard and mouse, and controller (Xbox) names as soon as you touch the controller, switching back when you use the keyboard or mouse again. Turn off to see the original PSP button names.")
+                    Note(text: "Gamepads also work. The mouse look and the modern control scheme are set in the Rendering and Performance pages.")
+                }
+            }
+            .formStyle(.grouped)
+            .scrollDisabled(true)
+        }
+    }
+
     private var addonsSection: some View {
         VStack(alignment: .leading, spacing: 18) {
             header("Addons")
@@ -733,11 +806,6 @@ struct ContentView: View {
                     Note(text: "Light coronas and LOD lights. Genuinely cross-platform — confirmed working on this Mac build. Off by default.")
                 }
 
-                Section("Not available on this build") {
-                    LabeledContent("ProperShaders / CloudWorks color grading & clouds") { Text("Off").foregroundStyle(.tertiary) }
-                        .help("DirectX12-only post-processing (color grading, volumetric clouds). Confirmed absent from this build's Vulkan backend entirely — no Mac equivalent exists yet.")
-                    Note(text: "Color grading and volumetric clouds are DirectX12-only — confirmed absent from the Vulkan backend entirely. Bloom now has its own Vulkan implementation; see Quality → Bloom.")
-                }
             }
             .formStyle(.grouped)
             .scrollDisabled(true)

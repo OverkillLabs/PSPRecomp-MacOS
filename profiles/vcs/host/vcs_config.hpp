@@ -249,6 +249,8 @@ struct PostFxConfiguration {
     float sky_palette_strength{0.85f}; // [SkyPalette] Strength
     bool time_of_day_enabled{false};   // [TimeOfDayGrade] Enabled
     float time_of_day_strength{0.35f};  // [TimeOfDayGrade] Strength
+    bool relief_enabled{false};        // [ReliefShading] Enabled
+    float relief_strength{0.5f};       // [ReliefShading] Strength
 };
 
 // Standalone ProperShaders.ini feature. Values normally supplied by the San
@@ -317,6 +319,9 @@ struct ControlsConfiguration {
     // off is the San Andreas-parity setting and turning it on is the GTA IV/V
     // one. The original PSP configuration also leaves it disabled.
     bool modern_control_scheme{false};
+    // Rewrite the game's control prompts ("press X", "L button") into the
+    // keyboard and mouse controls bound to those buttons.
+    bool keyboard_prompts{true};
 };
 
 struct VcsConfiguration {

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 
 namespace vcs {
@@ -95,11 +96,33 @@ inline void note_game_sky_color(std::uint32_t abgr) noexcept {
 // `rgb` is 0xBBGGRR (low 24 bits of a PSP ABGR word); the alpha byte, if
 // present, is preserved. Returns the input unchanged when the feature is off
 // or the game clock is not known yet.
+[[nodiscard]] inline std::uint32_t remap_sky_color_uncached(std::uint32_t abgr, float hours, float strength) noexcept;
+
+// Called for the fog and clear colour of every draw, thousands of times a frame in
+// busy scenes, while its inputs (the colour, the in-game minute, the weather sample
+// and the strength setting) change at most a few times a second. Remember the last
+// answer per thread and only recompute when an input actually differs.
 [[nodiscard]] inline std::uint32_t remap_sky_color(std::uint32_t abgr) noexcept {
     const PostFxConfiguration &fx = vcs_configuration().postfx;
     if (!fx.sky_palette_enabled) return abgr;
     const float hours = game_clock_hours();
     if (hours < 0.0f) return abgr;
+    struct Memo {
+        std::uint32_t abgr{}, sky{}, hours_bits{}, strength_bits{}, result{};
+        bool valid{false};
+    };
+    static thread_local Memo memo;
+    const std::uint32_t sky = g_game_sky_abgr.load(std::memory_order_relaxed);
+    const std::uint32_t hours_bits = std::bit_cast<std::uint32_t>(hours);
+    const std::uint32_t strength_bits = std::bit_cast<std::uint32_t>(fx.sky_palette_strength);
+    if (memo.valid && memo.abgr == abgr && memo.sky == sky && memo.hours_bits == hours_bits &&
+        memo.strength_bits == strength_bits)
+        return memo.result;
+    memo = {abgr, sky, hours_bits, strength_bits, remap_sky_color_uncached(abgr, hours, fx.sky_palette_strength), true};
+    return memo.result;
+}
+
+[[nodiscard]] inline std::uint32_t remap_sky_color_uncached(std::uint32_t abgr, float hours, float strength) noexcept {
     const float r = static_cast<float>(abgr & 0xFFu);
     const float g = static_cast<float>((abgr >> 8u) & 0xFFu);
     const float b = static_cast<float>((abgr >> 16u) & 0xFFu);
@@ -107,7 +130,7 @@ inline void note_game_sky_color(std::uint32_t abgr) noexcept {
     if (peak < 1.0f) return abgr;
     const float saturation = (peak - std::min({r, g, b})) / peak;
     const float weather = sky_weather_factor();
-    const float k = std::clamp(fx.sky_palette_strength, 0.0f, 1.0f) * weather;
+    const float k = std::clamp(strength, 0.0f, 1.0f) * weather;
     const std::array<float, 3> target = sky_palette_rgb(hours);
     const auto mix = [k](float from, float to) {
         return static_cast<std::uint32_t>(std::clamp(from + (to - from) * k, 0.0f, 255.0f) + 0.5f);

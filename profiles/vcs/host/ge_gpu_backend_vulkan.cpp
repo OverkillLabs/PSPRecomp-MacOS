@@ -27,15 +27,14 @@
 #include "ge_gpu_backend.hpp"
 #include "ge_cloud_camera_math.hpp"
 #include "vcs_config.hpp"
+#include "vcs_env.hpp"
 #include "vcs_game_clock.hpp"
 #include "vcs_sky_palette.hpp"
 #include "vcs_texture_replace.hpp"
 #include "vcs_runtime_log.hpp"
+#include "vulkan_platform.hpp"
 
 #include <vulkan/vulkan.h>
-#if defined(__APPLE__)
-#include <vulkan/vulkan_metal.h>
-#endif
 
 #include "psp_ge_vert_spv.h"
 #include "psp_ge_frag_spv.h"
@@ -57,6 +56,8 @@
 #include "cloud_composite_frag_spv.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -65,6 +66,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <unordered_set>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <cstring>
@@ -424,6 +426,8 @@ struct TextureEntry {
     // log2 of how much larger this texture is than the game's own (replacement or
     // upscale); the shader divides it back out of the size it normalizes UVs by.
     std::uint8_t scale_shift{0u};
+    // vcs::texture_signature() of the pixels this entry was uploaded from.
+    std::uint64_t source_signature{0u};
     VkSampler sampler{VK_NULL_HANDLE};
     // Stamped with VulkanGeState::frame_epoch every time this entry is
     // uploaded or looked up by a draw. Lets upload() evict the least
@@ -516,7 +520,7 @@ struct VulkanGeState {
     // already working.
     bool swapchain_migration_enabled{false};
     VkSurfaceKHR diagnostic_surface{VK_NULL_HANDLE};
-    void *diagnostic_metal_layer{nullptr};
+    void *diagnostic_native_window{nullptr};
 
     // Real swapchain + present pipeline. Only ever touched when
     // swapchain_migration_enabled; every field here stays VK_NULL_HANDLE/
@@ -526,6 +530,9 @@ struct VulkanGeState {
     // never show up if the CPU readback that composite depends on is
     // skipped, which this path does).
     VkSwapchainKHR swapchain{VK_NULL_HANDLE};
+    VkPresentModeKHR swapchain_present_mode{VK_PRESENT_MODE_FIFO_KHR};
+    bool swapchain_needs_recreate{false};
+    std::uint32_t swapchain_recreations{0u};
     VkFormat swapchain_format{VK_FORMAT_UNDEFINED};
     VkExtent2D swapchain_extent{};
     std::vector<VkImage> swapchain_images;
@@ -1059,6 +1066,94 @@ void destroy_texture_entry(VulkanGeState &s, TextureEntry &entry) noexcept {
     entry = TextureEntry{};
 }
 
+// Non-blocking texture uploads. GPU queue order already guarantees an upload has finished before
+// any later draw samples it (the upload ends in a pipeline barrier to the fragment stage), so the
+// CPU never has to wait for it -- only the shared staging buffer must not be rewritten while the
+// previous upload is still reading it.
+struct AsyncUpload {
+    VkFence fence{VK_NULL_HANDLE};
+    VkCommandBuffer submitted_cmd{VK_NULL_HANDLE};  // in flight, released once `fence` signals
+    bool pending{false};
+    // Uploads of the game's own textures within one frame share this arena and this one open
+    // command buffer, which is submitted once just before the frame's own submit.
+    VkBuffer arena{VK_NULL_HANDLE};
+    VkDeviceMemory arena_memory{VK_NULL_HANDLE};
+    std::byte *arena_ptr{nullptr};
+    VkDeviceSize arena_used{0};
+    VkCommandBuffer open_cmd{VK_NULL_HANDLE};
+};
+constexpr VkDeviceSize kUploadArenaBytes = 48ull * 1024ull * 1024ull;
+AsyncUpload &async_upload() {
+    static AsyncUpload u;
+    return u;
+}
+void record_texture_upload(VkCommandBuffer cmd, VkImage image, VkBuffer staging, VkDeviceSize offset,
+                           std::uint32_t width, std::uint32_t height, std::uint32_t mip_levels) noexcept;
+// Release the previously submitted batch once the GPU is done with it.
+void wait_previous_upload(VulkanGeState &s) noexcept {
+    AsyncUpload &u = async_upload();
+    if (!u.pending) return;
+    vkWaitForFences(s.device, 1, &u.fence, VK_TRUE, 5000000000ull);
+    if (u.submitted_cmd != VK_NULL_HANDLE) vkFreeCommandBuffers(s.device, s.command_pool, 1, &u.submitted_cmd);
+    u.submitted_cmd = VK_NULL_HANDLE;
+    u.pending = false;
+}
+// Submit the open command buffer (if any). Never waits.
+void flush_uploads(VulkanGeState &s) noexcept {
+    AsyncUpload &u = async_upload();
+    if (u.open_cmd == VK_NULL_HANDLE) return;
+    VkCommandBuffer cmd = u.open_cmd;
+    u.open_cmd = VK_NULL_HANDLE;
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) { vkFreeCommandBuffers(s.device, s.command_pool, 1, &cmd); return; }
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1u;
+    submit.pCommandBuffers = &cmd;
+    vkResetFences(s.device, 1, &u.fence);
+    if (vkQueueSubmit(s.graphics_queue, 1, &submit, u.fence) != VK_SUCCESS) {
+        vkFreeCommandBuffers(s.device, s.command_pool, 1, &cmd);
+        return;
+    }
+    u.submitted_cmd = cmd;
+    u.pending = true;
+}
+void flush_uploads_and_wait(VulkanGeState &s) noexcept {
+    flush_uploads(s);
+    wait_previous_upload(s);
+    async_upload().arena_used = 0u;
+}
+// Reserve `bytes` in the arena and make sure a command buffer is open. Returns false on failure.
+[[nodiscard]] bool acquire_upload_slot(VulkanGeState &s, VkDeviceSize bytes, VkCommandBuffer &cmd,
+                                       VkDeviceSize &offset) noexcept {
+    AsyncUpload &u = async_upload();
+    if (u.arena == VK_NULL_HANDLE) {
+        VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(s.device, &info, nullptr, &u.fence) != VK_SUCCESS) return false;
+        if (!create_buffer(s, kUploadArenaBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                           u.arena, u.arena_memory))
+            return false;
+        void *mapped = nullptr;
+        if (vkMapMemory(s.device, u.arena_memory, 0, kUploadArenaBytes, 0, &mapped) != VK_SUCCESS) return false;
+        u.arena_ptr = static_cast<std::byte *>(mapped);
+    }
+    if (bytes > kUploadArenaBytes) return false;
+    if (u.open_cmd == VK_NULL_HANDLE) {
+        // A new frame's worth of uploads: the previous batch is normally long finished by now.
+        wait_previous_upload(s);
+        u.arena_used = 0u;
+    } else if (u.arena_used + bytes > kUploadArenaBytes) {
+        flush_uploads_and_wait(s);  // arena full within one frame: rare, drain it
+    }
+    if (u.open_cmd == VK_NULL_HANDLE) {
+        u.open_cmd = begin_one_shot(s);
+        if (u.open_cmd == VK_NULL_HANDLE) return false;
+    }
+    cmd = u.open_cmd;
+    offset = u.arena_used;
+    u.arena_used += (bytes + 255u) & ~VkDeviceSize{255u};
+    return true;
+}
+
 [[nodiscard]] bool create_texture(VulkanGeState &s, std::uint32_t width, std::uint32_t height,
                                   std::span<const std::byte> pixels, VkSampler sampler,
                                   TextureEntry &out) {
@@ -1096,35 +1191,20 @@ void destroy_texture_entry(VulkanGeState &s, TextureEntry &entry) noexcept {
     if (vkAllocateMemory(s.device, &allocate, nullptr, &out.memory) != VK_SUCCESS) return false;
     if (vkBindImageMemory(s.device, out.image, out.memory, 0) != VK_SUCCESS) return false;
 
-    if (s.staging_capacity < byte_size) {
-        if (s.staging_buffer != VK_NULL_HANDLE) vkDestroyBuffer(s.device, s.staging_buffer, nullptr);
-        if (s.staging_memory != VK_NULL_HANDLE) vkFreeMemory(s.device, s.staging_memory, nullptr);
-        s.staging_buffer = VK_NULL_HANDLE;
-        s.staging_memory = VK_NULL_HANDLE;
-        if (!create_buffer(s, byte_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                           s.staging_buffer, s.staging_memory))
-            return false;
-        s.staging_capacity = byte_size;
-    }
-    void *mapped = nullptr;
-    if (vkMapMemory(s.device, s.staging_memory, 0, byte_size, 0, &mapped) != VK_SUCCESS)
-        return false;
-    std::memcpy(mapped, pixels.data(), static_cast<std::size_t>(byte_size));
-    vkUnmapMemory(s.device, s.staging_memory);
-
-    VkCommandBuffer cmd = begin_one_shot(s);
-    if (cmd == VK_NULL_HANDLE) return false;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkDeviceSize upload_offset = 0u;
+    if (!acquire_upload_slot(s, byte_size, cmd, upload_offset)) return false;
+    std::memcpy(async_upload().arena_ptr + upload_offset, pixels.data(), static_cast<std::size_t>(byte_size));
     transition_image(cmd, out.image, VK_IMAGE_LAYOUT_UNDEFINED,
                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkBufferImageCopy region{};
+    region.bufferOffset = upload_offset;
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.layerCount = 1u;
     // Full extent. A zero-extent copy silently transfers nothing.
     region.imageExtent = {width, height, 1u};
-    vkCmdCopyBufferToImage(cmd, s.staging_buffer, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    vkCmdCopyBufferToImage(cmd, async_upload().arena, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                            1, &region);
     // Build the mip chain: each level is blitted (linear) from the previous one.
     const auto mip_barrier = [&](std::uint32_t level, VkImageLayout from, VkImageLayout to,
@@ -1165,7 +1245,6 @@ void destroy_texture_entry(VulkanGeState &s, TextureEntry &entry) noexcept {
     mip_barrier(mip_levels - 1u, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    if (!end_one_shot(s, cmd)) return false;
 
     VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     view_info.image = out.image;
@@ -1174,14 +1253,16 @@ void destroy_texture_entry(VulkanGeState &s, TextureEntry &entry) noexcept {
     view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     view_info.subresourceRange.levelCount = mip_levels;
     view_info.subresourceRange.layerCount = 1u;
-    if (vkCreateImageView(s.device, &view_info, nullptr, &out.view) != VK_SUCCESS) return false;
+    if (vkCreateImageView(s.device, &view_info, nullptr, &out.view) != VK_SUCCESS) { flush_uploads_and_wait(s); return false; }
 
     VkDescriptorSetAllocateInfo descriptor_allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     descriptor_allocate.descriptorPool = s.descriptor_pool;
     descriptor_allocate.descriptorSetCount = 1u;
     descriptor_allocate.pSetLayouts = &s.descriptor_layout;
-    if (vkAllocateDescriptorSets(s.device, &descriptor_allocate, &out.descriptor) != VK_SUCCESS)
+    if (vkAllocateDescriptorSets(s.device, &descriptor_allocate, &out.descriptor) != VK_SUCCESS) {
+        flush_uploads_and_wait(s);
         return false;
+    }
 
     VkDescriptorImageInfo image_descriptor{};
     image_descriptor.sampler = sampler;
@@ -1740,6 +1821,64 @@ void destroy_backend(VulkanGeState &s) noexcept {
     return static_cast<std::uint32_t>(value);
 }
 
+// Chooses which GPU renders. A laptop with an integrated and a discrete GPU lists both, and the
+// first entry is often the weak integrated one, so prefer discrete > integrated > virtual > other.
+// PSPRECOMP_VULKAN_DEVICE overrides: a number is an index into the loader's list, anything else
+// is matched as a case-insensitive part of the GPU name. Only devices with a graphics queue count.
+[[nodiscard]] VkPhysicalDevice pick_physical_device(const std::vector<VkPhysicalDevice> &devices) {
+    const auto has_graphics_queue = [](VkPhysicalDevice device) {
+        std::uint32_t count = 0u;
+        vkGetPhysicalDeviceQueueFamilyProperties(device, &count, nullptr);
+        std::vector<VkQueueFamilyProperties> families(count);
+        vkGetPhysicalDeviceQueueFamilyProperties(device, &count, families.data());
+        for (const VkQueueFamilyProperties &family : families)
+            if (family.queueFlags & VK_QUEUE_GRAPHICS_BIT) return true;
+        return false;
+    };
+    const auto lowered = [](std::string text) {
+        for (char &c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return text;
+    };
+
+    VkPhysicalDevice chosen = VK_NULL_HANDLE;
+    int chosen_score = -1;
+    const char *override_text = VCS_ENV("PSPRECOMP_VULKAN_DEVICE");
+    for (std::size_t index = 0u; index < devices.size(); ++index) {
+        if (!has_graphics_queue(devices[index])) continue;
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(devices[index], &properties);
+        int score = 0;
+        switch (properties.deviceType) {
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: score = 3; break;
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: score = 2; break;
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: score = 1; break;
+        default: score = 0; break;
+        }
+        if (override_text != nullptr && *override_text != '\0') {
+            char *end = nullptr;
+            const unsigned long wanted_index = std::strtoul(override_text, &end, 10);
+            const bool by_index = end != override_text && *end == '\0';
+            const bool matches = by_index
+                ? wanted_index == index
+                : lowered(properties.deviceName).find(lowered(override_text)) != std::string::npos;
+            if (matches) score = 100;
+        }
+        if (score > chosen_score) {
+            chosen_score = score;
+            chosen = devices[index];
+        }
+    }
+    if (chosen == VK_NULL_HANDLE) chosen = devices.front();
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(chosen, &properties);
+    std::fprintf(stderr, "[vulkan] GPU: %s (%s), %zu device(s) available\n", properties.deviceName,
+                 properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete"
+                 : properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
+                 : properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? "virtual" : "other",
+                 devices.size());
+    return chosen;
+}
+
 [[nodiscard]] bool create_backend(VulkanGeState &s, std::string &error) {
     // --- Instance / device -------------------------------------------------
     VkApplicationInfo app_info{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -1763,14 +1902,18 @@ void destroy_backend(VulkanGeState &s) noexcept {
     // support (an older MoltenVK) must not fail the whole instance, so both
     // are added conditionally, exactly like the portability extension above.
     bool surface_extensions_supported = false;
-#if defined(VK_KHR_SURFACE_EXTENSION_NAME) && defined(VK_EXT_METAL_SURFACE_EXTENSION_NAME)
-    if (instance_extension_supported(VK_KHR_SURFACE_EXTENSION_NAME) &&
-        instance_extension_supported(VK_EXT_METAL_SURFACE_EXTENSION_NAME)) {
-        instance_extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
-        instance_extensions.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
-        surface_extensions_supported = true;
+    {
+        // What a presentable surface needs is a per-platform answer (platform/<os>/).
+        const std::vector<const char *> surface_extensions = vkplat::surface_instance_extensions();
+        bool all_supported = !surface_extensions.empty();
+        for (const char *extension : surface_extensions)
+            if (!instance_extension_supported(extension)) all_supported = false;
+        if (all_supported) {
+            instance_extensions.insert(instance_extensions.end(), surface_extensions.begin(),
+                                       surface_extensions.end());
+            surface_extensions_supported = true;
+        }
     }
-#endif
     (void)surface_extensions_supported;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app_info;
@@ -1780,7 +1923,8 @@ void destroy_backend(VulkanGeState &s) noexcept {
     if (const VkResult result = vkCreateInstance(&instance_info, nullptr, &s.instance);
         result != VK_SUCCESS) {
         error = "vkCreateInstance failed (VkResult " + std::to_string(static_cast<int>(result)) +
-                "); install the Vulkan loader and MoltenVK (brew install vulkan-loader molten-vk)";
+                "); install the Vulkan loader (macOS: brew install vulkan-loader molten-vk; Windows: a current "
+                "GPU driver ships vulkan-1.dll)";
         return false;
     }
     s.report.instance_created = true;
@@ -1789,12 +1933,13 @@ void destroy_backend(VulkanGeState &s) noexcept {
     std::uint32_t device_count = 0u;
     vkEnumeratePhysicalDevices(s.instance, &device_count, nullptr);
     if (device_count == 0u) {
-        error = "no Vulkan physical devices; the loader could not find MoltenVK's ICD";
+        error = "no Vulkan physical devices; the loader found no driver (macOS: MoltenVK's ICD, "
+                "Windows: update the GPU driver)";
         return false;
     }
     std::vector<VkPhysicalDevice> devices(device_count);
     vkEnumeratePhysicalDevices(s.instance, &device_count, devices.data());
-    s.physical_device = devices.front();
+    s.physical_device = pick_physical_device(devices);
     s.report.physical_device_count = device_count;
 
     std::uint32_t family_count = 0u;
@@ -3702,7 +3847,6 @@ void destroy_backend(VulkanGeState &s) noexcept {
     return true;
 }
 
-#if defined(__APPLE__)
 // Native-swapchain present-path migration: builds a real VkSwapchainKHR
 // against the surface ge_gpu_backend_set_native_window() just created, plus
 // a minimal fullscreen-triangle blit pipeline that samples the already-
@@ -3712,8 +3856,22 @@ void destroy_backend(VulkanGeState &s) noexcept {
 // with a single GPU-side sample. Only ever called once per process (no
 // resize/recreate handling yet -- a real limitation, not an oversight: this
 // is still the experimental, opt-in (PSPRECOMP_VULKAN_SWAPCHAIN=1) path).
-[[nodiscard]] bool create_present_swapchain(VulkanGeState &s, VkSurfaceKHR surface,
-                                            std::string &error) {
+// Frees what depends on the swapchain images. The swapchain itself is replaced by the caller.
+void destroy_swapchain_targets(VulkanGeState &s) noexcept {
+    for (VkFramebuffer framebuffer : s.swapchain_framebuffers)
+        if (framebuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(s.device, framebuffer, nullptr);
+    s.swapchain_framebuffers.clear();
+    for (VkImageView view : s.swapchain_views)
+        if (view != VK_NULL_HANDLE) vkDestroyImageView(s.device, view, nullptr);
+    s.swapchain_views.clear();
+    s.swapchain_images.clear();
+}
+
+// The part of the present setup that follows the window size: swapchain, its image views and
+// one framebuffer per image. The render pass is created once and reused, since only the extent
+// changes on a resize, never the format.
+[[nodiscard]] bool create_swapchain_targets(VulkanGeState &s, VkSurfaceKHR surface,
+                                            VkSwapchainKHR old_swapchain, std::string &error) {
     VkSurfaceCapabilitiesKHR capabilities{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s.physical_device, surface, &capabilities);
 
@@ -3724,10 +3882,22 @@ void destroy_backend(VulkanGeState &s) noexcept {
     VkSurfaceFormatKHR chosen_format = formats.empty()
         ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}
         : formats.front();
+    // The game's frame is already gamma-encoded, so the surface must be a plain UNORM format: an
+    // sRGB one would apply a second curve and wash every colour out. Drivers list formats in
+    // different orders (Windows drivers often put an sRGB one first), so rank rather than trust
+    // the first entry. macOS offers only B8G8R8A8_UNORM, so it still gets that one.
+    const auto format_rank = [](VkFormat format) {
+        if (format == kColorFormat) return 0;
+        if (format == VK_FORMAT_B8G8R8A8_UNORM) return 1;
+        if (format == VK_FORMAT_A8B8G8R8_UNORM_PACK32) return 2;
+        return 9;
+    };
+    int best_rank = 9;
     for (const VkSurfaceFormatKHR &candidate : formats) {
-        if (candidate.format == kColorFormat) {
+        if (candidate.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) continue;
+        if (format_rank(candidate.format) < best_rank) {
+            best_rank = format_rank(candidate.format);
             chosen_format = candidate;
-            break;
         }
     }
 
@@ -3741,8 +3911,24 @@ void destroy_backend(VulkanGeState &s) noexcept {
     // and is exactly what "flawless 60fps, no tearing/stutter" wants: vsync-
     // paced, no frame skipped or torn.
     VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+    // PSPRECOMP_VULKAN_PRESENT_MODE = fifo (default) | mailbox | immediate | relaxed. FIFO is the
+    // safe vsync mode; the others exist for high-refresh or variable-refresh displays, where
+    // pacing a 60 Hz game against a fixed vblank can judder. Falls back to FIFO if unsupported.
+    if (const char *wanted = VCS_ENV("PSPRECOMP_VULKAN_PRESENT_MODE"); wanted != nullptr && *wanted != '\0') {
+        VkPresentModeKHR requested = VK_PRESENT_MODE_FIFO_KHR;
+        if (std::strcmp(wanted, "mailbox") == 0) requested = VK_PRESENT_MODE_MAILBOX_KHR;
+        else if (std::strcmp(wanted, "immediate") == 0) requested = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        else if (std::strcmp(wanted, "relaxed") == 0) requested = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+        for (const VkPresentModeKHR mode : present_modes)
+            if (mode == requested) present_mode = requested;
+    }
+    s.swapchain_present_mode = present_mode;
 
     VkExtent2D extent = capabilities.currentExtent;
+    if (extent.width == 0u || extent.height == 0u) {
+        error = "surface extent is zero (window minimised)";
+        return false;
+    }
     if (extent.width == 0xFFFFFFFFu) {
         extent.width = std::clamp(capabilities.minImageExtent.width, 1u, 16384u);
         extent.height = std::clamp(capabilities.minImageExtent.height, 1u, 16384u);
@@ -3767,6 +3953,7 @@ void destroy_backend(VulkanGeState &s) noexcept {
     swapchain_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     swapchain_info.presentMode = present_mode;
     swapchain_info.clipped = VK_TRUE;
+    swapchain_info.oldSwapchain = old_swapchain;
     if (vkCreateSwapchainKHR(s.device, &swapchain_info, nullptr, &s.swapchain) != VK_SUCCESS) {
         error = "vkCreateSwapchainKHR failed";
         return false;
@@ -3792,6 +3979,7 @@ void destroy_backend(VulkanGeState &s) noexcept {
         }
     }
 
+    if (s.present_render_pass == VK_NULL_HANDLE) {
     VkAttachmentDescription present_attachment{};
     present_attachment.format = s.swapchain_format;
     present_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -3816,6 +4004,7 @@ void destroy_backend(VulkanGeState &s) noexcept {
         error = "vkCreateRenderPass failed for the present pass";
         return false;
     }
+    }
 
     s.swapchain_framebuffers.resize(real_image_count);
     for (std::uint32_t i = 0u; i < real_image_count; ++i) {
@@ -3833,6 +4022,14 @@ void destroy_backend(VulkanGeState &s) noexcept {
         }
     }
 
+    return true;
+}
+
+[[nodiscard]] bool create_present_swapchain(VulkanGeState &s, VkSurfaceKHR surface,
+                                            std::string &error) {
+    if (!create_swapchain_targets(s, surface, VK_NULL_HANDLE, error)) return false;
+    const bool bilinear =
+        vcs_configuration().display.upscale_filter == DisplayUpscaleFilter::Bilinear;
     if (!create_shader_module(s, kBloomVertSpv, sizeof(kBloomVertSpv), s.present_vertex_shader) ||
         !create_shader_module(s, kPresentFragSpv, sizeof(kPresentFragSpv),
                               s.present_fragment_shader)) {
@@ -3841,8 +4038,6 @@ void destroy_backend(VulkanGeState &s) noexcept {
     }
 
     VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    const bool bilinear =
-        vcs_configuration().display.upscale_filter == DisplayUpscaleFilter::Bilinear;
     sampler_info.magFilter = bilinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     sampler_info.minFilter = sampler_info.magFilter;
     sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -4027,12 +4222,49 @@ void destroy_backend(VulkanGeState &s) noexcept {
 
     std::fprintf(stderr,
         "[swapchain-migration] real swapchain + present pipeline created: %ux%u format=%d "
-        "images=%u present_mode=FIFO upscale=%s\n",
-        extent.width, extent.height, static_cast<int>(chosen_format.format), real_image_count,
-        bilinear ? "bilinear" : "nearest");
+        "images=%u present_mode=%d upscale=%s\n",
+        s.swapchain_extent.width, s.swapchain_extent.height, static_cast<int>(s.swapchain_format),
+        static_cast<std::uint32_t>(s.swapchain_images.size()), static_cast<int>(s.swapchain_present_mode), bilinear ? "bilinear" : "nearest");
     return true;
 }
-#endif
+
+// Rebuilds the swapchain after a resize, a mode change or VK_ERROR_OUT_OF_DATE_KHR. Returns false
+// while the window has no drawable area (minimised); the caller just skips presenting until it does.
+[[nodiscard]] bool recreate_present_swapchain(VulkanGeState &s) {
+    if (s.diagnostic_surface == VK_NULL_HANDLE || s.swapchain == VK_NULL_HANDLE) return false;
+    VkSurfaceCapabilitiesKHR capabilities{};
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s.physical_device, s.diagnostic_surface,
+                                                   &capabilities) != VK_SUCCESS)
+        return false;
+    if (capabilities.currentExtent.width == 0u || capabilities.currentExtent.height == 0u)
+        return false;
+    vkDeviceWaitIdle(s.device);
+    destroy_swapchain_targets(s);
+    // The frame semaphores may be left signalled by a present that failed; nothing is in flight
+    // after the wait above, so replace them and clear the dependency the next render would wait on.
+    for (VkSemaphore *semaphore : {&s.present_image_acquired, &s.present_render_finished,
+                                   &s.present_color_read_done}) {
+        vkDestroySemaphore(s.device, *semaphore, nullptr);
+        VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        vkCreateSemaphore(s.device, &semaphore_info, nullptr, semaphore);
+    }
+    s.present_just_ran = false;
+    const VkSwapchainKHR old_swapchain = s.swapchain;
+    std::string error;
+    const bool ok = create_swapchain_targets(s, s.diagnostic_surface, old_swapchain, error);
+    vkDestroySwapchainKHR(s.device, old_swapchain, nullptr);
+    if (!ok) {
+        s.swapchain = VK_NULL_HANDLE;  // present falls back to the CPU readback path
+        std::fprintf(stderr, "[swapchain] recreate failed (%s) -- falling back to readback present\n",
+                     error.c_str());
+        return false;
+    }
+    s.swapchain_needs_recreate = false;
+    ++s.swapchain_recreations;
+    std::fprintf(stderr, "[swapchain] recreated for %ux%u (recreation %u)\n", s.swapchain_extent.width,
+                 s.swapchain_extent.height, s.swapchain_recreations);
+    return true;
+}
 
 // Packed as R8G8B8A8_UINT and consumed by psp_ge.frag as texture_control:
 // byte0 = GE texture function (MODULATE/DECAL/BLEND/REPLACE/ADD), byte1 =
@@ -4054,11 +4286,24 @@ void destroy_backend(VulkanGeState &s) noexcept {
 
 [[nodiscard]] std::uint32_t packed_texture_control(const GeGpuDrawDescriptor &draw,
                                                    bool enabled) noexcept {
+    // Sun-lit relief: bit 7 of the second byte switches it on, and the third
+    // byte's upper seven bits carry where the sun is across the sky (0 = east
+    // horizon, 127 = west), which the shader turns into a light direction.
+    std::uint32_t relief_bit = 0u, sun_bits = 0u;
+    const VcsConfiguration &cfg = vcs_configuration();
+    if (cfg.postfx.relief_enabled && !draw.through) {
+        const float hour = vcs::game_clock_hours();
+        if (hour >= 5.5f && hour <= 19.5f) {
+            const float t = std::clamp((hour - 6.0f) / 13.0f, 0.0f, 1.0f);
+            sun_bits = static_cast<std::uint32_t>(std::lround(t * 127.0f)) << 1u;
+            relief_bit = 0x80u;
+        }
+    }
     return (draw.texture_function & 0xFFu) |
            ((static_cast<std::uint32_t>(draw.texture_use_alpha ? 1u : 0u) |
              (texture_scale_shift(draw) << 4u) |
-             ((!draw.through && vcs_configuration().textures.detail) ? 0x40u : 0u)) << 8u) |
-           (static_cast<std::uint32_t>(draw.texture_double_color ? 1u : 0u) << 16u) |
+             ((!draw.through && vcs_configuration().textures.detail) ? 0x40u : 0u) | relief_bit) << 8u) |
+           ((static_cast<std::uint32_t>(draw.texture_double_color ? 1u : 0u) | sun_bits) << 16u) |
            (static_cast<std::uint32_t>(enabled ? 1u : 0u) << 24u);
 }
 
@@ -4590,7 +4835,7 @@ bool initialize_ge_gpu_backend(std::string &error) {
         const std::string native_error = error;
         runtime_log_error("vulkan ge initialize", native_error);
         destroy_backend(s);
-        const char *strict = std::getenv("PSPRECOMP_VULKAN_GE_STRICT");
+        const char *strict = VCS_ENV("PSPRECOMP_VULKAN_GE_STRICT");
         const bool strict_mode = strict != nullptr && *strict != '\0' && *strict != '0';
         s.report.requested = GeGpuBackendKind::Vulkan;
         s.report.active = GeGpuBackendKind::Software;
@@ -4782,6 +5027,7 @@ bool ge_gpu_backend_upload_decoded_texture(const GeGpuDrawDescriptor &draw, std:
             ++s.report.rejected_texture_decodes;
             return false;
         }
+        flush_uploads_and_wait(s);  // the victim may be referenced by an unsubmitted upload
         destroy_texture_entry(s, victim->second);
         s.textures.erase(victim);
         ++s.report.texture_cache_evictions;
@@ -4794,6 +5040,7 @@ bool ge_gpu_backend_upload_decoded_texture(const GeGpuDrawDescriptor &draw, std:
         return false;
     }
     entry.sampler = sampler;
+    entry.source_signature = vcs::texture_signature(rgba8);
     // Hand the decoded texture to the background pipeline (dump / replacement /
     // upscale); a finished result is swapped in at a later frame boundary.
     std::uint32_t usage = 0u;
@@ -4871,7 +5118,7 @@ void ge_gpu_backend_accumulate_color_triangles(
     // excludes as world effects, versus ordinary 3D draws -- proof the
     // classifier fires on real, sane numbers before any pixel is actually
     // rerouted. No rendering behavior changes here.
-    if (std::getenv("PSPRECOMP_HUD_DIAG") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_HUD_DIAG") != nullptr) {
         static std::uint64_t frame_marker = 0u;
         static std::uint64_t hud_candidate_draws = 0u;
         static std::uint64_t through_excluded_draws = 0u;
@@ -4895,7 +5142,7 @@ void ge_gpu_backend_accumulate_color_triangles(
         else ++world_draws;
     }
 
-    if (std::getenv("PSPRECOMP_GE_GPU_DRAW_DIAG") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_GE_GPU_DRAW_DIAG") != nullptr) {
         float min_y = triangle_vertices[0].y, max_y = triangle_vertices[0].y;
         float min_x = triangle_vertices[0].x, max_x = triangle_vertices[0].x;
         for (const GeGpuVertex &v : triangle_vertices) {
@@ -5224,72 +5471,64 @@ bool ge_gpu_backend_accumulate_hardware_packed_0115(
     return true;
 }
 
-void ge_gpu_backend_set_native_window(void *metal_layer) noexcept {
-#if defined(__APPLE__)
+void ge_gpu_backend_set_native_window(void *native_window) noexcept {
     VulkanGeState &s = state();
-    if (!s.enabled || metal_layer == nullptr) return;
-    // Default ON (see the matching comment in display_window.cpp) --
-    // PSPRECOMP_VULKAN_SWAPCHAIN=0 opts back out.
+    if (!s.enabled || native_window == nullptr) return;
+    // Whether the swapchain present is used at all is a per-platform default
+    // (platform/<os>/vulkan_platform_*.cpp); PSPRECOMP_VULKAN_SWAPCHAIN=1/0 forces it either way.
     static const bool migration_flag = [] {
-        const char *value = std::getenv("PSPRECOMP_VULKAN_SWAPCHAIN");
-        return value == nullptr || (*value != '\0' && std::strcmp(value, "0") != 0);
+        const char *value = VCS_ENV("PSPRECOMP_VULKAN_SWAPCHAIN");
+        if (value == nullptr || *value == '\0') return vkplat::swapchain_default_enabled();
+        return std::strcmp(value, "0") != 0;
     }();
     if (!migration_flag) return;
+    if (vkplat::surface_instance_extensions().empty()) return;  // no surface path on this platform
     s.swapchain_migration_enabled = true;
-    if (s.diagnostic_metal_layer == metal_layer && s.diagnostic_surface != VK_NULL_HANDLE) return;
+    if (s.diagnostic_native_window == native_window && s.diagnostic_surface != VK_NULL_HANDLE) return;
 
-    const auto create_metal_surface = reinterpret_cast<PFN_vkCreateMetalSurfaceEXT>(
-        vkGetInstanceProcAddr(s.instance, "vkCreateMetalSurfaceEXT"));
-    if (create_metal_surface == nullptr) {
-        std::fprintf(stderr,
-            "[swapchain-migration] vkCreateMetalSurfaceEXT unavailable (surface extension not "
-            "loaded) -- staying on the existing present path\n");
-        return;
-    }
-    VkMetalSurfaceCreateInfoEXT surface_info{VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT};
-    surface_info.pLayer = static_cast<const CAMetalLayer *>(metal_layer);
     VkSurfaceKHR surface = VK_NULL_HANDLE;
-    if (create_metal_surface(s.instance, &surface_info, nullptr, &surface) != VK_SUCCESS) {
+    if (vkplat::create_surface(s.instance, native_window, surface) != VK_SUCCESS) {
         std::fprintf(stderr,
-            "[swapchain-migration] vkCreateMetalSurfaceEXT failed -- staying on the existing "
-            "present path\n");
+            "[swapchain] could not create a %s surface -- staying on the CPU readback present "
+            "path\n", vkplat::platform_name());
+        s.swapchain_migration_enabled = false;
         return;
     }
     s.diagnostic_surface = surface;
-    s.diagnostic_metal_layer = metal_layer;
+    s.diagnostic_native_window = native_window;
 
     VkBool32 supported = VK_FALSE;
     vkGetPhysicalDeviceSurfaceSupportKHR(s.physical_device, s.graphics_queue_family, surface,
                                         &supported);
+    if (supported != VK_TRUE) {
+        // The graphics queue must be able to present to this window; on the rare machine where it
+        // cannot (a GPU that does not drive the display), keep the readback path.
+        std::fprintf(stderr,
+            "[swapchain] the graphics queue cannot present to this window -- staying on the CPU "
+            "readback present path\n");
+        s.swapchain_migration_enabled = false;
+        return;
+    }
     VkSurfaceCapabilitiesKHR capabilities{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s.physical_device, surface, &capabilities);
-    std::uint32_t format_count = 0u;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(s.physical_device, surface, &format_count, nullptr);
-    std::uint32_t present_mode_count = 0u;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(s.physical_device, surface, &present_mode_count,
-                                              nullptr);
     std::fprintf(stderr,
-        "[swapchain-migration] real VkSurfaceKHR created from the game window's CAMetalLayer -- "
-        "graphics_queue_supports_present=%s current_extent=%ux%u min_extent=%ux%u "
-        "max_extent=%ux%u min_image_count=%u max_image_count=%u surface_formats=%u "
-        "present_modes=%u\n",
-        supported == VK_TRUE ? "yes" : "no", capabilities.currentExtent.width,
-        capabilities.currentExtent.height, capabilities.minImageExtent.width,
-        capabilities.minImageExtent.height, capabilities.maxImageExtent.width,
-        capabilities.maxImageExtent.height, capabilities.minImageCount,
-        capabilities.maxImageCount, format_count, present_mode_count);
+        "[swapchain] %s surface created: current_extent=%ux%u min_extent=%ux%u max_extent=%ux%u "
+        "min_image_count=%u max_image_count=%u\n", vkplat::platform_name(),
+        capabilities.currentExtent.width, capabilities.currentExtent.height,
+        capabilities.minImageExtent.width, capabilities.minImageExtent.height,
+        capabilities.maxImageExtent.width, capabilities.maxImageExtent.height,
+        capabilities.minImageCount, capabilities.maxImageCount);
 
     std::string swapchain_error;
     if (!create_present_swapchain(s, surface, swapchain_error)) {
         std::fprintf(stderr,
-            "[swapchain-migration] swapchain/present pipeline creation failed (%s) -- staying "
-            "on the existing present path\n",
-            swapchain_error.c_str());
+            "[swapchain] swapchain/present pipeline creation failed (%s) -- staying on the CPU "
+            "readback present path\n", swapchain_error.c_str());
+        s.swapchain_migration_enabled = false;
     }
-#else
-    (void)metal_layer;
-#endif
 }
+
+bool ge_gpu_backend_is_vulkan() noexcept { return true; }
 
 void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept {
     VulkanGeState &s = state();
@@ -5340,24 +5579,264 @@ void coalesce_batches(std::vector<Batch> &batches, std::uint64_t &merged_away) n
 
 // Swaps in finished replacement / upscaled textures. Runs at a frame boundary
 // (after the fence wait), so no in-flight draw still references the old image.
+//
+// Uploads are batched into one command buffer per frame and submitted WITHOUT
+// waiting: on MoltenVK a submit-and-wait costs milliseconds however little it
+// does, and doing that once per texture stalled the render thread for hundreds
+// of milliseconds a second while streaming. The old image stays in use until the
+// batch's own fence signals on a later frame, then the new one is swapped in.
+struct PendingUploadItem {
+    std::uint64_t key{};
+    TextureEntry fresh{};
+    std::uint32_t mip_levels{1u};
+    VkSampler sampler{VK_NULL_HANDLE};
+};
+struct UploadBatch {
+    VkFence fence{VK_NULL_HANDLE};
+    VkBuffer staging{VK_NULL_HANDLE};
+    VkDeviceMemory staging_memory{VK_NULL_HANDLE};
+    std::byte *staging_ptr{nullptr};
+    VkCommandBuffer cmd{VK_NULL_HANDLE};
+    std::vector<PendingUploadItem> items;
+    bool in_flight{false};
+    bool broken{false};
+    // Replaced images. The frame submitted just before a swap may still be reading the old one;
+    // finish_color_frame_impl() waits for that frame at the start of the next call, so they
+    // are destroyed one apply call later.
+    std::vector<TextureEntry> retired;
+    bool has_carry{false};
+    vcs::TextureResult carry;  // finished but did not fit the previous batch
+};
+constexpr VkDeviceSize kUploadBatchBytes = 12ull * 1024ull * 1024ull;
+constexpr std::size_t kUploadBatchMaxItems = 24u;
+
+UploadBatch &upload_batch() {
+    static UploadBatch batch;
+    return batch;
+}
+
+namespace {
+void record_texture_upload(VkCommandBuffer cmd, VkImage image, VkBuffer staging, VkDeviceSize offset,
+                           std::uint32_t width, std::uint32_t height, std::uint32_t mip_levels) noexcept {
+    const auto barrier = [&](std::uint32_t level, VkImageLayout from, VkImageLayout to,
+                             VkAccessFlags src_access, VkAccessFlags dst_access,
+                             VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, 0u, 1u};
+        b.srcAccessMask = src_access;
+        b.dstAccessMask = dst_access;
+        vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+    // Whole chain to TRANSFER_DST in one barrier, then the copy into level 0.
+    VkImageMemoryBarrier all{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    all.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    all.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    all.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    all.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    all.image = image;
+    all.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, mip_levels, 0u, 1u};
+    all.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &all);
+    VkBufferImageCopy region{};
+    region.bufferOffset = offset;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1u;
+    region.imageExtent = {width, height, 1u};
+    vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    std::int32_t mip_w = static_cast<std::int32_t>(width);
+    std::int32_t mip_h = static_cast<std::int32_t>(height);
+    for (std::uint32_t level = 1u; level < mip_levels; ++level) {
+        barrier(level - 1u, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        const std::int32_t next_w = std::max(1, mip_w / 2);
+        const std::int32_t next_h = std::max(1, mip_h / 2);
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 0u, 1u};
+        blit.srcOffsets[1] = {mip_w, mip_h, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0u, 1u};
+        blit.dstOffsets[1] = {next_w, next_h, 1};
+        vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        barrier(level - 1u, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        mip_w = next_w;
+        mip_h = next_h;
+    }
+    barrier(mip_levels - 1u, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+}
+
+} // namespace
+
+// View + descriptor for an image whose contents are already uploaded.
+[[nodiscard]] bool finish_texture_entry(VulkanGeState &s, TextureEntry &e, VkSampler sampler,
+                                        std::uint32_t mip_levels) noexcept {
+    VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view_info.image = e.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = kColorFormat;
+    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view_info.subresourceRange.levelCount = mip_levels;
+    view_info.subresourceRange.layerCount = 1u;
+    if (vkCreateImageView(s.device, &view_info, nullptr, &e.view) != VK_SUCCESS) return false;
+    VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocate.descriptorPool = s.descriptor_pool;
+    allocate.descriptorSetCount = 1u;
+    allocate.pSetLayouts = &s.descriptor_layout;
+    if (vkAllocateDescriptorSets(s.device, &allocate, &e.descriptor) != VK_SUCCESS) return false;
+    VkDescriptorImageInfo image_descriptor{};
+    image_descriptor.sampler = sampler;
+    image_descriptor.imageView = e.view;
+    image_descriptor.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = e.descriptor;
+    write.descriptorCount = 1u;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &image_descriptor;
+    vkUpdateDescriptorSets(s.device, 1, &write, 0, nullptr);
+    e.sampler = sampler;
+    ++s.report.texture_descriptor_sets_allocated;
+    return true;
+}
+
+// The batch's GPU work is done: swap each finished image in (or discard it).
+void finalize_upload_batch(VulkanGeState &s, UploadBatch &b, bool gpu_ok) noexcept {
+    for (PendingUploadItem &item : b.items) {
+        TextureEntry &fresh = item.fresh;
+        const auto found = s.textures.find(item.key);
+        bool swapped = false;
+        if (gpu_ok && found != s.textures.end() && found->second.scale_shift == 0u &&
+            finish_texture_entry(s, fresh, item.sampler, item.mip_levels)) {
+            fresh.last_used_epoch = found->second.last_used_epoch;
+            b.retired.push_back(found->second);
+            found->second = fresh;
+            swapped = true;
+        }
+        if (!swapped) destroy_texture_entry(s, fresh);
+    }
+    b.items.clear();
+    if (b.cmd != VK_NULL_HANDLE) vkFreeCommandBuffers(s.device, s.command_pool, 1, &b.cmd);
+    b.cmd = VK_NULL_HANDLE;
+    b.in_flight = false;
+}
+
 void apply_texture_replacements(VulkanGeState &s) noexcept {
+    UploadBatch &b = upload_batch();
+    for (TextureEntry &old : b.retired) destroy_texture_entry(s, old);
+    b.retired.clear();
+    if (b.broken) return;
+    if (b.in_flight) {
+        if (vkGetFenceStatus(s.device, b.fence) == VK_NOT_READY) return;
+        finalize_upload_batch(s, b, true);
+    }
+    if (b.fence == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(s.device, &fence_info, nullptr, &b.fence) != VK_SUCCESS) { b.broken = true; return; }
+        if (!create_buffer(s, kUploadBatchBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                           b.staging, b.staging_memory)) { b.broken = true; return; }
+        void *mapped = nullptr;
+        if (vkMapMemory(s.device, b.staging_memory, 0, kUploadBatchBytes, 0, &mapped) != VK_SUCCESS) {
+            b.broken = true;
+            return;
+        }
+        b.staging_ptr = static_cast<std::byte *>(mapped);
+    }
+
     static thread_local std::vector<vcs::TextureResult> finished;
-    finished.clear();
-    vcs::texture_pipeline_poll(finished, 4u);  // a few per frame keeps uploads hitch-free
-    for (vcs::TextureResult &r : finished) {
+    VkDeviceSize used = 0u;
+    while (b.items.size() < kUploadBatchMaxItems) {
+        vcs::TextureResult r;
+        if (b.has_carry) {
+            r = std::move(b.carry);
+            b.has_carry = false;
+        } else {
+            finished.clear();
+            vcs::texture_pipeline_poll(finished, 1u);
+            if (finished.empty()) break;
+            r = std::move(finished.front());
+        }
         const auto found = s.textures.find(r.key);
         if (found == s.textures.end()) continue;
         TextureEntry &old = found->second;
         if (old.scale_shift != 0u || old.width != r.original_width || old.height != r.original_height) continue;
-        TextureEntry fresh{};
-        const std::span<const std::byte> pixels(reinterpret_cast<const std::byte *>(r.texture.rgba.data()),
-                                                r.texture.rgba.size());
-        if (!create_texture(s, r.texture.width, r.texture.height, pixels, old.sampler, fresh)) continue;
+        // The cache slot may have been evicted and refilled with a different texture of the same
+        // size while this result was being made; never put it onto the wrong image.
+        if (old.source_signature != r.source_signature) continue;
+        const VkDeviceSize byte_size = VkDeviceSize{r.texture.width} * r.texture.height * 4u;
+        if (byte_size > kUploadBatchBytes || r.texture.rgba.size() < byte_size) continue;
+        if (used + byte_size > kUploadBatchBytes) {
+            b.carry = std::move(r);  // goes first in the next batch
+            b.has_carry = true;
+            break;
+        }
+        PendingUploadItem item;
+        item.key = r.key;
+        item.sampler = old.sampler;
+        std::uint32_t mips = 1u;
+        for (std::uint32_t largest = std::max(r.texture.width, r.texture.height); largest > 1u; largest >>= 1u) ++mips;
+        item.mip_levels = vcs_configuration().textures.mipmaps ? std::min(mips, 12u) : 1u;
+        VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.format = kColorFormat;
+        image_info.extent = {r.texture.width, r.texture.height, 1u};
+        image_info.mipLevels = item.mip_levels;
+        image_info.arrayLayers = 1u;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                           VK_IMAGE_USAGE_SAMPLED_BIT;
+        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        TextureEntry &fresh = item.fresh;
+        bool ok = vkCreateImage(s.device, &image_info, nullptr, &fresh.image) == VK_SUCCESS;
+        if (ok) {
+            VkMemoryRequirements requirements{};
+            vkGetImageMemoryRequirements(s.device, fresh.image, &requirements);
+            std::uint32_t type_index = 0u;
+            ok = find_memory_type(s.physical_device, requirements.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, type_index);
+            if (ok) {
+                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                allocate.allocationSize = requirements.size;
+                allocate.memoryTypeIndex = type_index;
+                ok = vkAllocateMemory(s.device, &allocate, nullptr, &fresh.memory) == VK_SUCCESS &&
+                     vkBindImageMemory(s.device, fresh.image, fresh.memory, 0) == VK_SUCCESS;
+            }
+        }
+        if (!ok) { destroy_texture_entry(s, fresh); continue; }
+        fresh.width = r.texture.width;
+        fresh.height = r.texture.height;
         fresh.scale_shift = r.texture.scale_shift;
-        fresh.sampler = old.sampler;
-        fresh.last_used_epoch = old.last_used_epoch;
-        destroy_texture_entry(s, old);
-        old = fresh;
+        if (b.cmd == VK_NULL_HANDLE) {
+            b.cmd = begin_one_shot(s);
+            if (b.cmd == VK_NULL_HANDLE) { destroy_texture_entry(s, fresh); break; }
+        }
+        std::memcpy(b.staging_ptr + used, r.texture.rgba.data(), static_cast<std::size_t>(byte_size));
+        record_texture_upload(b.cmd, fresh.image, b.staging, used, r.texture.width, r.texture.height,
+                              item.mip_levels);
+        used += (byte_size + 15u) & ~VkDeviceSize{15u};
+        b.items.push_back(std::move(item));
+    }
+    if (!b.items.empty() && b.cmd != VK_NULL_HANDLE) {
+        bool submitted = vkEndCommandBuffer(b.cmd) == VK_SUCCESS;
+        if (submitted) {
+            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submit.commandBufferCount = 1u;
+            submit.pCommandBuffers = &b.cmd;
+            vkResetFences(s.device, 1, &b.fence);
+            submitted = vkQueueSubmit(s.graphics_queue, 1, &submit, b.fence) == VK_SUCCESS;
+        }
+        if (submitted) b.in_flight = true;
+        else finalize_upload_batch(s, b, false);
     }
 }
 
@@ -5387,7 +5866,6 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
     if (s.submission_pending) {
         s.submission_pending = false;
         if (vkWaitForFences(s.device, 1, &s.fence, VK_TRUE, 5'000'000'000ull) == VK_SUCCESS) {
-#if defined(__APPLE__)
             // Native-swapchain present path: color_image from the
             // submission just fence-waited above is now guaranteed
             // GPU-complete (same guarantee the CPU readback below relies
@@ -5398,12 +5876,32 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
             // (harmless, unused bytes) rather than touch that recording
             // path too, keeping this migration's risk surface smaller.
             if (s.swapchain_migration_enabled && s.swapchain != VK_NULL_HANDLE) {
-                vkWaitForFences(s.device, 1, &s.present_fence, VK_TRUE, 5'000'000'000ull);
-                vkResetFences(s.device, 1, &s.present_fence);
+                // A resized or minimised window: when the drawable extent is not fixed for the
+                // process (Windows), compare it with the swapchain's every frame.
+                if (vkplat::surface_extent_can_change() && !s.swapchain_needs_recreate) {
+                    VkSurfaceCapabilitiesKHR surface_caps{};
+                    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+                            s.physical_device, s.diagnostic_surface, &surface_caps) == VK_SUCCESS &&
+                        surface_caps.currentExtent.width != 0xFFFFFFFFu &&
+                        (surface_caps.currentExtent.width != s.swapchain_extent.width ||
+                         surface_caps.currentExtent.height != s.swapchain_extent.height))
+                        s.swapchain_needs_recreate = true;
+                }
+                bool swapchain_ready = true;
+                if (s.swapchain_needs_recreate) swapchain_ready = recreate_present_swapchain(s);
                 std::uint32_t image_index = 0u;
-                const VkResult acquire_result = vkAcquireNextImageKHR(
-                    s.device, s.swapchain, 5'000'000'000ull, s.present_image_acquired,
-                    VK_NULL_HANDLE, &image_index);
+                VkResult acquire_result = VK_NOT_READY;
+                if (swapchain_ready && s.swapchain != VK_NULL_HANDLE) {
+                    vkWaitForFences(s.device, 1, &s.present_fence, VK_TRUE, 5'000'000'000ull);
+                    acquire_result = vkAcquireNextImageKHR(
+                        s.device, s.swapchain, 5'000'000'000ull, s.present_image_acquired,
+                        VK_NULL_HANDLE, &image_index);
+                    if (acquire_result == VK_ERROR_OUT_OF_DATE_KHR) s.swapchain_needs_recreate = true;
+                    // Only after a successful acquire: this fence is signalled by the present
+                    // submit below, so resetting it earlier would strand it on a failed acquire.
+                    if (acquire_result == VK_SUCCESS || acquire_result == VK_SUBOPTIMAL_KHR)
+                        vkResetFences(s.device, 1, &s.present_fence);
+                }
                 if (acquire_result == VK_SUCCESS || acquire_result == VK_SUBOPTIMAL_KHR) {
                     vkResetCommandBuffer(s.present_command_buffer, 0);
                     VkCommandBufferBeginInfo present_begin{
@@ -5474,7 +5972,11 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
                                 present_info.swapchainCount = 1u;
                                 present_info.pSwapchains = &s.swapchain;
                                 present_info.pImageIndices = &image_index;
-                                vkQueuePresentKHR(s.graphics_queue, &present_info);
+                                const VkResult present_result =
+                                    vkQueuePresentKHR(s.graphics_queue, &present_info);
+                                if (present_result == VK_ERROR_OUT_OF_DATE_KHR ||
+                                    present_result == VK_SUBOPTIMAL_KHR)
+                                    s.swapchain_needs_recreate = true;
                                 // Step 2 below (the next frame's main render,
                                 // later in this same function call) waits on
                                 // present_color_read_done before it starts
@@ -5496,14 +5998,7 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
                 s.report.presented_framebuffer_target = s.pending_target_address;
                 produced_frame = true;
             }
-#endif
-            if (
-#if defined(__APPLE__)
-                !(s.swapchain_migration_enabled && s.swapchain != VK_NULL_HANDLE)
-#else
-                true
-#endif
-            ) {
+            if (!(s.swapchain_migration_enabled && s.swapchain != VK_NULL_HANDLE)) {
             void *mapped = nullptr;
             if (vkMapMemory(s.device, s.readback_memory, 0, s.readback_capacity, 0, &mapped) ==
                 VK_SUCCESS) {
@@ -5522,7 +6017,7 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
                 // VK_QUERY_RESULT_WAIT_BIT here -- the fence wait above
                 // already proves this submission's GPU work, timestamps
                 // included, is finished.
-                if (s.timestamps_supported && std::getenv("PSPRECOMP_GE_GPU_TIMESTAMP_DIAG") != nullptr) {
+                if (s.timestamps_supported && VCS_ENV("PSPRECOMP_GE_GPU_TIMESTAMP_DIAG") != nullptr) {
                     std::array<std::uint64_t, 2> timestamps{};
                     if (vkGetQueryPoolResults(s.device, s.timestamp_pool, 0u, 2u,
                                               sizeof(timestamps), timestamps.data(),
@@ -5567,7 +6062,7 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
                                 max_brightness = std::max(max_brightness, glow);
                             }
                         }
-                        if (std::getenv("PSPRECOMP_BLOOM_DIAG") != nullptr) {
+                        if (VCS_ENV("PSPRECOMP_BLOOM_DIAG") != nullptr) {
                             static std::uint64_t frames = 0u;
                             ++frames;
                             const double avg = pixel_count > 0u
@@ -5743,7 +6238,7 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
     const CloudUniforms clouds = cloud_present_constants(s, winner->address);
     const CloudFrameDraws cloud_draws =
         cloud_camera != nullptr ? record_cloud_offscreen_passes(s, clouds) : CloudFrameDraws{};
-    if (std::getenv("PSPRECOMP_CLOUD_DIAG") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_CLOUD_DIAG") != nullptr) {
         static std::uint64_t cloud_diag_frame = 0u;
         if (!s.cloud_cameras.empty() && (cloud_diag_frame % 15u) == 0u) {
             std::fprintf(stderr,
@@ -5789,7 +6284,7 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
     const std::size_t batches_before_coalesce = winner->batches.size();
     std::uint64_t batches_merged_away = 0u;
     coalesce_batches(winner->batches, batches_merged_away);
-    if (std::getenv("PSPRECOMP_GE_BATCH_COALESCE_DIAG") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_GE_BATCH_COALESCE_DIAG") != nullptr) {
         std::fprintf(stderr,
             "[batch-coalesce] vblank=%llu before=%zu after=%zu merged=%llu\n",
             static_cast<unsigned long long>(vblank), batches_before_coalesce,
@@ -5846,7 +6341,7 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
         }
         if (!clouds_composited && cloud_draws.ready && fading_entities_boundary) {
             clouds_composited = true;
-            if (std::getenv("PSPRECOMP_CLOUD_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_CLOUD_DIAG") != nullptr) {
                 static std::uint64_t composite_diag_count = 0u;
                 if (composite_diag_count < 60u) {
                     std::fprintf(stderr, "[cloud-diag] composite draw issued, batch_clear=%d\n",
@@ -6223,16 +6718,13 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
     submit.commandBufferCount = 1u;
     submit.pCommandBuffers = &s.command_buffer;
     VkPipelineStageFlags present_read_wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-#if defined(__APPLE__)
     if (s.present_just_ran) {
         submit.waitSemaphoreCount = 1u;
         submit.pWaitSemaphores = &s.present_color_read_done;
         submit.pWaitDstStageMask = &present_read_wait_stage;
         s.present_just_ran = false;
     }
-#else
-    (void)present_read_wait_stage;
-#endif
+    flush_uploads(s);  // this frame's new textures must be on the queue ahead of its draws
     vkResetFences(s.device, 1, &s.fence);
     if (vkQueueSubmit(s.graphics_queue, 1, &submit, s.fence) == VK_SUCCESS) {
         ++s.report.perf_queue_submit_calls;

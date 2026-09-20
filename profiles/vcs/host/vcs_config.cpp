@@ -159,7 +159,7 @@ void load_proper_shaders_configuration(VcsConfiguration &config,
             continue;
         }
         if (section == "dither" || section == "cas" || section == "vhs" ||
-            section == "timeofdaygrade" || section == "skypalette") {
+            section == "timeofdaygrade" || section == "skypalette" || section == "reliefshading") {
             const std::size_t eq = line.find('=');
             if (eq == std::string::npos) continue;
             const std::string k = lowercase_copy(trim_copy(line.substr(0u, eq)));
@@ -171,6 +171,7 @@ void load_proper_shaders_configuration(VcsConfiguration &config,
                            : section == "cas"     ? fx.cas_enabled
                            : section == "timeofdaygrade" ? fx.time_of_day_enabled
                            : section == "skypalette" ? fx.sky_palette_enabled
+                           : section == "reliefshading" ? fx.relief_enabled
                                                   : fx.vhs_enabled;
                 ok = parse_bool(v, flag);
             } else if (section == "dither" && k == "strength") {
@@ -181,6 +182,8 @@ void load_proper_shaders_configuration(VcsConfiguration &config,
                 ok = parse_float(v, 0.0f, 1.0f, fx.sky_palette_strength);
             } else if (section == "timeofdaygrade" && k == "strength") {
                 ok = parse_float(v, 0.0f, 1.0f, fx.time_of_day_strength);
+            } else if (section == "reliefshading" && k == "strength") {
+                ok = parse_float(v, 0.0f, 1.0f, fx.relief_strength);
             } else if (section == "vhs" && k == "wiggle") {
                 ok = parse_float(v, 0.0f, 1.5f, fx.vhs_wiggle);
             } else if (section == "vhs" && k == "smear") {
@@ -536,6 +539,11 @@ void apply_controls_key(VcsConfiguration &config, const std::string &key,
     if (key == "moderncontrolscheme") {
         if (!parse_bool(value, config.controls.modern_control_scheme))
             warning(config, line, "Controls.ModernControlScheme expects true/false");
+        return;
+    }
+    if (key == "keyboardprompts") {
+        if (!parse_bool(value, config.controls.keyboard_prompts))
+            warning(config, line, "Controls.KeyboardPrompts expects true/false");
         return;
     }
     warning(config, line, "unknown [Controls] key '" + key + "'");

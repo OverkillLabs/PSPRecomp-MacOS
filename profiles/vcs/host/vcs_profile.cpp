@@ -6,6 +6,7 @@
 #include "vcs_vehicle_input.hpp"
 #include "vcs_media_decoder.hpp"
 #include "vcs_config.hpp"
+#include "vcs_key_prompts.hpp"
 #include "framebuffer_capture.hpp"
 #include "ge_renderer.hpp"
 #include "ge_gpu_backend.hpp"
@@ -46,6 +47,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "vcs_env.hpp"
 
 namespace psprecomp {
 using RuntimePostImportHook = void (*)(Runtime &, AllegrexContext &);
@@ -89,7 +91,7 @@ void vcs_raw_deflate_fast(psprecomp::Runtime &runtime, psprecomp::AllegrexContex
             const std::uint32_t return_pc = work.return_pc;
             const std::uint64_t call = work.call;
             deflate_fast_pending.erase(pending);
-            if (std::getenv("PSPRECOMP_DEFLATE_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_DEFLATE_DIAG") != nullptr)
                 std::cerr << "[deflate-fast-timing-complete] call=" << call
                           << " uid=" << thread_uid << " return=" << psprecomp::hex32(return_pc) << "\n";
             ctx.pc = return_pc;
@@ -104,7 +106,7 @@ void vcs_raw_deflate_fast(psprecomp::Runtime &runtime, psprecomp::AllegrexContex
     const std::uint32_t return_pc = ctx.gpr[31];
     static std::uint64_t deflate_calls = 0u;
     const std::uint64_t deflate_call = ++deflate_calls;
-    if (std::getenv("PSPRECOMP_DEFLATE_DIAG") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_DEFLATE_DIAG") != nullptr) {
         std::cerr << "[deflate-fast-begin] call=" << deflate_call
                   << " input=" << psprecomp::hex32(input)
                   << " output=" << psprecomp::hex32(output)
@@ -134,7 +136,7 @@ void vcs_raw_deflate_fast(psprecomp::Runtime &runtime, psprecomp::AllegrexContex
     std::uint64_t guest_work = 1u;
     if (result.status == psprecomp::RawDeflateStatus::Ok)
         guest_work = estimate_vcs_deflate_guest_work(result.input_consumed, result.output_size);
-    if (std::getenv("PSPRECOMP_DEFLATE_DIAG") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_DEFLATE_DIAG") != nullptr) {
         if (deflate_call <= 16u || (deflate_call % 1000u) == 0u) {
             std::cerr << "[deflate-fast] call=" << deflate_call
                       << " input=" << psprecomp::hex32(input)
@@ -152,7 +154,7 @@ void vcs_raw_deflate_fast(psprecomp::Runtime &runtime, psprecomp::AllegrexContex
     // thread preemption and vblank timing while avoiding the expensive Huffman
     // and byte-copy loops.  Each thread owns its own continuation state.
     if (result.status == psprecomp::RawDeflateStatus::Ok && guest_work > 1u &&
-        std::getenv("PSPRECOMP_NO_FAST_DEFLATE_TIMING") == nullptr) {
+        VCS_ENV("PSPRECOMP_NO_FAST_DEFLATE_TIMING") == nullptr) {
         deflate_fast_pending.emplace(thread_uid, DeflateFastPending{return_pc, guest_work - 1u, deflate_call});
         ctx.pc = kFastEntry;
     } else {
@@ -555,9 +557,27 @@ const VirtualDiscFile *register_virtual_disc_file(const std::filesystem::path &p
 
     VirtualDiscFile item{};
     item.native_path = path;
+    std::uint64_t item_size = size;
+    if (vcs_configuration().controls.keyboard_prompts) {
+        std::string leaf = path.filename().string();
+        std::transform(leaf.begin(), leaf.end(), leaf.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (leaf == "english.gxt") {
+            // Serve a copy whose control prompts name our keyboard and mouse controls.
+            if (const auto patched = vcs::vcs_keyboard_prompt_gxt(path)) {
+                std::error_code patched_error;
+                const std::uint64_t patched_size = std::filesystem::file_size(*patched, patched_error);
+                if (!patched_error && patched_size != 0u) {
+                    item.native_path = *patched;
+                    item_size = patched_size;
+                }
+            }
+        }
+    }
+    const std::uint64_t sector_count_final = std::max<std::uint64_t>(1u, (item_size + 2047u) / 2048u);
     item.start_sector = file_table.next_virtual_sector;
-    item.size = size;
-    file_table.next_virtual_sector += static_cast<std::uint32_t>(sector_count);
+    item.size = item_size;
+    file_table.next_virtual_sector += static_cast<std::uint32_t>(sector_count_final);
     const auto [inserted, ok] = file_table.virtual_files_by_path.emplace(key, std::move(item));
     if (!ok) return &inserted->second;
     file_table.virtual_path_by_sector.emplace(inserted->second.start_sector, key);
@@ -594,7 +614,7 @@ DiscReadStats disc_read_stats;
 std::chrono::steady_clock::duration io_host_time_this_vblank{};
 
 bool disc_read_diag_enabled() {
-    static const bool enabled = std::getenv("PSPRECOMP_DISC_READ_DIAG") != nullptr;
+    static const bool enabled = VCS_ENV("PSPRECOMP_DISC_READ_DIAG") != nullptr;
     return enabled;
 }
 
@@ -766,7 +786,7 @@ bool open_video_decoder(MpegContextState &state) {
     state.video_eof = false;
     state.decoded_video_frames = 0u;
     state.consumed_video_packets = 0u;
-    if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr)
+    if (VCS_ENV("PSPRECOMP_MPEG_DIAG") != nullptr)
         std::cerr << "[mpeg] decoder opened source=\"" << state.source_path.string() << "\"\n";
     return true;
 }
@@ -983,7 +1003,7 @@ bool open_atrac_decoder(AtracContextState &state) {
     // must stay inside the file.
     std::uint64_t seek = state.sample_position;
     if (state.header.total_samples != 0u && seek > state.header.total_samples) {
-        if (std::getenv("PSPRECOMP_ATRAC_DIAG") != nullptr)
+        if (VCS_ENV("PSPRECOMP_ATRAC_DIAG") != nullptr)
             std::cerr << "[atrac] seek " << seek << " fora do stream (total="
                       << state.header.total_samples << "), limitado\n";
         seek = state.header.total_samples;
@@ -992,7 +1012,7 @@ bool open_atrac_decoder(AtracContextState &state) {
                             kAtracOutputChannels, seek))
         return false;
     state.decoder_eof = false;
-    if (std::getenv("PSPRECOMP_ATRAC_DIAG") != nullptr)
+    if (VCS_ENV("PSPRECOMP_ATRAC_DIAG") != nullptr)
         std::cerr << "[atrac] decoder opened id-source=\"" << state.source_path.string()
                   << "\" sample=" << state.sample_position << "\n";
     return true;
@@ -1169,6 +1189,10 @@ std::uint64_t ge_lighting_state_revision = 1u;
 std::uint64_t ge_camera_state_revision = 1u;
 GeListTable ge_list_table{};
 std::unordered_map<std::int32_t, std::vector<GuestCallbackInvocation>> pending_guest_callbacks;
+// GE callbacks completed by the async worker. On hardware these are interrupts and run on
+// whichever thread is current, so they are not tied to the thread that submitted the list:
+// that thread may well be asleep waiting for exactly the wake-up the callback delivers.
+std::vector<GuestCallbackInvocation> ge_async_global_callbacks;
 
 // Stage 45.7: the PSP GE is an independent processor.  Previous stages executed
 // the complete display list inside sceGeListEnQueue(), serializing translated
@@ -1214,10 +1238,15 @@ struct GeAsyncWorkerState {
 GeAsyncWorkerState ge_async{};
 thread_local bool ge_async_worker_thread = false;
 
+// Display lists execute on their own thread and overlap game logic, which is what keeps busy
+// scenes inside the 60 Hz frame budget. On by default with the Vulkan backend, where it was
+// validated; the DirectX 12 build keeps its previous default (off). PSPRECOMP_GE_ASYNC=1/0
+// forces it either way on any backend.
 bool ge_async_enabled() noexcept {
     static const bool enabled = [] {
-        const char *value = std::getenv("PSPRECOMP_GE_ASYNC");
-        return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+        const char *value = VCS_ENV("PSPRECOMP_GE_ASYNC");
+        if (value == nullptr || *value == '\0') return ge_gpu_backend_is_vulkan();
+        return std::strcmp(value, "0") != 0;
     }();
     return enabled;
 }
@@ -1466,7 +1495,7 @@ void dump_ram_if_requested(const psprecomp::GuestMemory &memory) {
     };
     static const Config config = [] {
         Config value{};
-        const char *directory = std::getenv("PSPRECOMP_RAM_DUMP_DIR");
+        const char *directory = VCS_ENV("PSPRECOMP_RAM_DUMP_DIR");
         if (directory == nullptr || *directory == '\0') return value;
         value.directory = directory;
         value.start = parse_environment_u64("PSPRECOMP_RAM_DUMP_START_VBLANK");
@@ -1649,8 +1678,8 @@ std::uint64_t sas_core_mix_calls{};
 std::uint64_t sas_core_with_mix_calls{};
 
 bool sas_audio_diagnostics_enabled() {
-    static const bool enabled = std::getenv("PSPRECOMP_AUDIO_DIAG") != nullptr ||
-        std::getenv("PSPRECOMP_SAS_DIAG") != nullptr;
+    static const bool enabled = VCS_ENV("PSPRECOMP_AUDIO_DIAG") != nullptr ||
+        VCS_ENV("PSPRECOMP_SAS_DIAG") != nullptr;
     return enabled;
 }
 
@@ -2800,7 +2829,7 @@ void vcs_load_codec_modules(psprecomp::Runtime &runtime, psprecomp::AllegrexCont
         if (existing != -1) continue;
 
         std::string module_name = runtime.memory().read_c_string(name_pointer, 1024u);
-        if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+        if (VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
             std::cerr << "[hle] codec entry " << index << " name=" << module_name
                       << " existing=" << existing << "\n";
         }
@@ -2816,7 +2845,7 @@ void vcs_load_codec_modules(psprecomp::Runtime &runtime, psprecomp::AllegrexCont
         runtime.memory().store32(entry + 4u, static_cast<std::uint32_t>(next_module_uid++));
         ++loaded;
     }
-    if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
         std::cerr << "[hle] codec modules ready: " << loaded << " prefix=" << prefix << "\n";
     }
     ctx.set_gpr(2, 0u);
@@ -3034,7 +3063,7 @@ bool preempt_if_higher_priority(psprecomp::AllegrexContext &ctx, const char *rea
     psprecomp::AllegrexContext caller = ctx;
     caller.pc = ctx.gpr[31];
     enqueue_continuation(caller_uid, caller);
-    if (std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr || std::getenv("PSPRECOMP_TRACE") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_SCHED_DIAG") != nullptr || VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
         std::cerr << "[sched] preempt reason=" << reason
                   << " caller=" << caller_uid
                   << " caller_priority=" << thread_priority(caller_uid)
@@ -3110,7 +3139,7 @@ bool activate_next_thread(psprecomp::AllegrexContext &ctx, const char *reason) {
     ctx = continuation.context;
     psprecomp::set_runtime_thread_identity(continuation.uid, thread_name);
 
-    if (std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr || std::getenv("PSPRECOMP_TRACE") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_SCHED_DIAG") != nullptr || VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
         const auto pending = pending_guest_callbacks.find(continuation.uid);
         const auto frames = async_return_frames.find(continuation.uid);
         std::cerr << "[sched] reason=" << reason
@@ -3176,7 +3205,7 @@ bool delay_current_thread(psprecomp::Runtime &runtime, psprecomp::AllegrexContex
     current->second.suspended_context = suspended;
     current->second.delay_until_us = virtual_time_us + delay_microseconds;
     current->second.delay_sequence = thread_table.next_delay_sequence++;
-    if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
         std::cerr << "[sched] delay uid=" << thread_table.current_uid
                   << " usec=" << delay_microseconds
                   << " resume=" << psprecomp::hex32(suspended.pc) << "\n";
@@ -3224,8 +3253,8 @@ bool defer_current_thread_for_io_handoff(psprecomp::Runtime &runtime,
     deferred_io_resumes[worker_uid] =
         DeferredIoResume{thread_table.current_uid, handoff_pc, release_pc, 0u};
     refresh_vcs_post_dispatch_hook();
-    if (std::getenv("PSPRECOMP_UMD_STREAM_DIAG") != nullptr ||
-        std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_UMD_STREAM_DIAG") != nullptr ||
+        VCS_ENV("PSPRECOMP_SCHED_DIAG") != nullptr) {
         std::cerr << "[io-handoff] arm worker=" << worker_uid
                   << " worker_name=" << worker->second.name
                   << " worker_resume=" << psprecomp::hex32(suspended.pc)
@@ -3245,7 +3274,7 @@ bool suspend_current_thread(psprecomp::Runtime &runtime, psprecomp::AllegrexCont
         current->second.state = ThreadState::Sleeping;
         current->second.suspended_context = suspended;
     }
-    if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
         const auto found = thread_table.threads.find(thread_table.current_uid);
         std::cerr << "[sched] block uid=" << thread_table.current_uid
                   << " name=" << (found != thread_table.threads.end() ? found->second.name : "unknown")
@@ -3492,7 +3521,7 @@ const char *ge_command_name(std::uint32_t command) {
 }
 
 bool ge_histogram_diag_enabled() noexcept {
-    static const bool enabled = std::getenv("PSPRECOMP_GE_DIAG") != nullptr;
+    static const bool enabled = VCS_ENV("PSPRECOMP_GE_DIAG") != nullptr;
     return enabled;
 }
 
@@ -3544,7 +3573,7 @@ bool start_next_guest_callback(psprecomp::AllegrexContext &ctx, bool begin_chain
     ctx.set_gpr(6, invocation.a2);
     ctx.set_gpr(31, 0x00000004u);
     ctx.pc = invocation.function;
-    if (std::getenv("PSPRECOMP_GE_DIAG") != nullptr || std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_GE_DIAG") != nullptr || VCS_ENV("PSPRECOMP_SCHED_DIAG") != nullptr) {
         std::cerr << "[callback] start uid=" << uid
                   << " function=" << psprecomp::hex32(invocation.function)
                   << " a0=" << psprecomp::hex32(invocation.a0)
@@ -3561,6 +3590,11 @@ bool maybe_start_pending_guest_callback(psprecomp::AllegrexContext &ctx) {
     if (thread == thread_table.threads.end() || thread->second.state != ThreadState::Running) return false;
     const auto frames = async_return_frames.find(thread_table.current_uid);
     if (frames != async_return_frames.end() && !frames->second.empty()) return false;
+    if (!ge_async_global_callbacks.empty()) {
+        auto &mine = pending_guest_callbacks[thread_table.current_uid];
+        mine.insert(mine.end(), ge_async_global_callbacks.begin(), ge_async_global_callbacks.end());
+        ge_async_global_callbacks.clear();
+    }
     return start_next_guest_callback(ctx, true);
 }
 
@@ -3574,7 +3608,7 @@ void queue_guest_callback_chain(psprecomp::AllegrexContext &ctx,
     if (callbacks.empty()) return;
     auto &pending = pending_guest_callbacks[thread_table.current_uid];
     pending.insert(pending.end(), callbacks.begin(), callbacks.end());
-    if (std::getenv("PSPRECOMP_GE_DIAG") != nullptr || std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_GE_DIAG") != nullptr || VCS_ENV("PSPRECOMP_SCHED_DIAG") != nullptr) {
         std::cerr << "[callback] queued uid=" << thread_table.current_uid
                   << " count=" << callbacks.size()
                   << " total=" << pending.size()
@@ -3613,7 +3647,7 @@ struct PhysicsVcallCensusState {
 PhysicsVcallCensusState physics_vcall_census_state;
 
 bool physics_vcall_census_enabled() {
-    static const bool enabled = std::getenv("PSPRECOMP_PHYSICS_VCALL_CENSUS") != nullptr;
+    static const bool enabled = VCS_ENV("PSPRECOMP_PHYSICS_VCALL_CENSUS") != nullptr;
     return enabled;
 }
 
@@ -3634,7 +3668,7 @@ bool physics_vcall_census_can_emit() {
 }
 
 bool collision_root_probe_enabled() {
-    static const bool enabled = std::getenv("PSPRECOMP_COLLISION_ROOT_PROBE") != nullptr;
+    static const bool enabled = VCS_ENV("PSPRECOMP_COLLISION_ROOT_PROBE") != nullptr;
     return enabled;
 }
 
@@ -3716,7 +3750,7 @@ std::string collision_probe_pointer70_words(psprecomp::Runtime &rt, std::uint32_
 }
 
 bool collision_chain_trace_enabled() {
-    static const bool enabled = std::getenv("PSPRECOMP_COLLISION_CHAIN_TRACE") != nullptr;
+    static const bool enabled = VCS_ENV("PSPRECOMP_COLLISION_CHAIN_TRACE") != nullptr;
     return enabled;
 }
 
@@ -3743,7 +3777,7 @@ std::uint32_t collision_chain_trace_root_end() {
 }
 
 bool collision_point_trace_enabled() {
-    static const bool enabled = std::getenv("PSPRECOMP_COLLISION_POINT_TRACE") != nullptr;
+    static const bool enabled = VCS_ENV("PSPRECOMP_COLLISION_POINT_TRACE") != nullptr;
     return enabled;
 }
 
@@ -4025,8 +4059,8 @@ void vcs_post_dispatch_hook(psprecomp::Runtime &rt, psprecomp::AllegrexContext &
         const auto worker = thread_table.threads.find(worker_uid);
         if (barrier == deferred_io_resumes.end()) continue;
         if (worker != thread_table.threads.end() && worker->second.state == ThreadState::IoDeferred) {
-            if (std::getenv("PSPRECOMP_UMD_STREAM_DIAG") != nullptr ||
-                std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_UMD_STREAM_DIAG") != nullptr ||
+                VCS_ENV("PSPRECOMP_SCHED_DIAG") != nullptr) {
                 std::cerr << "[io-handoff] release worker=" << worker_uid
                           << " handoff_uid=" << barrier->second.handoff_uid
                           << " handoff_pc=" << psprecomp::hex32(barrier->second.handoff_pc)
@@ -4134,7 +4168,7 @@ struct RealtimeSpeedStats {
 RealtimeSpeedStats realtime_speed_stats;
 
 bool realtime_speed_diag_enabled() {
-    static const bool enabled = std::getenv("PSPRECOMP_REALTIME_SPEED_DIAG") != nullptr;
+    static const bool enabled = VCS_ENV("PSPRECOMP_REALTIME_SPEED_DIAG") != nullptr;
     return enabled;
 }
 
@@ -4146,7 +4180,7 @@ std::uint64_t realtime_speed_diag_interval() {
 
 std::uint64_t gpu_dump_vblank() noexcept {
     static const std::uint64_t value = [] {
-        const char *text = std::getenv("PSPRECOMP_GE_GPU_DUMP_VBLANK");
+        const char *text = VCS_ENV("PSPRECOMP_GE_GPU_DUMP_VBLANK");
         if (text == nullptr || *text == '\0') return std::uint64_t{0};
         char *end = nullptr;
         const unsigned long long parsed = std::strtoull(text, &end, 10);
@@ -4157,7 +4191,7 @@ std::uint64_t gpu_dump_vblank() noexcept {
 
 bool gpu_color_preview_enabled() noexcept {
     static const bool enabled = [] {
-        const char *text = std::getenv("PSPRECOMP_GE_GPU_COLOR_PREVIEW");
+        const char *text = VCS_ENV("PSPRECOMP_GE_GPU_COLOR_PREVIEW");
         return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
     }();
     return enabled;
@@ -4190,7 +4224,7 @@ void dump_gpu_internal_frame_if_requested(std::uint64_t vblank) {
     std::vector<std::byte> rgba(frame_bytes);
     if (!ge_gpu_backend_copy_game_frame_rgba(rgba)) return;
     std::filesystem::path output_path;
-    if (const char *path = std::getenv("PSPRECOMP_GE_GPU_DUMP_PATH");
+    if (const char *path = VCS_ENV("PSPRECOMP_GE_GPU_DUMP_PATH");
         path != nullptr && *path != '\0') {
         output_path = path;
     } else {
@@ -4316,18 +4350,18 @@ void report_realtime_speed_if_requested() {
 }
 
 bool frame_time_diag_enabled() {
-    static const bool enabled = std::getenv("PSPRECOMP_FRAME_TIME_DIAG") != nullptr;
+    static const bool enabled = VCS_ENV("PSPRECOMP_FRAME_TIME_DIAG") != nullptr;
     return enabled;
 }
 
 bool ge_phase_diag_line_enabled() {
-    static const bool enabled = std::getenv("PSPRECOMP_GE_PHASE_DIAG") != nullptr;
+    static const bool enabled = VCS_ENV("PSPRECOMP_GE_PHASE_DIAG") != nullptr;
     return enabled;
 }
 
 bool gpu_timing_diag_line_enabled() {
     static const bool enabled = [] {
-        const char *text = std::getenv("PSPRECOMP_GPU_TIMING_DIAG");
+        const char *text = VCS_ENV("PSPRECOMP_GPU_TIMING_DIAG");
         return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
     }();
     return enabled;
@@ -4390,7 +4424,7 @@ void write_diag_line(const std::ostringstream &line) {
 // sleep/catch-up pacing and cannot itself become a source of stutter.
 void limit_frame_rate() {
     static const bool enabled = [] {
-        const char *text = std::getenv("PSPRECOMP_FRAME_LIMIT");
+        const char *text = VCS_ENV("PSPRECOMP_FRAME_LIMIT");
         return text == nullptr || (*text != '\0' && std::strcmp(text, "0") != 0);
     }();
     if (!enabled) return;
@@ -4677,8 +4711,8 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
             // needs only next_vertex/next_index, so leave the diagnostic bookkeeping
             // cold instead of doing min/max/isfinite work on every city vertex.
             static const bool collect_ge_render_stats =
-                std::getenv("PSPRECOMP_GE_RENDER_TRACE") != nullptr ||
-                std::getenv("PSPRECOMP_GE_RENDER_DIAG") != nullptr;
+                VCS_ENV("PSPRECOMP_GE_RENDER_TRACE") != nullptr ||
+                VCS_ENV("PSPRECOMP_GE_RENDER_DIAG") != nullptr;
             GeRenderStats render_stats{};
             std::string render_error;
             if (!render_ge_primitive(runtime.memory(), ge_state.commands, ge_state.transform,
@@ -4696,7 +4730,7 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
             // Read once: this sits on the per-draw-call path, and getenv walks
             // the whole environment block on every call.
             static const bool render_trace_enabled =
-                std::getenv("PSPRECOMP_GE_RENDER_TRACE") != nullptr;
+                VCS_ENV("PSPRECOMP_GE_RENDER_TRACE") != nullptr;
             if (render_trace_enabled) {
                 const std::uint64_t trace_start = parse_environment_u64(
                     "PSPRECOMP_GE_RENDER_TRACE_START_VBLANK");
@@ -4718,7 +4752,7 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
                     render_stats.max_abs_screen_coordinate > 4096.0f ||
                     screen_span_x > 2048.0f || screen_span_y > 2048.0f;
                 const bool suspicious_only =
-                    std::getenv("PSPRECOMP_GE_RENDER_TRACE_SUSPICIOUS_ONLY") != nullptr;
+                    VCS_ENV("PSPRECOMP_GE_RENDER_TRACE_SUSPICIOUS_ONLY") != nullptr;
                 if (in_window && trace_lines < max_lines &&
                     render_stats.pixels_tested >= min_pixels &&
                     (!suspicious_only || suspicious)) {
@@ -4773,7 +4807,7 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
                 }
             }
             static const bool render_diag_enabled =
-                std::getenv("PSPRECOMP_GE_RENDER_DIAG") != nullptr;
+                VCS_ENV("PSPRECOMP_GE_RENDER_DIAG") != nullptr;
             if (render_diag_enabled) {
                 static std::unordered_set<std::uint64_t> reported_signatures;
                 const std::uint64_t signature =
@@ -5045,8 +5079,8 @@ void ge_async_drain_completions() {
     while (!ready.empty()) {
         GeAsyncCompletion completion = std::move(ready.front());
         ready.pop_front();
-        auto &pending = pending_guest_callbacks[completion.submitter_uid];
-        pending.insert(pending.end(), completion.callbacks.begin(), completion.callbacks.end());
+        ge_async_global_callbacks.insert(ge_async_global_callbacks.end(), completion.callbacks.begin(),
+                                         completion.callbacks.end());
     }
 }
 
@@ -5328,7 +5362,7 @@ bool continue_mpeg_ringbuffer_callback(psprecomp::Runtime &runtime,
         runtime.memory().store32(frame.ring_address + 12u, static_cast<std::uint32_t>(packets_available));
     }
 
-    if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_MPEG_DIAG") != nullptr) {
         std::cerr << "[mpeg] ring callback returned=" << callback_result
                   << " total=" << frame.total_packets
                   << " remaining=" << frame.remaining_packets
@@ -5400,7 +5434,7 @@ void vcs_interrupt_return(psprecomp::Runtime &runtime, psprecomp::AllegrexContex
     found->second.pop_back();
     if (found->second.empty()) async_return_frames.erase(found);
 
-    if (std::getenv("PSPRECOMP_GE_DIAG") != nullptr || std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
+    if (VCS_ENV("PSPRECOMP_GE_DIAG") != nullptr || VCS_ENV("PSPRECOMP_SCHED_DIAG") != nullptr) {
         std::cerr << "[async-return] uid=" << uid
                   << " kind=" << (kind == AsyncReturnKind::GeCallbackChain ? "ge" : "subintr")
                   << " resume=" << psprecomp::hex32(ctx.pc) << "\n";
@@ -5426,8 +5460,8 @@ const char *thread_state_name(ThreadState state) {
 }
 
 bool event_diag_matches(const EventFlagRecord &flag) {
-    if (std::getenv("PSPRECOMP_EVENT_DIAG") == nullptr) return false;
-    const char *filter = std::getenv("PSPRECOMP_EVENT_DIAG_FILTER");
+    if (VCS_ENV("PSPRECOMP_EVENT_DIAG") == nullptr) return false;
+    const char *filter = VCS_ENV("PSPRECOMP_EVENT_DIAG_FILTER");
     return filter == nullptr || *filter == '\0' || flag.name.find(filter) != std::string::npos;
 }
 
@@ -5639,7 +5673,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     runtime.register_function(0x08B562D8u, &vcs_sprintf, "vcs_sprintf");
     runtime.register_function(0x088B4FA8u, &vcs_path_hash, "vcs_path_hash");
     runtime.register_function(0x08B1B36Cu, &vcs_load_codec_modules, "vcs_load_codec_modules");
-    if (std::getenv("PSPRECOMP_NO_FAST_DEFLATE") == nullptr)
+    if (VCS_ENV("PSPRECOMP_NO_FAST_DEFLATE") == nullptr)
         runtime.register_function(0x08B648B0u, &vcs_raw_deflate_fast, "vcs_raw_deflate_fast");
     runtime.register_hle("SysMemUserForUser", 0x7591C7DBu,
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
@@ -5676,7 +5710,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const std::int32_t uid = partition_table.next_uid++;
             partition_table.blocks.emplace(uid, PartitionBlock{name, address, aligned_size});
             partition_table.next_address = address + aligned_size;
-            if (std::getenv("PSPRECOMP_PARTITION_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_PARTITION_DIAG") != nullptr) {
                 std::cerr << "[partition] alloc uid=" << uid << " name=\"" << name
                           << "\" addr=" << psprecomp::hex32(address)
                           << " size=" << psprecomp::hex32(aligned_size)
@@ -5697,7 +5731,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             const auto uid = static_cast<std::int32_t>(ctx.gpr[4]);
             const auto it = partition_table.blocks.find(uid);
-            if (std::getenv("PSPRECOMP_PARTITION_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_PARTITION_DIAG") != nullptr) {
                 std::cerr << "[partition] free uid=" << uid;
                 if (it != partition_table.blocks.end()) {
                     std::cerr << " name=\"" << it->second.name << "\" addr="
@@ -5744,7 +5778,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             rt.memory().store32(record.kernel_context + 0xF8u, 0xFFFFFFFFu);
             rt.memory().store32(record.kernel_context + 0xFCu, 0xFFFFFFFFu);
 
-            if (std::getenv("PSPRECOMP_TRACE") != nullptr || std::getenv("PSPRECOMP_THREAD_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_TRACE") != nullptr || VCS_ENV("PSPRECOMP_THREAD_DIAG") != nullptr) {
                 std::cerr << "[sched] create uid=" << uid << " name=" << record.name
                           << " entry=" << psprecomp::hex32(record.entry)
                           << " priority=" << record.priority << " stack=" << record.stack_size
@@ -5806,7 +5840,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
 
             const std::int32_t caller_uid = thread_table.current_uid;
             const std::uint32_t caller_priority = thread_priority(caller_uid);
-            if (std::getenv("PSPRECOMP_TRACE") != nullptr || std::getenv("PSPRECOMP_THREAD_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_TRACE") != nullptr || VCS_ENV("PSPRECOMP_THREAD_DIAG") != nullptr) {
                 std::cerr << "[sched] start uid=" << uid << " name=" << thread.name
                           << " entry=" << psprecomp::hex32(thread.entry)
                           << " priority=" << thread.priority
@@ -5846,7 +5880,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             const bool was_active = found->second.state != ThreadState::Created &&
                                     found->second.state != ThreadState::Completed;
-            if (std::getenv("PSPRECOMP_THREAD_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_THREAD_DIAG") != nullptr) {
                 std::cerr << "[thread] terminate-delete uid=" << uid
                           << " name=" << found->second.name
                           << " active=" << (was_active ? 1 : 0) << "\n";
@@ -5884,7 +5918,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 ctx.set_gpr(2, 0x800201A4u);
                 return;
             }
-            if (std::getenv("PSPRECOMP_THREAD_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_THREAD_DIAG") != nullptr)
                 std::cerr << "[thread] delete uid=" << uid << " name=" << found->second.name << "\n";
             remove_thread_from_wait_queues(uid);
             pending_guest_callbacks.erase(uid);
@@ -5912,7 +5946,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 return;
             }
             ThreadRecord &thread = found->second;
-            if (std::getenv("PSPRECOMP_THREAD_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_THREAD_DIAG") != nullptr) {
                 std::cerr << "[thread] suspend requested=" << uid
                           << " current=" << thread_table.current_uid
                           << " name=" << thread.name << " state=" << static_cast<int>(thread.state)
@@ -5952,7 +5986,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 return;
             }
             ThreadRecord &thread = found->second;
-            if (std::getenv("PSPRECOMP_THREAD_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_THREAD_DIAG") != nullptr) {
                 std::cerr << "[thread] resume requested=" << uid
                           << " current=" << thread_table.current_uid
                           << " name=" << thread.name << " state=" << static_cast<int>(thread.state)
@@ -6000,7 +6034,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
 
             thread.priority = priority;
-            if (std::getenv("PSPRECOMP_THREAD_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_THREAD_DIAG") != nullptr) {
                 std::cerr << "[thread] priority uid=" << uid
                           << " current=" << thread_table.current_uid
                           << " value=" << priority << "\n";
@@ -6118,7 +6152,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 current != thread_table.threads.end()) {
                 current->second.attributes |= attributes;
             }
-            if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
                 std::cerr << "[hle] sceKernelChangeCurrentThreadAttr uid="
                           << thread_table.current_uid << " add=0x" << std::hex
                           << std::uppercase << attributes << std::dec << "\n";
@@ -6154,7 +6188,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (auto current = thread_table.threads.find(thread_table.current_uid);
                 current != thread_table.threads.end()) {
                 current->second.exit_status = ctx.gpr[4];
-                if (std::getenv("PSPRECOMP_THREAD_DIAG") != nullptr)
+                if (VCS_ENV("PSPRECOMP_THREAD_DIAG") != nullptr)
                     std::cerr << "[thread] exit uid=" << thread_table.current_uid
                               << " name=" << current->second.name
                               << " status=" << psprecomp::hex32(ctx.gpr[4]) << "\n";
@@ -6523,7 +6557,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             fixed_pool_table.pools.emplace(uid, FixedPoolRecord{name, address, block_size, block_count,
                 std::vector<bool>(block_count, false)});
             partition_table.next_address = address + reserved;
-            if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
                 std::cerr << "[hle] sceKernelCreateFpl uid=" << uid << " name=" << name
                           << " block=0x" << std::hex << std::uppercase << block_size
                           << " count=" << std::dec << block_count << " base=0x"
@@ -6816,7 +6850,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             };
             const std::int32_t uid = ge_callback_table.next_uid++;
             ge_callback_table.callbacks.emplace(uid, record);
-            if (std::getenv("PSPRECOMP_GE_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_GE_DIAG") != nullptr) {
                 std::cerr << "[ge] callback uid=" << uid
                           << " signal=" << psprecomp::hex32(record.signal_function)
                           << " finish=" << psprecomp::hex32(record.finish_function) << "\n";
@@ -7037,7 +7071,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 return;
             }
             sub_interrupts.emplace(key, SubInterruptRecord{handler, argument, false, false});
-            if (std::getenv("PSPRECOMP_GE_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_GE_DIAG") != nullptr) {
                 std::cerr << "[intr] register int=" << interrupt_number << " sub=" << sub_number
                           << " handler=" << psprecomp::hex32(handler)
                           << " arg=" << psprecomp::hex32(argument) << "\n";
@@ -7099,7 +7133,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             display_state.mode = mode;
             display_state.width = width;
             display_state.height = height;
-            if (std::getenv("PSPRECOMP_DISPLAY_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_DISPLAY_DIAG") != nullptr) {
                 std::cerr << "[display] mode=" << mode << " " << width << "x" << height << "\n";
             }
             set_success(ctx);
@@ -7142,7 +7176,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             display_state.buffer_width = stride;
             display_state.pixel_format = format;
             display_state.sync_mode = sync;
-            if (std::getenv("PSPRECOMP_DISPLAY_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_DISPLAY_DIAG") != nullptr) {
                 std::cerr << "[display] framebuffer=" << psprecomp::hex32(address)
                           << " stride=" << stride << " format=" << format
                           << " sync=" << sync << "\n";
@@ -7359,6 +7393,56 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         {
             // gp+0x1DE0/0x1DE1: hour and minute (confirmed by Project2DFX).
             const std::uint32_t clock_gp = ctx.gpr[28];
+            // Keyboard/mouse and controller prompts follow the device used last.
+            if (vcs_configuration().controls.keyboard_prompts && !vcs::vcs_prompt_patches().empty()) {
+                static std::uint32_t prompt_base = 0u;
+                static int prompt_applied = 0;  // 0 keyboard (as loaded), 1 controller
+                static std::uint64_t prompt_next_scan = 0u;
+                const auto &patches = vcs::vcs_prompt_patches();
+                const auto units_match = [&](std::uint32_t base, const std::u16string &text) {
+                    for (std::size_t i = 0; i < text.size(); ++i)
+                        if (rt.memory().load16(base + static_cast<std::uint32_t>(i * 2u)) != static_cast<std::uint16_t>(text[i])) return false;
+                    return rt.memory().load16(base + static_cast<std::uint32_t>(text.size() * 2u)) == 0u;
+                };
+                if (prompt_base != 0u) {
+                    // The table can be reloaded elsewhere; drop the address if it no longer matches.
+                    const auto &probe = patches[patches.size() / 2u];
+                    const std::u16string &now = prompt_applied != 0 ? probe.pad : probe.keyboard;
+                    if (!units_match(prompt_base + probe.file_offset, now)) prompt_base = 0u;
+                }
+                if (prompt_base == 0u && display_vblank_index >= prompt_next_scan) {
+                    prompt_next_scan = display_vblank_index + 120u;
+                    const std::vector<std::uint8_t> signature = vcs::vcs_prompt_signature();
+                    const vcs::PromptPatch *first = nullptr;
+                    for (const auto &patch : patches) if (patch.keyboard.size() >= 12u) { first = &patch; break; }
+                    constexpr std::uint32_t kScanStart = 0x08800000u, kScanBytes = 0x01800000u;
+                    if (first != nullptr && !signature.empty() && rt.memory().contains(kScanStart, kScanBytes)) {
+                        const std::uint8_t *ram = rt.memory().raw_pointer(kScanStart, kScanBytes);
+                        if (ram != nullptr) {
+                            const std::uint8_t *hit = static_cast<const std::uint8_t *>(
+                                memmem(ram, kScanBytes, signature.data(), signature.size()));
+                            if (hit != nullptr) {
+                                const std::uint32_t candidate = kScanStart + static_cast<std::uint32_t>(hit - ram) - first->file_offset;
+                                // Three more strings from across the table must line up before trusting it.
+                                bool ok = true;
+                                for (const std::size_t k : {patches.size() / 4u, patches.size() / 2u, (patches.size() * 3u) / 4u})
+                                    ok = ok && units_match(candidate + patches[k].file_offset, patches[k].keyboard);
+                                if (ok) { prompt_base = candidate; prompt_applied = 0; }
+                            }
+                        }
+                    }
+                }
+                const int wanted = vcs::vcs_prompt_controller_active() ? 1 : 0;
+                if (prompt_base != 0u && wanted != prompt_applied) {
+                    for (const auto &patch : patches) {
+                        const std::u16string &text = wanted != 0 ? patch.pad : patch.keyboard;
+                        const std::uint32_t at = prompt_base + patch.file_offset;
+                        for (std::uint32_t i = 0u; i < patch.slot_units; ++i)
+                            rt.memory().store16(at + i * 2u, i < text.size() ? static_cast<std::uint16_t>(text[i]) : 0u);
+                    }
+                    prompt_applied = wanted;
+                }
+            }
             if (rt.memory().contains(clock_gp + 0x2098u, 0x140u)) {
                 const auto weather_old = static_cast<std::int16_t>(rt.memory().load16(clock_gp + 0x2098u));
                 const auto weather_new = static_cast<std::int16_t>(rt.memory().load16(clock_gp + 0x20A0u));
@@ -7478,7 +7562,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         current->second.delay_until_us = virtual_time_us + delay;
         current->second.delay_sequence = thread_table.next_delay_sequence++;
         interrupt->second.occurred = true;
-        if (std::getenv("PSPRECOMP_GE_DIAG") != nullptr) {
+        if (VCS_ENV("PSPRECOMP_GE_DIAG") != nullptr) {
             std::cerr << "[intr] schedule vblank uid=" << thread_table.current_uid
                       << " handler=" << psprecomp::hex32(handler.pc)
                       << " resume=" << psprecomp::hex32(resume.pc) << "\n";
@@ -7511,7 +7595,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             savedata_utility = SavedataUtilityState{UtilityStatus::Init, parameter, false};
             rt.memory().store32(parameter + kUtilityCommonResultOffset, 0u);
-            if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
                 std::cerr << "[hle] savedata init mode=" << rt.memory().load32(parameter + kSavedataModeOffset)
                           << " game=" << read_fixed_string(rt.memory(), parameter + kSavedataGameNameOffset, 13u)
                           << " save=" << read_fixed_string(rt.memory(), parameter + kSavedataSaveNameOffset, 20u)
@@ -7533,7 +7617,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 rt.memory().store32(savedata_utility.parameter_address + kUtilityCommonResultOffset, result);
                 savedata_utility.operation_complete = true;
                 savedata_utility.status = UtilityStatus::Quit;
-                if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+                if (VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
                     std::cerr << "[hle] savedata operation result=0x" << std::hex << std::uppercase << result
                               << std::nouppercase << std::dec << "\n";
                 }
@@ -7586,7 +7670,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         if (state.reserved) { ctx.set_gpr(2, 0x80268002u); return; }
         vcs::audio_output_reset_channel(static_cast<std::uint32_t>(channel));
         state = AudioChannelState{true, sample_count, format, 0u, 0u, 0u};
-        if (std::getenv("PSPRECOMP_AUDIO_DIAG") != nullptr)
+        if (VCS_ENV("PSPRECOMP_AUDIO_DIAG") != nullptr)
             std::cerr << "[audio] reserve channel=" << channel << " samples=" << sample_count
                       << " format=" << format << "\n";
         ctx.set_gpr(2, static_cast<std::uint32_t>(channel));
@@ -7684,7 +7768,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         // which is exactly when this one starts.
         const std::uint64_t wait_us =
             start_us > virtual_time_us ? start_us - virtual_time_us : 0u;
-        if (std::getenv("PSPRECOMP_AUDIO_DIAG") != nullptr)
+        if (VCS_ENV("PSPRECOMP_AUDIO_DIAG") != nullptr)
             std::cerr << "[audio] output channel=" << channel << " samples=" << state.sample_count
                       << " blocking=" << blocking << " start_us=" << start_us
                       << " wait_us=" << wait_us << "\n";
@@ -7722,7 +7806,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (state.reserved) { ctx.set_gpr(2, 0x80268002u); return; }
             vcs::audio_output_reset_channel(8u);
             state = AudioChannelState{true, samples, 0u, 0u, 0u, 0u};
-            if (std::getenv("PSPRECOMP_AUDIO_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_AUDIO_DIAG") != nullptr)
                 std::cerr << "[audio] output2 reserve samples=" << samples << "\n";
             set_success(ctx);
         });
@@ -7742,7 +7826,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             // 0 means "keep the current rate" on hardware; 44100 is the default.
             state.frequency = frequency == 0u ? 44100u : frequency;
             state.channel_count = channel_count == 1u ? 1u : 2u;
-            if (std::getenv("PSPRECOMP_AUDIO_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_AUDIO_DIAG") != nullptr)
                 std::cerr << "[audio] src reserve samples=" << samples
                           << " freq=" << state.frequency
                           << " channels=" << state.channel_count << "\n";
@@ -7774,7 +7858,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             // bulletin at half rate: the dragging, slowed-down audio.
             const std::uint32_t effective_channels = 2u;
             if (state.channel_count != effective_channels &&
-                std::getenv("PSPRECOMP_AUDIO_DIAG") != nullptr) {
+                VCS_ENV("PSPRECOMP_AUDIO_DIAG") != nullptr) {
                 static bool once = false;
                 if (!once) {
                     once = true;
@@ -7802,7 +7886,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             const std::uint64_t wait_us =
                 start_us > virtual_time_us ? start_us - virtual_time_us : 0u;
-            if (std::getenv("PSPRECOMP_AUDIO_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_AUDIO_DIAG") != nullptr)
                 std::cerr << "[audio] output2 samples=" << state.sample_count
                           << " channels=" << state.channel_count
                           << " freq=" << state.frequency
@@ -7816,7 +7900,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             // scheduling bottleneck upstream of all the guest-clock pacing
             // logic -- this is the one measurement that would show it
             // directly, with nothing else able to hide or explain it away.
-            if (std::getenv("PSPRECOMP_SRC_REALTIME_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_SRC_REALTIME_DIAG") != nullptr) {
                 static std::chrono::steady_clock::time_point first_call{};
                 static bool anchored = false;
                 static std::uint64_t submitted_samples = 0u;
@@ -7895,7 +7979,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             state.next_file_offset = std::min(read_size, parsed.file_size);
             state.write_offset = buffer_size == 0u ? 0u : read_size % buffer_size;
             state.source_path = identify_atrac_source(header_bytes, parsed);
-            if (std::getenv("PSPRECOMP_ATRAC_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_ATRAC_DIAG") != nullptr) {
                 std::cerr << "[atrac] set-halfway id=" << id
                           << " buffer=" << psprecomp::hex32(buffer)
                           << " read=" << read_size << " capacity=" << buffer_size
@@ -7990,7 +8074,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 // station back to the music. loop_num survives in a reused
                 // context, so the bulletin inherited the music's loop.
                 if (state->header.loop_start < 0) {
-                    if (std::getenv("PSPRECOMP_ATRAC_DIAG") != nullptr)
+                    if (VCS_ENV("PSPRECOMP_ATRAC_DIAG") != nullptr)
                         std::cerr << "[atrac] fim de stream sem regiao de loop: "
                                   << state->source_path.filename().string()
                                   << " (loop_num=" << state->loop_num
@@ -8024,7 +8108,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (pcm.size() < pcm_bytes) pcm.resize(pcm_bytes);
             const std::span<std::uint8_t> pcm_span(pcm.data(), pcm_bytes);
             static const bool audio_summary_enabled = [] {
-                const char *text = std::getenv("PSPRECOMP_AUDIO_SUMMARY");
+                const char *text = VCS_ENV("PSPRECOMP_AUDIO_SUMMARY");
                 return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
             }();
             const auto decode_started = audio_summary_enabled
@@ -8065,7 +8149,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (samples_addr != 0u) rt.memory().store32(samples_addr, samples);
             if (finish_addr != 0u) rt.memory().store32(finish_addr, finished ? 1u : 0u);
             if (remain_addr != 0u) rt.memory().store32(remain_addr, remaining_frames);
-            if (std::getenv("PSPRECOMP_ATRAC_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_ATRAC_DIAG") != nullptr) {
                 std::cerr << "[atrac] decode id=" << ctx.gpr[4] << " samples=" << samples
                           << " stream_channels=" << state->header.channels
                           << " stream_rate=" << state->header.sample_rate
@@ -8678,7 +8762,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             state->second.header = header;
             state->second.analyzed = true;
             rt.memory().store32(output, header.stream_offset);
-            if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_MPEG_DIAG") != nullptr) {
                 std::cerr << "[mpeg] PSMF version=" << std::string(bytes.begin() + 4, bytes.begin() + 8)
                           << " offset=" << header.stream_offset << " size=" << header.stream_size
                           << " dimensions=" << header.width << "x" << header.height
@@ -8717,7 +8801,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             }
             const std::uint32_t stream_id = next_mpeg_stream_id++;
             state->second.streams.emplace(stream_id, MpegStreamState{ctx.gpr[5], ctx.gpr[6], true});
-            if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_MPEG_DIAG") != nullptr)
                 std::cerr << "[mpeg] register stream id=" << stream_id << " type=" << ctx.gpr[5]
                           << " number=" << ctx.gpr[6] << "\n";
             ctx.set_gpr(2, stream_id);
@@ -8843,7 +8927,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const std::uint64_t pts = state->second.header.first_timestamp +
                 static_cast<std::uint64_t>(state->second.audio_au_count) * 4180u;
             write_mpeg_timestamp(rt.memory(), au, pts);
-            if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr && state->second.audio_au_count <= 3u)
+            if (VCS_ENV("PSPRECOMP_MPEG_DIAG") != nullptr && state->second.audio_au_count <= 3u)
                 std::cerr << "[mpeg] ATRAC decode bytes=" << decoded
                           << " pts=" << pts
                           << " output=" << psprecomp::hex32(output) << "\n";
@@ -8901,7 +8985,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 const std::uint32_t used = rt.memory().load32(ring + 12u);
                 rt.memory().store32(ring + 12u, used > consume ? used - consume : 0u);
             }
-            if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr &&
+            if (VCS_ENV("PSPRECOMP_MPEG_DIAG") != nullptr &&
                 (state->second.decoded_video_frames <= 3u || state->second.decoded_video_frames % 30u == 0u)) {
                 std::cerr << "[mpeg] decoded frame=" << state->second.decoded_video_frames
                           << " destination=" << psprecomp::hex32(destination)
@@ -8930,7 +9014,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 return;
             }
             rt.memory().store32(status_pointer, 0u);
-            if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_MPEG_DIAG") != nullptr)
                 std::cerr << "[mpeg] AVC decode stop: no pending frame\n";
             set_success(ctx);
         });
@@ -8964,7 +9048,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (attributes != 0u && rt.memory().contains(attributes, 4u)) rt.memory().store32(attributes, 0u);
             stream->second.needs_reset = false;
             ++state->second.audio_au_count;
-            if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_MPEG_DIAG") != nullptr)
                 std::cerr << "[mpeg] ATRAC AU stream=" << ctx.gpr[5] << " pts=" << pts
                           << " used_packets=" << rt.memory().load32(ring + 12u) << "\n";
             set_success(ctx);
@@ -8999,7 +9083,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if (attributes != 0u && rt.memory().contains(attributes, 4u)) rt.memory().store32(attributes, 1u);
             stream->second.needs_reset = false;
             ++state->second.video_au_count;
-            if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_MPEG_DIAG") != nullptr)
                 std::cerr << "[mpeg] AVC AU stream=" << ctx.gpr[5] << " pts=" << pts << " dts=" << dts
                           << " used_packets=" << rt.memory().load32(ring + 12u) << "\n";
             set_success(ctx);
@@ -9038,7 +9122,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             ctx.set_gpr(6, callback_argument);
             ctx.set_gpr(31, 0x00000004u);
             ctx.pc = callback;
-            if (std::getenv("PSPRECOMP_MPEG_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_MPEG_DIAG") != nullptr) {
                 std::cerr << "[mpeg] ring put ring=" << psprecomp::hex32(ring)
                           << " callback=" << psprecomp::hex32(callback)
                           << " data=" << psprecomp::hex32(ctx.gpr[4])
@@ -9093,13 +9177,13 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             const auto fd = static_cast<std::int32_t>(ctx.gpr[4]);
             if (!file_table.files.contains(fd) && !file_table.synthetic_empty_files.contains(fd)) {
-                if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr)
+                if (VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr)
                     std::cerr << "[module] sceKernelLoadModuleByID rejected fd=" << fd << "\n";
                 ctx.set_gpr(2, 0x80010009u);
                 return;
             }
             const std::int32_t uid = next_module_uid++;
-            if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr)
                 std::cerr << "[module] sceKernelLoadModuleByID fd=" << fd << " -> uid=" << uid << "\n";
             loaded_modules.emplace(uid, false);
             ctx.set_gpr(2, static_cast<std::uint32_t>(uid));
@@ -9117,7 +9201,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const std::uint32_t status = ctx.gpr[7];
             if (status != 0u && rt.memory().contains(status, 4u)) rt.memory().store32(status, 0u);
             found->second = true;
-            if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr)
                 std::cerr << "[module] sceKernelStartModule uid=" << uid << " status=0\n";
             ctx.set_gpr(2, static_cast<std::uint32_t>(uid));
         });
@@ -9187,7 +9271,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 set_success(ctx);
                 return;
             }
-            if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
                 std::cerr << "[hle] unsupported sceIoDevctl device=" << device
                           << " cmd=0x" << std::hex << std::uppercase << command
                           << " in=0x" << input << "/" << std::dec << input_length
@@ -9241,7 +9325,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     rt.memory().store32(dirent + 8u, static_cast<std::uint32_t>(disc_file->size));
                     rt.memory().store32(dirent + 12u, static_cast<std::uint32_t>(disc_file->size >> 32u));
                     rt.memory().store32(dirent + 0x40u, disc_file->start_sector);
-                    if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr) {
+                    if (VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr) {
                         std::cerr << "[io] sceIoDread file=\"" << entry.path().filename().string()
                                   << "\" sector=" << disc_file->start_sector
                                   << " size=" << disc_file->size << "\n";
@@ -9464,7 +9548,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const auto native = rt.translate_path(path);
             std::ios::openmode mode = std::ios::binary;
             const std::uint32_t flags = ctx.gpr[5];
-            const bool file_object_diag = std::getenv("PSPRECOMP_FILE_OBJECT_DIAG") != nullptr;
+            const bool file_object_diag = VCS_ENV("PSPRECOMP_FILE_OBJECT_DIAG") != nullptr;
 
             // The PSP accepts pseudo paths such as
             // disc0:/sce_lbn0x0_size0x000 for raw UMD ranges.  VCS uses the
@@ -9495,7 +9579,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                             if (stream) {
                                 const auto fd = file_table.next_fd++;
                                 file_table.files.emplace(fd, std::move(stream));
-                                if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr) {
+                                if (VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr) {
                                     std::cerr << "[io] raw UMD open lbn=" << raw_lbn
                                               << " size=" << raw_size
                                               << " native=\"" << disc_file->native_path.string() << "\"\n";
@@ -9510,14 +9594,14 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                         if (raw_size <= virtual_disc_size && base_offset <= virtual_disc_size - raw_size) {
                             const auto fd = file_table.next_fd++;
                             file_table.virtual_disc_handles.emplace(fd, VirtualDiscHandle{base_offset, raw_size, 0u});
-                            if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr) {
+                            if (VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr) {
                                 std::cerr << "[io] virtual UMD range fd=" << fd << " lbn=" << raw_lbn
                                           << " size=" << raw_size << " disc_size=" << virtual_disc_size << "\n";
                             }
                             ctx.set_gpr(2, static_cast<std::uint32_t>(fd));
                             return;
                         }
-                        if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr) {
+                        if (VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr) {
                             std::cerr << "[io] unresolved raw UMD open lbn=" << raw_lbn
                                       << " size=" << raw_size << " path=\"" << path << "\"\n";
                         }
@@ -9528,7 +9612,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             if ((flags & 0x0002u) != 0u) mode |= std::ios::out;
             std::fstream stream(native, mode);
             if (!stream) {
-                if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr) {
+                if (VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr) {
                     static std::unordered_set<std::string> reported_paths;
                     if (reported_paths.insert(path).second) {
                         std::cerr << "[io] sceIoOpen failed psp=\"" << path
@@ -9580,13 +9664,13 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 virtual_handle->second.position = static_cast<std::uint64_t>(position);
                 ctx.set_gpr(2, static_cast<std::uint32_t>(position));
                 ctx.set_gpr(3, static_cast<std::uint32_t>(static_cast<std::uint64_t>(position) >> 32u));
-                if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr)
+                if (VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr)
                     std::cerr << "[io] sceIoLseek virtual fd=" << fd << " -> " << position << "\n";
                 return;
             }
             const auto it = file_table.files.find(fd);
             if (it == file_table.files.end() || whence < 0 || whence > 2) {
-                if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr) {
+                if (VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr) {
                     std::cerr << "[io] sceIoLseek rejected fd=" << fd << " offset=" << offset
                               << " whence=" << whence << " open=" << (it != file_table.files.end()) << "\n";
                 }
@@ -9613,7 +9697,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const auto result = static_cast<std::uint64_t>(position);
             ctx.set_gpr(2, static_cast<std::uint32_t>(result));
             ctx.set_gpr(3, static_cast<std::uint32_t>(result >> 32u));
-            if (std::getenv("PSPRECOMP_IO_DIAG") != nullptr) {
+            if (VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr) {
                 std::cerr << "[io] sceIoLseek fd=" << fd << " offset=" << offset
                           << " whence=" << whence << " -> " << position << "\n";
             }
@@ -9668,7 +9752,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             const bool closed = file_table.files.erase(fd) == 1u ||
                 file_table.synthetic_empty_files.erase(fd) == 1u ||
                 file_table.virtual_disc_handles.erase(fd) == 1u;
-            if (std::getenv("PSPRECOMP_FILE_OBJECT_DIAG") != nullptr)
+            if (VCS_ENV("PSPRECOMP_FILE_OBJECT_DIAG") != nullptr)
                 std::cerr << "[fileobj-hle] close fd=" << fd << " closed=" << closed << "\n";
             ctx.set_gpr(2, closed ? 0u : 0x80010009u);
         });
@@ -9703,8 +9787,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     virtual_handle->second,
                     std::span<std::uint8_t>(guest_destination, static_cast<std::size_t>(size)));
                 if (time_io) io_host_time_this_vblank += std::chrono::steady_clock::now() - io_entry;
-                static const bool io_diag = std::getenv("PSPRECOMP_IO_DIAG") != nullptr;
-                static const bool umd_stream_diag = std::getenv("PSPRECOMP_UMD_STREAM_DIAG") != nullptr;
+                static const bool io_diag = VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr;
+                static const bool umd_stream_diag = VCS_ENV("PSPRECOMP_UMD_STREAM_DIAG") != nullptr;
                 if (io_diag)
                     std::cerr << "[io] sceIoRead virtual fd=" << fd << " size=" << size << " -> " << read << "\n";
                 if (umd_stream_diag &&

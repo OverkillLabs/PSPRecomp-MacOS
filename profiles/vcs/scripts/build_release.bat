@@ -37,6 +37,14 @@ echo Link: host/core LTCG only ^| generated AOT /GL- ^| LTCG status visible
 echo Build dir preserved: %BUILD%
 echo ================================================================
 
+if not defined VULKAN_SDK (
+  echo.
+  echo WARNING: VULKAN_SDK is not set. Without the Vulkan SDK this build falls back to the
+  echo          DirectX 12 backend, which does NOT include the graphics stack, the texture
+  echo          pack support or the performance work. Install the SDK from
+  echo          https://vulkan.lunarg.com/ ^(it sets VULKAN_SDK^) and run this again.
+  echo.
+)
 echo [1/7] Configuring without deleting existing objects...
 "%CMAKE_EXE%" -S "%REPO%" -B "%BUILD%" -G "Visual Studio 17 2022" -A x64 ^
   -DPSPRECOMP_PROFILE=vcs ^

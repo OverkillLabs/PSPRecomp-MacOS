@@ -120,25 +120,55 @@ endif()
         # Clang/GCC). Confirmed building fine at Release's normal level;
         # removed rather than kept as a stale, unexplained downgrade.
 
-# The DX12 backend is Windows-only (its non-Windows branch is a stub that
-# always reports Software active); everywhere else, the default is the
-# MoltenVK/Vulkan backend instead so the two never fight over the same
-# symbols. PSPRECOMP_VCS_WIN32_VULKAN opts a Windows build into the same
-# Vulkan backend used on macOS/Linux instead of DX12 -- default OFF so the
-# existing, proven Windows/DX12 build is completely unaffected unless this is
-# explicitly turned on. The Vulkan backend source and GLSL shaders are
-# already fully cross-platform (ge_gpu_backend_vulkan.cpp, psp_ge.vert/frag);
-# what a Windows+Vulkan build has not had live-tested yet is specifically its
-# win32 surface/swapchain creation path -- see that file's surface-creation
-# function first if a Windows+Vulkan build doesn't come up.
-option(PSPRECOMP_VCS_WIN32_VULKAN
-    "On Windows, build the Vulkan GE backend instead of DX12" OFF)
-if(WIN32 AND NOT PSPRECOMP_VCS_WIN32_VULKAN)
+# Graphics backend and platform layer are chosen automatically from the machine doing the build:
+#
+#   macOS    -> Vulkan (MoltenVK) + platform/macos
+#   Windows  -> Vulkan + platform/windows when the Vulkan SDK (glslc) is installed, because that is
+#               the backend that carries the whole graphics stack, texture pack and performance
+#               work; otherwise DirectX 12 (the older, smaller backend) so a build never fails just
+#               for lack of the SDK
+#   other    -> Vulkan + platform/generic (CPU readback present)
+#
+# PSPRECOMP_VCS_GE_BACKEND=VULKAN or DX12 overrides the choice on Windows.
+# (PSPRECOMP_VCS_WIN32_VULKAN=ON is still accepted and means VULKAN.)
+set(PSPRECOMP_VCS_GE_BACKEND "AUTO" CACHE STRING
+    "GE backend: AUTO, VULKAN or DX12 (DX12 only exists on Windows)")
+set_property(CACHE PSPRECOMP_VCS_GE_BACKEND PROPERTY STRINGS AUTO VULKAN DX12)
+if(PSPRECOMP_VCS_WIN32_VULKAN)
+    set(PSPRECOMP_VCS_GE_BACKEND "VULKAN")
+endif()
+if(NOT WIN32)
+    set(VCS_BACKEND_CHOICE "VULKAN")
+elseif(PSPRECOMP_VCS_GE_BACKEND STREQUAL "DX12" OR PSPRECOMP_VCS_GE_BACKEND STREQUAL "VULKAN")
+    set(VCS_BACKEND_CHOICE "${PSPRECOMP_VCS_GE_BACKEND}")
+else()
+    find_package(Vulkan QUIET)
+    find_program(VCS_GLSLC_PROBE NAMES glslc HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
+    if(Vulkan_FOUND AND VCS_GLSLC_PROBE)
+        set(VCS_BACKEND_CHOICE "VULKAN")
+    else()
+        set(VCS_BACKEND_CHOICE "DX12")
+        message(WARNING "Vulkan SDK (with glslc) not found: building the DirectX 12 backend, which "
+                "does NOT include the graphics stack or texture pack. Install the Vulkan SDK "
+                "(https://vulkan.lunarg.com/) and reconfigure for the full build.")
+    endif()
+endif()
+message(STATUS "VCS graphics backend: ${VCS_BACKEND_CHOICE}")
+
+if(VCS_BACKEND_CHOICE STREQUAL "DX12")
     set(VCS_GPU_BACKEND_SOURCE host/ge_gpu_backend_dx12.cpp)
     set(VCS_USE_VULKAN_BACKEND FALSE)
 else()
     set(VCS_GPU_BACKEND_SOURCE host/ge_gpu_backend_vulkan.cpp)
     set(VCS_USE_VULKAN_BACKEND TRUE)
+    # The Vulkan backend is platform-neutral; exactly one platform layer is compiled with it.
+    if(APPLE)
+        set(VCS_VULKAN_PLATFORM_SOURCE platform/macos/vulkan_platform_metal.cpp)
+    elseif(WIN32)
+        set(VCS_VULKAN_PLATFORM_SOURCE platform/windows/vulkan_platform_win32.cpp)
+    else()
+        set(VCS_VULKAN_PLATFORM_SOURCE platform/generic/vulkan_platform_stub.cpp)
+    endif()
     find_package(Vulkan REQUIRED)
 
     # GLSL -> SPIR-V -> C header, compiled at build time. glslc ships with the
@@ -217,16 +247,26 @@ else()
     endforeach()
     add_custom_target(vcs_ge_shaders DEPENDS ${VCS_SHADER_HEADERS})
 endif()
+# Each platform has its own window/input/present layer (and, with Vulkan, its own surface layer).
+# Exactly one is compiled, chosen by the machine doing the build.
+if(WIN32)
+    set(VCS_DISPLAY_WINDOW_SOURCE platform/windows/display_window_win32.cpp)
+elseif(APPLE)
+    set(VCS_DISPLAY_WINDOW_SOURCE platform/macos/display_window_sdl.cpp)
+else()
+    set(VCS_DISPLAY_WINDOW_SOURCE platform/generic/display_window_stub.cpp)
+endif()
 set(VCS_HDR_POST_SOURCE host/vcs_hdr_post_dx12_stub.cpp)
 set(VCS_HOST_SOURCES
     host/vcs_bootstrap_paths.cpp
     host/vcs_profile.cpp
     host/vcs_native_fast_paths.cpp
     host/framebuffer_capture.cpp
-    host/display_window.cpp
+    ${VCS_DISPLAY_WINDOW_SOURCE}
     host/audio_output.cpp
     host/vcs_config.cpp
     host/vcs_texture_replace.cpp
+    host/vcs_key_prompts.cpp
     host/vcs_camera_input.cpp
     host/vcs_vehicle_input.cpp
     host/vcs_fps_overlay.cpp
@@ -238,13 +278,14 @@ set(VCS_HOST_SOURCES
     ${VCS_HDR_POST_SOURCE}
     host/ge_renderer.cpp
     ${VCS_GPU_BACKEND_SOURCE}
+    ${VCS_VULKAN_PLATFORM_SOURCE}
     host/dx12_presenter.cpp
 )
 if(APPLE)
     # Objective-C++: lets Metal HUD report the game's real internal render
     # resolution instead of the display's, by setting the SDL-created
     # CAMetalLayer's drawableSize explicitly. See metal_drawable_size.h.
-    list(APPEND VCS_HOST_SOURCES host/metal_drawable_size.mm)
+    list(APPEND VCS_HOST_SOURCES platform/macos/metal_drawable_size.mm)
 endif()
 
 function(vcs_target_common target)
@@ -253,6 +294,9 @@ function(vcs_target_common target)
         "${VCS_PROFILE_DIR}/generated"
         "${VCS_PROFILE_DIR}/third_party/ffmpeg/include")
     target_link_libraries(${target} PRIVATE psprecomp_core ${CMAKE_DL_LIBS})
+    if(APPLE)
+        target_include_directories(${target} PRIVATE "${VCS_PROFILE_DIR}/platform/macos")
+    endif()
     # Link whichever GE backend was actually selected above (VCS_USE_VULKAN_BACKEND),
     # not just "not Windows" -- PSPRECOMP_VCS_WIN32_VULKAN can select Vulkan on
     # Windows too, and DX12 libs must not be linked in that case (nothing in

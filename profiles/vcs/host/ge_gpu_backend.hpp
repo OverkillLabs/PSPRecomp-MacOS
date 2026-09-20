@@ -602,6 +602,11 @@ void ge_gpu_backend_accumulate_hardware_triangles(
 // directly without routing pixels back through the CPU presenter.
 void ge_gpu_backend_set_native_window(void *native_window) noexcept;
 
+// True when this build's GPU backend is the Vulkan one (false for DirectX 12). Lets shared code
+// choose defaults that were only validated with one backend, without a compile-time flag that
+// would force every generated unit to rebuild.
+[[nodiscard]] bool ge_gpu_backend_is_vulkan() noexcept;
+
 // Publishes the framebuffer address the guest is currently displaying
 // (sceDisplaySetFrameBuf). The frame assembler needs it to tell the displayed
 // surface apart from the offscreen render targets VCS also draws into, which

@@ -3594,6 +3594,8 @@ bool ge_gpu_backend_accumulate_hardware_packed_0115(
     }
 }
 
+bool ge_gpu_backend_is_vulkan() noexcept { return false; }
+
 void ge_gpu_backend_set_native_window(void *native_window) noexcept {
     Dx12GeState &s = state();
     const HWND window = static_cast<HWND>(native_window);
@@ -4252,6 +4254,7 @@ void ge_gpu_backend_accumulate_color_triangles(const GeGpuDrawDescriptor &, std:
 void ge_gpu_backend_accumulate_hardware_triangles(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::span<const GeGpuVertex>, std::span<const std::uint32_t>) noexcept {}
 bool ge_gpu_backend_accumulate_hardware_packed_0115(const GeGpuDrawDescriptor &, const GeGpuHardwareTransform &, std::span<const std::byte>, std::uint32_t, std::span<const std::uint32_t>) noexcept { return false; }
 void ge_gpu_backend_set_native_window(void *) noexcept {}
+bool ge_gpu_backend_is_vulkan() noexcept { return false; }
 void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept { state().display_framebuffer = address & 0x001FFFF0u; }
 bool ge_gpu_backend_finish_color_frame(std::uint64_t) noexcept { return false; }
 bool ge_gpu_backend_copy_game_frame_rgba(std::span<std::byte>) noexcept { return false; }

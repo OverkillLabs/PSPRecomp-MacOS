@@ -4,6 +4,7 @@
 #include "display_window.hpp"
 #include "dx12_presenter.hpp"
 #include "ge_gpu_backend.hpp"
+#include "vcs_camera_input.hpp"
 #include "vcs_config.hpp"
 #include "vcs_env.hpp"
 #include "vcs_key_prompts.hpp"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -28,6 +30,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <timeapi.h>
 
 #include <chrono>
 #include <condition_variable>
@@ -141,6 +144,7 @@ struct WindowState {
     // the pointer reaches the edge of a 3440-wide monitor is unusable.
     std::atomic<std::int32_t> mouse_dx{0};
     std::atomic<std::int32_t> mouse_dy{0};
+    std::atomic<std::uint32_t> raw_mouse_events{0};  // WM_INPUT mouse packets seen (PSPRECOMP_INPUT_DIAG)
     std::atomic<std::int32_t> wheel{0};
     // Set while a movie is on screen; see display_window_set_aspect_lock.
     // Atomic because the guest thread raises it and the window thread paints.
@@ -295,6 +299,54 @@ void release_cursor_clip() {
     window_state().mouse_captured = false;
 }
 
+// The clip is set on focus and geometry events, but anything else may clear it afterwards (an overlay,
+// another program calling ClipCursor, a display change, a focus event that arrived before the window had
+// its final size), and then the hidden cursor drifts onto another monitor and the next click lands there.
+// So it is checked against what it should be whenever the window is the foreground one, and put back if
+// it differs. Cheap: one GetClipCursor per call.
+void ensure_cursor_clip(HWND window) {
+    WindowState &state = window_state();
+    if (GetForegroundWindow() != window || IsIconic(window)) {
+        if (state.mouse_captured && GetForegroundWindow() != window) {
+            state.focused.store(false, std::memory_order_relaxed);
+            release_cursor_clip();
+        }
+        return;
+    }
+    RECT client_rect{};
+    if (!GetClientRect(window, &client_rect)) return;
+    POINT top_left{client_rect.left, client_rect.top};
+    POINT bottom_right{client_rect.right, client_rect.bottom};
+    ClientToScreen(window, &top_left);
+    ClientToScreen(window, &bottom_right);
+    const RECT wanted{top_left.x, top_left.y, bottom_right.x, bottom_right.y};
+    RECT current{};
+    if (!GetClipCursor(&current) || !EqualRect(&current, &wanted)) {
+        ClipCursor(&wanted);
+        state.mouse_captured = true;
+    }
+    state.focused.store(true, std::memory_order_relaxed);
+}
+
+// Tells the widescreen code (the guest's projection and the interface correction) how big the game
+// picture really is on screen: the whole client area when it is stretched, the letterboxed rectangle
+// when its proportions are kept. Called on creation and on every resize, so an ultrawide monitor, a
+// custom window size or a window dragged to any shape all get a projection and an interface that match.
+void publish_output_surface(HWND window) {
+    RECT client{};
+    if (!GetClientRect(window, &client)) return;
+    const auto width = static_cast<std::uint32_t>(std::max(0L, client.right - client.left));
+    const auto height = static_cast<std::uint32_t>(std::max(0L, client.bottom - client.top));
+    if (width == 0u || height == 0u) return;  // minimised: keep the last real size
+    const WindowState &state = window_state();
+    const InternalResolutionDimensions source = resolve_internal_resolution(vcs_configuration().rendering);
+    const PresentationRectangle picture = calculate_presentation_rectangle(
+        width, height, source.width, source.height, state.configuration.aspect_mode,
+        state.configuration.integer_scale);
+    publish_live_display_surface(static_cast<std::uint32_t>(std::max(1, picture.width)),
+                                 static_cast<std::uint32_t>(std::max(1, picture.height)));
+}
+
 LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     WindowState &state = window_state();
     switch (message) {
@@ -315,6 +367,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wparam, LPAR
         return 0;
     case WM_MOVE:
     case WM_SIZE:
+        if (message == WM_SIZE && wparam != SIZE_MINIMIZED) publish_output_surface(window);
         // Re-clip only while focused: an unfocused/background window
         // re-clipping here would fight whatever window the user actually
         // has focused right now.
@@ -339,6 +392,12 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wparam, LPAR
                     (raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
                     state.mouse_dx.fetch_add(raw->data.mouse.lLastX, std::memory_order_relaxed);
                     state.mouse_dy.fetch_add(raw->data.mouse.lLastY, std::memory_order_relaxed);
+                    // Straight into the camera's accumulator, as it arrives: the camera converts it
+                    // once per frame, when the game reads the axis, so no motion depends on which
+                    // controller poll happens to see it.
+                    vcs_camera_add_mouse_motion(raw->data.mouse.lLastX, raw->data.mouse.lLastY);
+                    state.raw_mouse_events.fetch_add(1u, std::memory_order_relaxed);
+                    ensure_cursor_clip(window);
                 }
             }
         }
@@ -363,12 +422,13 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wparam, LPAR
         return 1;
     case WM_TIMER: {
         if (wparam != kStatusTimer) break;
-        std::wstring title = L"VCSNative — GTA: Vice City Stories — ";
+        ensure_cursor_clip(window);
+        std::wstring title = L"VCSNative \u2014 GTA: Vice City Stories \u2014 ";
         {
             std::lock_guard<std::mutex> guard(state.mutex);
             title.append(state.status.begin(), state.status.end());
         }
-        title += L" — ";
+        title += L" \u2014 ";
         title += std::to_wstring(state.client_width);
         title += L"x";
         title += std::to_wstring(state.client_height);
@@ -380,6 +440,12 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wparam, LPAR
     case WM_PAINT: {
         PAINTSTRUCT paint{};
         HDC window_context = BeginPaint(window, &paint);
+        // A Vulkan swapchain owns the window: a GDI fill or blit here would fight the presentation
+        // engine (black or flickering frames). Validate the region and leave the image alone.
+        if (ge_gpu_backend_owns_window()) {
+            EndPaint(window, &paint);
+            return 0;
+        }
         RECT client{};
         GetClientRect(window, &client);
         // Once DirectX 12 owns presentation there is no GDI back buffer to
@@ -513,7 +579,7 @@ void window_thread_main() {
         window_y = static_cast<int>(work.top);
     }
     const HWND window = CreateWindowExW(
-        0, window_class.lpszClassName, L"VCSNative — GTA: Vice City Stories",
+        0, window_class.lpszClassName, L"VCSNative \u2014 GTA: Vice City Stories",
         style, window_x, window_y,
         bounds.right - bounds.left, bounds.bottom - bounds.top,
         nullptr, nullptr, instance, nullptr);
@@ -525,16 +591,19 @@ void window_thread_main() {
     state.ready_signal.notify_all();
     if (window == nullptr) return;
 
+    publish_output_surface(window);
     ShowWindow(window, SW_SHOW);
     UpdateWindow(window);
     SetForegroundWindow(window);
     state.focused.store(true, std::memory_order_relaxed);
+    clip_cursor_to_window(window);
     SetTimer(window, kStatusTimer, 250u, nullptr);
 
     // Raw mouse input for the camera. Registered on this window rather than
     // with RIDEV_INPUTSINK, so the game stops turning when you tab away.
     const RAWINPUTDEVICE mouse{0x01u, 0x02u, 0u, window};
-    RegisterRawInputDevices(&mouse, 1u, sizeof(mouse));
+    if (!RegisterRawInputDevices(&mouse, 1u, sizeof(mouse)) && VCS_ENV("PSPRECOMP_INPUT_DIAG") != nullptr)
+        std::cerr << "[input] RegisterRawInputDevices failed, error " << GetLastError() << "\n";
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -560,6 +629,56 @@ void ensure_window_started() {
 
 } // namespace
 
+// Power and scheduling hygiene for a real-time game process. Every call is best effort and none of
+// them is allowed to fail the start: an older Windows simply lacks some of them.
+void configure_process_scheduling() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    // Opt out of power throttling (EcoQoS). Windows 11 can otherwise classify the process as
+    // background work and park its hot threads on efficiency cores or clock them down, which shows up
+    // as sporadic long frames on laptops and hybrid CPUs.
+    PROCESS_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0;  // 0 with the bit in the control mask = throttling explicitly off
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+    // Slightly above normal, never higher: the guest, the GE worker, audio and the window thread all
+    // have to make progress, and the very high classes can starve the system.
+    SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+    // Multimedia Class Scheduler ("Games" task) for the calling thread, the one that runs the guest
+    // and paces the frames. Loaded dynamically so nothing new has to be linked.
+    if (HMODULE avrt = LoadLibraryW(L"avrt.dll")) {
+        using SetCharacteristics = HANDLE(WINAPI *)(LPCWSTR, LPDWORD);
+        if (const auto set_characteristics =
+                reinterpret_cast<SetCharacteristics>(GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW"))) {
+            DWORD task_index = 0u;
+            set_characteristics(L"Games", &task_index);
+        }
+    }
+}
+
+// A 60 fps game on a display whose refresh rate is not a multiple of 60 cannot show every frame for the
+// same number of refreshes (75 Hz alternates one and two, 144 Hz two and three), which reads as judder.
+// Only variable refresh rate or a 60/120/180/240 Hz mode avoids it, so say so once instead of leaving
+// it unexplained. Nothing is changed.
+void report_display_refresh_rate() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    if (!EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) || mode.dmDisplayFrequency <= 1u) return;
+    const unsigned hz = mode.dmDisplayFrequency;
+    const unsigned nearest = (hz + 30u) / 60u * 60u;
+    const bool multiple = nearest >= 60u && (hz + 1u >= nearest) && (hz <= nearest + 1u);
+    std::cout << "Display refresh:      " << hz << " Hz" << (multiple ? "" : " (not a multiple of 60)") << "\n";
+    if (!multiple)
+        std::cout << "  note: the game runs at 60 fps. Without variable refresh rate (G-SYNC / FreeSync) frames are shown for\n"
+                     "  an uneven number of refreshes on this display, which looks like judder. Enable VRR in the graphics driver\n"
+                     "  and Windows (Settings > Display > Graphics), or use a 60/120/180/240 Hz mode, for perfectly even motion.\n";
+}
+
 bool display_window_enabled() {
     static const bool enabled = [] {
         const char *text = VCS_ENV("PSPRECOMP_WINDOW");
@@ -572,17 +691,26 @@ bool display_window_enabled() {
 
 void display_window_start() {
     if (!display_window_enabled()) return;
+    // Windows sleeps in ~15.6 ms ticks unless the process asks for finer resolution. The frame
+    // limiter sleeps most of a 16.7 ms frame and spins the last 1.5 ms, so at the default tick
+    // every sleep overshoots the target and frames stretch to 18-19 ms (a steady ~54 fps). 1 ms
+    // keeps the overshoot inside the spin margin. Held for the life of the process.
+    static const bool timer_resolution_raised = timeBeginPeriod(1u) == TIMERR_NOERROR;
+    (void)timer_resolution_raised;
+    configure_process_scheduling();
+    report_display_refresh_rate();
     ensure_window_started();
-    if (vcs_configuration().rendering.backend != RenderingBackend::DirectX12) return;
 
     WindowState &state = window_state();
     HWND window = state.window.load(std::memory_order_acquire);
     if (ge_gpu_backend_active()) {
-        // Native GE owns the D3D12 queue/swapchain. Avoid creating a second
-        // presenter/device for the same HWND.
+        // Native GE (D3D12 or Vulkan) owns the queue/swapchain. Avoid creating a second
+        // presenter/device for the same HWND. This no longer depends on the ini's Backend tag:
+        // the Vulkan backend needs the window whenever it is the one that is active.
         ge_gpu_backend_set_native_window(window);
         return;
     }
+    if (vcs_configuration().rendering.backend != RenderingBackend::DirectX12) return;
 
     // Native GE may have been intentionally disabled or may have failed its
     // feature probe. In non-strict play mode the stable software GE can still
@@ -624,6 +752,18 @@ void display_window_present(const psprecomp::GuestMemory &memory,
     WindowState &state = window_state();
     const HWND window = state.window.load(std::memory_order_acquire);
     if (window == nullptr) return;
+
+    if (ge_gpu_backend_owns_window()) {
+        // The Vulkan swapchain owns this window: show the frame through it instead of GDI/DX12.
+        try {
+            const std::vector<std::byte> rgba = decode_framebuffer_rgba(memory, description);
+            if (ge_gpu_backend_present_rgba(rgba, description.width, description.height,
+                                            state.aspect_lock.load(std::memory_order_relaxed)))
+                return;
+        } catch (const std::exception &) {
+            return;  // transient framebuffer pointer: the previous frame stays on screen
+        }
+    }
 
     if (vcs_configuration().rendering.backend == RenderingBackend::DirectX12 &&
         !vcs_configuration().rendering.dx12_ge_color) {
@@ -691,6 +831,10 @@ void display_window_present_rgba(std::span<const std::byte> rgba,
     WindowState &state = window_state();
     const HWND window = state.window.load(std::memory_order_acquire);
     if (window == nullptr) return;
+    if (ge_gpu_backend_owns_window() &&
+        ge_gpu_backend_present_rgba(rgba, width, height,
+                                    state.aspect_lock.load(std::memory_order_relaxed)))
+        return;
     if (vcs_configuration().rendering.backend == RenderingBackend::DirectX12 &&
         !vcs_configuration().rendering.dx12_ge_color) {
         if (!dx12_presenter_active()) {
@@ -733,6 +877,60 @@ void display_window_present_rgba(std::span<const std::byte> rgba,
     PostMessageW(window, kMessagePresent, 0, 0);
 }
 
+
+static HostInputState read_shared_input();
+
+// Diagnostics and the test hook for the mouse; the camera itself is fed by the WM_INPUT handler.
+static void mouse_input_diagnostics() {
+    static const bool diag = VCS_ENV("PSPRECOMP_INPUT_DIAG") != nullptr;
+    const char *sim_text = VCS_ENV("PSPRECOMP_INPUT_SIM_MOUSE");
+    if (!diag && (sim_text == nullptr || *sim_text == '\0')) return;
+    WindowState &state = window_state();
+    // Test hook: PSPRECOMP_INPUT_SIM_MOUSE=<dx>,<dy>,<first poll>,<last poll>[;<dx>,<dy>,<first>,<last>...]
+    // adds a fixed motion to every poll in each range (up to four ranges). Synthetic OS input does not
+    // always produce raw-input packets, so this is how camera behaviour is checked without a physical
+    // mouse.
+    if (sim_text != nullptr && *sim_text != '\0') {
+        struct SimRange { long dx, dy, first, last; };
+        static SimRange ranges[4];
+        static int range_count = 0;
+        static const bool parsed = [&] {
+            const char *cursor = sim_text;
+            while (range_count < 4 && *cursor != '\0') {
+                SimRange range{0, 0, -1, -1};
+                int consumed = 0;
+                if (std::sscanf(cursor, "%ld,%ld,%ld,%ld%n", &range.dx, &range.dy, &range.first, &range.last,
+                                &consumed) < 4)
+                    break;
+                ranges[range_count++] = range;
+                cursor += consumed;
+                if (*cursor == ';') ++cursor;
+            }
+            return true;
+        }();
+        (void)parsed;
+        static long sim_polls = 0;
+        ++sim_polls;
+        for (int index = 0; index < range_count; ++index)
+            if (sim_polls >= ranges[index].first && sim_polls <= ranges[index].last)
+                vcs_camera_add_mouse_motion(static_cast<int>(ranges[index].dx), static_cast<int>(ranges[index].dy));
+    }
+    if (diag) {
+        // Once a second or so: proves whether raw mouse packets reach the window at all.
+        static int polls = 0;
+        if ((++polls % 240) == 0)
+            std::cerr << "[input] raw_mouse_packets=" << state.raw_mouse_events.load(std::memory_order_relaxed)
+                      << " focused=" << state.focused.load(std::memory_order_relaxed) << "\n";
+    }
+}
+
+HostInputState display_window_input() {
+    mouse_input_diagnostics();
+    // The mouse is not part of this reading (see vcs_camera_add_mouse_motion()); a deflected
+    // controller stick is, and is forwarded to the camera by the caller.
+    return read_shared_input();
+}
+
 DisplayWindowSurface display_window_surface() {
     if (!display_window_enabled()) return {};
     ensure_window_started();
@@ -746,12 +944,19 @@ DisplayWindowSurface display_window_surface() {
             static_cast<std::uint32_t>(std::max(0L, client.bottom - client.top))};
 }
 
+// Defined below: the keyboard/button/pad half of the input reading, shared and cached, which never
+// drains the mouse.
+static HostInputState read_shared_input();
+
 std::uint32_t display_window_buttons() {
     // Shares one reading with the analog path. Doing its own pass over
     // kKeyBindings is what left the mouse out entirely: the mouse buttons and
     // the wheel live in the reading below, so punching and tuning the radio
     // never reached the guest while the keyboard worked fine.
-    return display_window_input().buttons;
+    //
+    // This must not go through display_window_input(): that call drains the mouse motion for the
+    // camera, and the guest reads buttons on paths (latch/peek) that never forward a camera axis.
+    return read_shared_input().buttons;
 }
 
 void display_window_analog(std::uint8_t &x, std::uint8_t &y) {
@@ -760,11 +965,13 @@ void display_window_analog(std::uint8_t &x, std::uint8_t &y) {
     y = input.analog_y;
 }
 
-HostInputState display_window_input() {
+static HostInputState read_shared_input() {
     // The buttons and the analog stick are fetched by separate callers within
-    // one controller poll, and the mouse deltas can only be drained once -- so
-    // the reading is cached for a few milliseconds and both callers get the
-    // same one. Shorter than a frame, so nothing here is ever perceptibly old.
+    // one controller poll, so the reading is cached for a few milliseconds and
+    // both callers get the same one. Shorter than a frame, so nothing here is
+    // ever perceptibly old. The mouse motion is deliberately NOT part of it: it
+    // used to be drained here, which meant any poll that only wanted buttons
+    // could swallow the movement before the camera poll ever saw it.
     static std::mutex cache_mutex;
     static HostInputState cached{};
     static std::chrono::steady_clock::time_point cached_at{};
@@ -782,9 +989,8 @@ HostInputState display_window_input() {
     WindowState &state = window_state();
     if (!state.ready.load(std::memory_order_acquire)) return publish();
 
-    // The mouse keeps accumulating while the window is not focused, so the
-    // deltas are drained either way. Leaving them to pile up made the camera
-    // whip round on the frame focus came back.
+    // Only used to tell keyboard/mouse from controller for the prompts; the camera has its own
+    // accumulator (vcs_camera_add_mouse_motion), so draining these here loses nothing.
     const std::int32_t mouse_dx = state.mouse_dx.exchange(0, std::memory_order_relaxed);
     const std::int32_t mouse_dy = state.mouse_dy.exchange(0, std::memory_order_relaxed);
     const std::int32_t wheel = state.wheel.exchange(0, std::memory_order_relaxed);
@@ -855,43 +1061,6 @@ HostInputState display_window_input() {
     }
 
     const ControlsConfiguration &controls = vcs_configuration().controls;
-    const int sensitivity = static_cast<int>(controls.mouse_sensitivity);
-    // A curve rather than a multiply-and-clamp.
-    //
-    // The axis is a stick deflection, so it is a turn *rate* with a hard
-    // ceiling at 127, and `delta * 12` reaches that ceiling at eleven counts of
-    // mouse movement. An ordinary flick produces many times that, so the value
-    // sat pinned at the ceiling nearly all the time: every difference between
-    // a nudge and a sweep was discarded before the game saw it, which is what
-    // made aiming feel like it moved in steps.
-    //
-    // x/(x+k) keeps small movements proportional -- a slow drag still maps
-    // almost linearly -- while approaching the ceiling asymptotically instead
-    // of slamming into it, so a fast flick stays faster than a slow one all the
-    // way up. Sensitivity now scales the curve rather than the clamp.
-    // Full range, and the curve rises quickly to reach it.
-    //
-    // Capping the peak at 63 was tried, on the theory that the rate was double
-    // what the camera code expects -- the accessor being replaced does shift
-    // its result right by one. It is not the answer: the pad's right stick goes
-    // to the full 127 through a different path, turns at a speed the player
-    // likes, and stalls no more than the capped mouse did. All the cap achieved
-    // was a mouse that crawled.
-    //
-    // The stalling itself tracks something else. It is worst just after the
-    // game starts and clears on its own, and emulation speed was measured at
-    // 69-75% through boot, reaching 100% later -- see the intro-audio work.
-    // A camera integrating at seven tenths of the intended rate reads as stuck.
-    const auto camera_response = [sensitivity](std::int32_t delta) {
-        const double scaled = std::abs(delta) * (sensitivity / 12.0);
-        const double magnitude = 127.0 * scaled / (scaled + 12.0);
-        return static_cast<int>(std::lround(delta < 0 ? -magnitude : magnitude));
-    };
-    input.camera_x = camera_response(mouse_dx);
-    // Negated: raw mouse Y grows downwards, and the axis the game reads treats
-    // positive as looking up. Pushing the mouse forward has to raise the view.
-    input.camera_y = camera_response(-mouse_dy);
-    if (controls.invert_camera_y) input.camera_y = -input.camera_y;
 
     if (const PfnXInputGetState get_state = xinput_get_state()) {
         XInputStatePacket pad{};
@@ -993,7 +1162,7 @@ void display_window_shutdown() {
         PostMessageW(window, WM_CLOSE, 0, 0);
         return;
     }
-    SetWindowTextW(window, L"VCSNative — stopped (close this window)");
+    SetWindowTextW(window, L"VCSNative \u2014 stopped (close this window)");
     while (!state.close_requested.load(std::memory_order_relaxed) &&
            state.window.load(std::memory_order_acquire) != nullptr) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));

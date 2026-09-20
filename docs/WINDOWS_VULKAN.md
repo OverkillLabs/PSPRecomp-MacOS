@@ -1,8 +1,8 @@
 # Windows + Vulkan: parity with the macOS build
 
-Written on a Mac. **Nothing in the Windows-only files has been compiled or run by its author.** This
-document is the handoff for whoever builds and tests it on Windows: what exists, what is unverified,
-and exactly how to verify it.
+Written on a Mac, then built, fixed, verified and tuned on Windows 11 (see "Windows session results" at
+the bottom for what was found and changed). The earlier sections describe the design and the original
+verification plan; where the results section contradicts them, the results section is current.
 
 ## The rules (from the project owner)
 
@@ -80,7 +80,7 @@ Everything from the earlier macOS work (see the feature table) is in shared code
 
 | Feature | Where | Windows status |
 |---|---|---|
-| Real swapchain present (GPU-side, no readback) | Vulkan backend + `platform/*/vulkan_platform_*` | **OFF by default on Windows** until verified. `PSPRECOMP_VULKAN_SWAPCHAIN=1` to test; then change `swapchain_default_enabled()` in `vulkan_platform_win32.cpp` to `true` |
+| Real swapchain present (GPU-side, no readback) | Vulkan backend + `platform/*/vulkan_platform_*` | **ON by default on Windows** (verified, see results). `PSPRECOMP_VULKAN_SWAPCHAIN=0` forces the CPU readback path |
 | Bloom (`[SimulateHDR]`) | Vulkan backend | See "Bloom" below |
 | FXAA / 3-pass SMAA (`[Rendering] SMAA`, `[SMAA]`) | Vulkan backend | shared |
 | Colour grading (`[ColorGrading]`), time-of-day grade, CAS, dither | Vulkan backend | shared |
@@ -99,7 +99,7 @@ Everything from the earlier macOS work (see the feature table) is in shared code
 | Non-blocking texture uploads, batched replacement swaps | Vulkan backend | shared |
 | Parallel vertex decode | `ge_renderer.cpp` | shared, on for Vulkan builds |
 | Sky remap memo, cached `getenv` (`VCS_ENV`) | headers | shared |
-| Launcher (settings UI, texture pack install) | macOS: `launcher/VCSLauncher.swift` | **Windows launcher to be written** (spec below) |
+| Launcher (settings UI, texture pack install) | macOS: `launcher/VCSLauncher.swift` | Windows: `launcher/windows/VCSLauncher.cs`, built with the game next to `VCSNative.exe` |
 
 ## Performance target and how it was measured on macOS
 
@@ -286,3 +286,171 @@ the original small texture is kept. Also fixed: a replaced entry now keeps its c
 the process's *GPU/committed* memory (Task Manager Details > GPU memory, or `dxdiag`/PIX). It must stay flat. On
 macOS the memory shows under `vmmap -summary <pid>` as "owned unmapped (graphics)" and in "Physical footprint"; a plain
 RSS number hides it. Also watch that `PSPRECOMP_FRAME_TIME_DIAG=1` frame times do not drift upward over the soak.
+
+
+## Windows session results (built and verified on Windows 11)
+
+Test machine: Ryzen 7 5800X3D, RTX 5070 Ti + RTX 2070 SUPER, one 2560x1440 display, Vulkan SDK 1.4.357,
+VS 2022 Build Tools 17.14. Game data and the 7,044-texture pack from the owner.
+
+### What was wrong or missing, and what changed
+
+Shared files (please reconcile on the Mac side; none of these change macOS behaviour):
+- `host/vcs_profile.cpp`: `memmem` (POSIX) replaced by `std::search`; MSVC has no `memmem`.
+- `host/ge_gpu_backend.hpp`: new `ge_gpu_backend_owns_window()` and
+  `ge_gpu_backend_present_rgba(rgba, w, h, aspect_locked)` (the handoff's swapchain blocker). The DX12 file has
+  stubs. Nothing on macOS calls them (macOS presents software frames through SDL on the shared CAMetalLayer),
+  so they are dormant there; the macOS layer may adopt them later to drop the SDL sharing.
+- `host/ge_gpu_backend_vulkan.cpp`: `present_software_frame()` (upload a CPU frame to a texture and draw it through
+  the present pass with the display aspect/integer-scale rules and letterboxing); a second descriptor set for it;
+  GPU selection now ranks discrete GPUs by device-local memory (type still dominates, so macOS/iGPU choices are
+  unchanged); `PSPRECOMP_VULKAN_DEVICE` treats a number as an index only when that device exists, otherwise as a
+  name part (`2070`, `5070 Ti`).
+- `CMakeLists.txt` (profiles/vcs): D3D12/DXGI libs are linked on every Windows build (`dx12_presenter.cpp` is
+  always compiled); Windows-only sections for the manifest, PDB, launcher and clang-cl AOT (below).
+
+Windows-only files:
+- `platform/windows/display_window_win32.cpp`: hands the HWND to whichever GPU backend is active (it used to depend
+  on the ini's `Backend=DirectX12` tag); `WM_PAINT` never GDI-paints over a window a Vulkan swapchain owns;
+  software frames (videos, loading screens) go through `ge_gpu_backend_present_rgba()`; `timeBeginPeriod(1)`;
+  window-title em-dashes fixed (universal character names in wide literals; MSVC was reading the UTF-8 as ANSI).
+- `platform/windows/vulkan_platform_win32.cpp`: `swapchain_default_enabled()` is now `true`.
+- `platform/windows/VCSNative.manifest` (new): per-monitor-v2 DPI awareness. Without it a 4K display at 125% reads as
+  3072x1728, the game renders below native and Windows bitmap-stretches it.
+- `scripts/INSTALL_TEXTURE_PACK.bat` / `UNINSTALL_TEXTURE_PACK.bat`: optional destination argument.
+- `scripts/build_release.bat`, `build_fast.bat`: MSBuild `/m:%JOBS%` (the clang shards parallelise across projects).
+
+### The performance finding (the big one)
+
+The generated AOT corpus is 234 huge translation units. Built with MSVC (`/Ob0`, and even `/Ob3` on the hot units) the
+vblank thread sat at ~95% of a core inside recompiled guest code, with ~20% of that in helpers MSVC refused to
+inline (`aot_load32`, `std::bit_cast`, `std::array::operator[]`, the VFPU read/write helpers): MSVC has a
+per-function inline budget and these functions are enormous, so even `__forceinline` is dropped. Result: 18-22 ms
+frames (48-55 fps) in the opening area regardless of GPU, swapchain or thread settings. Measured with a sampling
+profiler (suspend + RIP + dbghelp, `/DEBUG` PDB) and confirmed by test compiles.
+
+Fix: compile the generated units with **clang-cl** (the ClangCL toolset already shipped with Visual Studio
+Build Tools) instead of cl.exe, exactly the compiler family the macOS build uses (`-O3`, `-ffp-contract=off` so no
+fused multiply-add). It is automatic: `PSPRECOMP_VCS_CLANG_AOT` (default ON) uses it when the toolset is present and
+the generator is Visual Studio, and falls back to the previous MSVC path (with an extended hot-unit list) otherwise.
+The units are built as 12 parallel OBJECT-library projects. `host/ge_renderer.cpp` (the software geometry pipeline:
+vertex decode, transform, lighting, triangle assembly, which runs on the GE worker thread) is built with clang-cl too;
+the rest of the host and the runtime still build with MSVC. The resulting exe is smaller (78 MB vs 107 MB) and much
+faster. Moving `ge_renderer.cpp` alone took a 5-minute walk through the army base (close walls, fences, soldiers) from
+18.1% of frames over 20 ms and p99 26.4 ms to 0.5% and p99 18.5 ms.
+
+| Same route, same machine, swapchain, pack installed | frame p50 | p99 | >20 ms | uncapped frame time |
+|---|---|---|---|---|
+| CPU readback + GDI (4K) | 167 ms | 176 ms | 100% | n/a |
+| Swapchain, MSVC-built AOT | 18-22 ms | 23-28 ms | 25-98% | ~18 ms |
+| **Swapchain, clang-cl-built AOT (default now)** | **16.7 ms** | **17.8 ms** | **0.0-0.1%** | **~7 ms** |
+
+With the limiter off the frame takes ~7 ms (~140 fps of headroom), better than the M1's ~9 ms.
+`PSPRECOMP_FRAME_TIME_DIAG=1` was used for all numbers; profilers were never active during a timing run.
+
+### Verification results
+
+- Boots on the default path; `[vulkan] GPU:` picks a discrete GPU; SMAA, sky palette, grade, clouds, HUD, radar and
+  colours look right (no washed-out sRGB double curve).
+- Swapchain: `present_us` ~0.3 ms. Windowed stress (resize x2, maximise, restore, minimise for 7 s, restore,
+  show-desktop and back, six rapid resizes): 12 recreations, 0 failures, process alive, the game clock advanced
+  the whole time, image always fits, no stuck black frame.
+- Intro videos, the Rockstar logo, "in association with Rockstar North", the GTA title and all credits cards render
+  correctly through the swapchain (the handoff's blocker).
+- With and without the texture pack: locked 60 fps, clean logs (no error/warning/invalid lines).
+- **Soak, 10 minutes idle in the opening area with the pack (the handoff's memory regression): flat.** 40,058 frames,
+  p50 16.7 ms, p99 17.8 ms, max 25.8 ms, 0.1% over 20 ms, none over 33 ms. GPU dedicated memory 516 -> 518 MB (338 MB
+  without the pack), private memory ~900 MB, working set ~530 MB, ~1,115 handles and ~73 threads, all constant for the
+  whole run. Without the pack (11.5 min): 41,915 frames, p50 16.7, p99 17.9, max 22.7, 0% over 20 ms.
+- **Walking test with the pack** (5 min running, sprinting and turning through the army base, the in-game clock advancing
+  from 08:00 to 12:00): 20,756 frames, p50 16.7 ms, p99 18.3 ms, 0.3% over 20 ms, none over 33 ms.
+- Capacity: with the limiter off the CPU cost of a running-forward frame is ~4.1 ms (GE ~3.6 ms); the async GE worker and
+  the vblank thread are each ~20% of a core while walking. (`frame_us` is ~13.5 ms uncapped only because FIFO blocks
+  in `vkAcquireNextImageKHR`; `cpu_us` is the real cost.)
+- The CPU readback path (`PSPRECOMP_VULKAN_SWAPCHAIN=0`) still works and shows bloom, as documented.
+- Launcher, tested with real clicks: Save changes exactly the toggled line (`ShowFPS=false` -> `true`) and nothing else in
+  the ini; a present-mode choice made in the launcher reaches the game as `PSPRECOMP_VULKAN_PRESENT_MODE` (read back from
+  the running process's environment block); Play starts the game and exits the launcher; without `PSP_DATA` beside the
+  exe it asks for the game folder instead of failing.
+- `BUILD_VCS.bat` (the official script) passes end to end on a clean reconfigure: `BUILD OK`, all 5 test suites pass.
+  Two tests were stale against Mac-side changes and were corrected (`vcs_config_tests`: the build locks `FrameRate` to 60,
+  and a 16:9 surface gets the documented 1.15 HUD safe-area floor, not 1.0). No event-log crash or hang entries for
+  `VCSNative.exe` or `VCSLauncher.exe` in any session.
+- Launcher: builds with the game, sits next to `VCSNative.exe`, edits both ini files in place, installs and removes
+  the pack, launches with GPU / present mode / swapchain / thread switches as environment variables.
+
+### Decisions left open (need the owner)
+
+- **Bloom.** Unchanged: on the swapchain path bloom is force-disabled (its composite is CPU-side only), which is the
+  shipped macOS behaviour. On Windows the swapchain is now the default, so `[SimulateHDR]` has no visible effect
+  unless `PSPRECOMP_VULKAN_SWAPCHAIN=0`. A GPU composite in `present.frag` would fix both platforms but turns bloom
+  on for macOS too. The launcher says this on the Quality page.
+
+### Not testable here
+
+Controller (XInput) input and mouse-look in gameplay beyond simple movement, missions/cutscene soak, saving and
+loading a save game, multiple monitors with mixed DPI, HDR displays.
+
+
+## Second Windows session: HUD, mouse, robustness (please reconcile on the Mac side)
+
+### The HUD and field of view (root cause, fixed in shared Vulkan code, applies to macOS too)
+
+Symptom: on a plain 16:9 screen the interface ran off the right and bottom edges (radar cut off, money
+digits cut off) and the 3D view was narrower than the original renderer's. The fork had hidden this with a
+1.15 floor in `widescreen_stretch_factor()` (which also widened the guest's projection by 15% at 16:9,
+because the guest reads the same function) plus hand-tuned per-edge HUD factors in `ge_renderer.cpp`
+(1.02 left, 1.02 top, 1.35 bottom).
+
+Root cause, measured by building the original repository (jessicanataliagta/PSPRecomp, DX12) and capturing the
+same scene: the guest composes each frame into a **512 x 320** area and positions both world and interface in
+it (a PSP screen shows only the top-left 480 x 272). The original DX12 renderer presents the whole logical
+frame; the Vulkan backend mapped only 480 x 272 of it to the output, cropping and magnifying the frame by
+512/480 horizontally and 320/272 vertically (measured: 1.07 and 1.18 between the two captures).
+
+Fix:
+- `ge_gpu_backend_vulkan.cpp`: `frame_extent()` (512 x 320; `PSPRECOMP_VULKAN_FRAME=480x272` restores the old
+  mapping for comparison) is used for every guest-space to render-target conversion (vertex push constants,
+  scissor scale and clamps, hardware-transform viewport, cloud camera, HUD centre).
+- `vcs_config.cpp`: `widescreen_stretch_factor()` is the original's exact ratio again (1.0 at 16:9);
+  new `widescreen_hud_factor()` = max(1, that) so the interface is never pushed outwards.
+- `ge_renderer.cpp`: the HUD correction is the original's symmetric X-only division (no Y, no per-edge
+  constants); the loading-art "fit into 272 rows" workaround is removed (it existed only to compensate for
+  the crop).
+- Dynamic scaling: `publish_live_display_surface()` (shared) is fed by the platform layer with the size of
+  the area the picture really occupies (client area when stretched, the letterboxed rectangle when
+  proportions are kept), on creation and on every resize (Windows: `publish_output_surface()`; macOS SDL:
+  same helper on SDL_WINDOWEVENT_SIZE_CHANGED/RESIZED). `resolve_display_surface_dimensions()` prefers it, so
+  the projection and the interface follow any resolution, window shape or resize. The Vulkan present pass now
+  also honours `Display.AspectRatio=Preserve` and `IntegerScale` for the GPU frame (it always stretched
+  before, on macOS too).
+- `vcs_config_tests.cpp` again asserts 1.0 at 16:9 and gained checks for the HUD factor and the live surface.
+- Verified against the original's capture at 16:9 (same framing and HUD positions), and at 21:9, 32:9, 4:3,
+  16:10, 5:4 and a tall window (captures kept with the session notes). The macOS SDL helper could not be compiled
+  on Windows: please build it and check the window title bar size events.
+
+### Mouse
+
+- Root cause of "barely moves": the controller is polled about 11 times per frame; each poll drained the mouse
+  motion and turned it into an axis that the next poll overwrote with zero before the game read it, so most motion
+  was lost. Now raw motion is accumulated the moment it arrives (`vcs_camera_add_mouse_motion()`, WM_INPUT on
+  Windows, SDL_MOUSEMOTION on macOS) and converted once per frame when the game reads the axis (latched for the
+  rest of the frame). Raw input was already used.
+- `PedCameraUpLimitDegrees` ships as 40 instead of 10 (the game's own limit is 45; the hook stops short of it).
+  Tested up and back down: no stall.
+- Test hooks: `PSPRECOMP_INPUT_SIM_MOUSE=dx,dy,first,last[;...]` (per-poll motion) and `PSPRECOMP_INPUT_DIAG=1`,
+  because synthetic OS mouse input does not generate WM_INPUT packets.
+
+### Robustness for varied PCs (from a research pass; details in the session notes)
+
+- `platform/windows/host_guard_win32.cpp`: startup CPU check (AVX2, FMA, BMI1/2, LZCNT, F16C, MOVBE, POPCNT for this
+  build) with a clear message instead of a silent illegal-instruction crash; the NVIDIA Optimus and AMD PowerXpress
+  exports. Built as its own object library without `/arch:AVX2` so the check cannot itself fault.
+- Process hygiene: EcoQoS opt-out, above-normal priority, MMCSS "Games" on the guest thread.
+- VRAM-aware replacement-texture budget on non-Apple platforms: 40% of the device-local heap (discrete, 0.5-3 GiB),
+  25% for integrated GPUs (0.25-1 GiB). Apple keeps the fixed 3 GiB.
+- Startup log of the display refresh rate with a hint when it is not a multiple of 60 (judder without VRR); the
+  launcher shows the same on its Performance page.
+- Not implemented on purpose (no gain for a CPU-bound 60 fps game, or needs data the pipeline lacks): DLSS, FSR 2+,
+  XeSS, in-game frame generation, Reflex, Anti-Lag. A spatial upscaler (FSR 1 style) would be cheap but only helps weak
+  GPUs. Driver-level frame generation (AMD AFMF, NVIDIA Smooth Motion) can be enabled by users without code.

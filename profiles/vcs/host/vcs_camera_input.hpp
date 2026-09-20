@@ -25,8 +25,22 @@ namespace vcs {
 // radians for the guest camera routine.
 [[nodiscard]] float vcs_ped_camera_up_limit_radians() noexcept;
 
-// Called once per controller poll with the host's mouse and right stick.
+// Called once per controller poll with the host's right stick (the mouse does NOT go through here).
 void vcs_camera_set_axes(int x, int y) noexcept;
+
+// Raw mouse motion in device counts, added the moment the platform layer receives it (any thread).
+//
+// The controller is polled far more often than the game reads the camera (about eleven times per
+// frame), and a poll only sees the motion that arrived since the previous one. Turning each poll's
+// motion straight into an axis made the axis a per-poll value that later polls in the same frame
+// overwrote with zero before the game read it, so most mouse movement never reached the camera.
+// Instead the motion accumulates here and is converted once per frame, at the moment the game reads
+// the axis, so none of it is lost and a fast flick is the sum of everything since the last frame.
+void vcs_camera_add_mouse_motion(int dx, int dy) noexcept;
+
+// Converts the motion accumulated since the previous frame into this frame's camera axis values.
+// Called once per displayed frame from the vblank wait.
+void vcs_camera_begin_frame() noexcept;
 
 // Diagnostic for the stall at full upward pitch.
 //

@@ -903,7 +903,14 @@ bool parse_atrac_header(std::span<const std::uint8_t> bytes, ParsedAtracHeader &
     if (!have_fmt || !have_data || header.channels == 0u || header.channels > 2u ||
         header.sample_rate == 0u || header.block_align == 0u) return false;
     // PSP ATRAC files use WAVE_FORMAT_EXTENSIBLE (0xFFFE) or the legacy ATRAC3 tag.
-    header.atrac3plus = header.format_tag == 0xFFFEu && header.block_align >= 0x180u;
+    // Every WAVE_FORMAT_EXTENSIBLE file on the disc is ATRAC3+ (checked with ffprobe over all of
+    // AUDIO/: 105 files, block sizes 280, 376, 560 and 1120 bytes, all atrac3p). Deciding by block size
+    // (>= 0x180) classed the 280-byte files -- every cutscene dialogue track, 77 of them -- and the
+    // 376-byte CITY tracks as plain ATRAC3, so a frame counted as 1024 samples instead of 2048. The
+    // game then consumed the stream's frames twice as fast as it played them, believed the file had
+    // ended halfway through, and fed the mixer silence in a repeating pattern for the second half of
+    // the cutscene (heard as heavy stuttering).
+    header.atrac3plus = header.format_tag == 0xFFFEu;
     if (!header.atrac3plus && header.format_tag != 0x0270u && header.format_tag != 0xFFFEu) return false;
     if (header.total_samples == 0u) {
         const std::uint32_t samples_per_frame = header.atrac3plus ? 2048u : 1024u;
@@ -7225,6 +7232,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         // wait only here before framebuffer presentation and vblank callbacks.
         if (!ge_async_wait_idle(rt)) return;
         ++display_vblank_index;
+        vcs::vcs_camera_begin_frame();
         vcs::audio_output_advance(virtual_time_us);
         report_realtime_speed_if_requested();
         if (frame_time_diag_enabled()) {
@@ -7419,8 +7427,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                     if (first != nullptr && !signature.empty() && rt.memory().contains(kScanStart, kScanBytes)) {
                         const std::uint8_t *ram = rt.memory().raw_pointer(kScanStart, kScanBytes);
                         if (ram != nullptr) {
-                            const std::uint8_t *hit = static_cast<const std::uint8_t *>(
-                                memmem(ram, kScanBytes, signature.data(), signature.size()));
+                            const auto *sig_begin = reinterpret_cast<const std::uint8_t *>(signature.data());
+                            const std::uint8_t *hit_it = std::search(ram, ram + kScanBytes, sig_begin, sig_begin + signature.size());
+                            const std::uint8_t *hit = hit_it == ram + kScanBytes ? nullptr : hit_it;
                             if (hit != nullptr) {
                                 const std::uint32_t candidate = kScanStart + static_cast<std::uint32_t>(hit - ram) - first->file_offset;
                                 // Three more strings from across the table must line up before trusting it.

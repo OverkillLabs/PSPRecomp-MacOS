@@ -34,7 +34,24 @@ if(NOT PSPRECOMP_HOT_GENERATED_INLINE_LEVEL MATCHES "^[0-3]$")
 endif()
 
 file(GLOB VCS_GENERATED CONFIGURE_DEPENDS "${VCS_PROFILE_DIR}/generated/*.cpp")
-if(MSVC)
+
+# Windows: compile the generated AOT corpus with clang-cl (the ClangCL toolset that ships with Visual
+# Studio) instead of cl.exe. The units are enormous single functions; MSVC stops inlining inside them
+# (its per-function inline budget) so every guest load/store and VFPU helper stays a real call, even at
+# /Ob3 and even for __forceinline. Clang has no such limit and is the compiler the macOS build uses.
+# Host and runtime code still build with MSVC. Falls back to the plain MSVC path when the toolset is
+# not installed or the generator is not Visual Studio. PSPRECOMP_VCS_CLANG_AOT=OFF forces MSVC.
+option(PSPRECOMP_VCS_CLANG_AOT "Compile the generated VCS units with the ClangCL toolset (MSVC builds)" ON)
+set(VCS_CLANG_AOT OFF)
+if(MSVC AND PSPRECOMP_VCS_CLANG_AOT AND CMAKE_GENERATOR MATCHES "Visual Studio" AND CMAKE_GENERATOR_INSTANCE)
+    if(EXISTS "${CMAKE_GENERATOR_INSTANCE}/VC/Tools/Llvm/x64/bin/clang-cl.exe" AND
+       EXISTS "${CMAKE_GENERATOR_INSTANCE}/MSBuild/Microsoft/VC/v170/Platforms/x64/PlatformToolsets/ClangCL")
+        set(VCS_CLANG_AOT ON)
+    endif()
+endif()
+message(STATUS "VCS generated AOT compiler: ${VCS_CLANG_AOT} (ON = clang-cl, OFF = default compiler)")
+
+if(MSVC AND NOT VCS_CLANG_AOT)
     if(PSPRECOMP_GENERATED_OPT_LEVEL STREQUAL "0")
         set(VCS_GENERATED_MSVC_OPT "/Od")
     elseif(PSPRECOMP_GENERATED_OPT_LEVEL STREQUAL "3")
@@ -57,13 +74,26 @@ else()
         "-O${PSPRECOMP_GENERATED_OPT_LEVEL};-g0")
 endif()
 
-if(PSPRECOMP_PROFILE_GUIDED_AOT)
+if(PSPRECOMP_PROFILE_GUIDED_AOT AND NOT VCS_CLANG_AOT)
     # This unit is hot in the current capture and finishes /Ob3 without
     # triggering MSVC's pathological optimizer growth. It also contains the
     # validated native collision leaf at guest PC 0x088B1554. Other measured
     # units remain /Ob0 until their oversized helpers are split/noinline.
     set(VCS_HOT_UNIT_IDS
         0043)
+    if(MSVC)
+        # MSVC compiles the generated corpus at /Ob0 (no inlining, not even __forceinline), which
+        # leaves every guest load/store and VFPU helper as a real call in the units below. A sampling
+        # profile of the Windows Vulkan build in gameplay put ~95% of the vblank thread in guest code
+        # and ~20% of it in those un-inlined helpers. These units account for 56% of the samples and
+        # each compiles at /Ob3 in 10-20 s (checked one by one), so they get the hot-unit treatment.
+        # macOS/clang keeps its own settings: this list only applies to MSVC.
+        list(APPEND VCS_HOT_UNIT_IDS
+            0129 0142 0092 0163 0044 0023 0154 0024 0173 0152 0093 0085 0089 0018 0162 0179 0022
+            0186 0165 0086 0199 0091 0169 0095 0150 0087 0005 0141 0007 0006 0198 0067 0155 0084
+            0075 0153 0149 0158 0174 0189 0030 0036 0002 0066 0035 0037 0038 0069 0088 0113 0188
+            0215)
+    endif()
     set(VCS_HOT_SOURCES)
     foreach(VCS_UNIT_ID IN LISTS VCS_HOT_UNIT_IDS)
         set(VCS_UNIT_SOURCE "${VCS_PROFILE_DIR}/generated/generated_unit_${VCS_UNIT_ID}.cpp")
@@ -93,7 +123,7 @@ if(PSPRECOMP_PROFILE_GUIDED_AOT)
     endif()
 endif()
 
-if(MSVC AND PSPRECOMP_NATIVE_AVX2)
+if(MSVC AND PSPRECOMP_NATIVE_AVX2 AND NOT VCS_CLANG_AOT)
     # MSVC 19.44's AVX2 optimizer crashes (C1001/c2.dll) on this translation
     # unit, while the identical /Ox /Ob0 compile completes in ~3 s with AVX.
     # Keep AVX2 for the host and the other AOT units; append the weaker ISA only
@@ -305,10 +335,11 @@ function(vcs_target_common target)
         target_link_libraries(${target} PRIVATE Vulkan::Vulkan)
         target_include_directories(${target} PRIVATE "${VCS_SHADER_OUTPUT_DIR}")
         add_dependencies(${target} vcs_ge_shaders)
-    else()
-        target_link_libraries(${target} PRIVATE d3d12 dxgi d3dcompiler dxguid)
     endif()
     if(WIN32)
+        # host/dx12_presenter.cpp is compiled on every Windows build (video and software-frame
+        # present), so the D3D12/DXGI libraries are needed with the Vulkan backend too.
+        target_link_libraries(${target} PRIVATE d3d12 dxgi d3dcompiler dxguid)
         foreach(VCS_FFMPEG_LIB avcodec avformat avutil swresample swscale)
             target_link_libraries(${target} PRIVATE
                 "${VCS_PROFILE_DIR}/third_party/ffmpeg/lib/${VCS_FFMPEG_LIB}.lib")
@@ -382,14 +413,126 @@ if(WIN32)
     list(APPEND VCS_APP_RESOURCES resources/VCSNative.rc)
 endif()
 
+set(VCS_GENERATED_FOR_EXE ${VCS_GENERATED})
+# Host sources of the game exe only. The test executables keep using the full VCS_HOST_SOURCES list.
+set(VCS_HOST_SOURCES_EXE ${VCS_HOST_SOURCES})
+if(VCS_CLANG_AOT)
+    # The corpus is split into shards, one Visual Studio project each, because MSBuild parallelises
+    # across projects (cl.exe /MP does not apply to the ClangCL toolset). Build with /m:<jobs>.
+    set(VCS_AOT_SHARD_COUNT 12 CACHE STRING "Number of parallel clang-cl projects for the generated units")
+    math(EXPR VCS_AOT_SHARD_LAST "${VCS_AOT_SHARD_COUNT} - 1")
+    set(VCS_AOT_INDEX 0)
+    foreach(VCS_AOT_SOURCE IN LISTS VCS_GENERATED)
+        math(EXPR VCS_AOT_SHARD "${VCS_AOT_INDEX} % ${VCS_AOT_SHARD_COUNT}")
+        list(APPEND VCS_AOT_SHARD_SOURCES_${VCS_AOT_SHARD} "${VCS_AOT_SOURCE}")
+        math(EXPR VCS_AOT_INDEX "${VCS_AOT_INDEX} + 1")
+    endforeach()
+    set(VCS_GENERATED_FOR_EXE)
+    foreach(VCS_AOT_SHARD RANGE 0 ${VCS_AOT_SHARD_LAST})
+        if(NOT VCS_AOT_SHARD_SOURCES_${VCS_AOT_SHARD})
+            continue()
+        endif()
+        set(VCS_AOT_TARGET vcs_aot_${VCS_AOT_SHARD})
+        add_library(${VCS_AOT_TARGET} OBJECT ${VCS_AOT_SHARD_SOURCES_${VCS_AOT_SHARD}})
+        set_target_properties(${VCS_AOT_TARGET} PROPERTIES
+            VS_PLATFORM_TOOLSET ClangCL
+            INTERPROCEDURAL_OPTIMIZATION OFF
+            FOLDER "vcs_aot")
+        target_include_directories(${VCS_AOT_TARGET} PRIVATE
+            "${VCS_PROFILE_DIR}/host" "${VCS_PROFILE_DIR}/generated")
+        target_link_libraries(${VCS_AOT_TARGET} PRIVATE psprecomp_core)
+        # -O3 like the macOS build. -ffp-contract=off keeps float results identical to the MSVC/PSP
+        # semantics the generated code was validated against (no fused multiply-add).
+        target_compile_options(${VCS_AOT_TARGET} PRIVATE
+            /clang:-O3 /clang:-ffp-contract=off /GL- -Wno-everything)
+        list(APPEND VCS_GENERATED_FOR_EXE $<TARGET_OBJECTS:${VCS_AOT_TARGET}>)
+    endforeach()
+
+    # The software geometry pipeline (vertex decode, transform, lighting, triangle assembly) is the
+    # other hot CPU code; it gets the same compiler.
+    set(VCS_CLANG_HOST_SOURCES host/ge_renderer.cpp)
+    list(REMOVE_ITEM VCS_HOST_SOURCES_EXE ${VCS_CLANG_HOST_SOURCES})
+    add_library(vcs_host_clang OBJECT ${VCS_CLANG_HOST_SOURCES})
+    set_target_properties(vcs_host_clang PROPERTIES
+        VS_PLATFORM_TOOLSET ClangCL
+        INTERPROCEDURAL_OPTIMIZATION OFF
+        FOLDER "vcs_aot")
+    target_include_directories(vcs_host_clang PRIVATE
+        "${VCS_PROFILE_DIR}/host" "${VCS_PROFILE_DIR}/generated"
+        "${VCS_PROFILE_DIR}/third_party/ffmpeg/include")
+    target_link_libraries(vcs_host_clang PRIVATE psprecomp_core)
+    target_compile_options(vcs_host_clang PRIVATE
+        /clang:-O3 /clang:-ffp-contract=off /GL- -Wno-everything)
+    list(APPEND VCS_GENERATED_FOR_EXE $<TARGET_OBJECTS:vcs_host_clang>)
+endif()
+
+if(WIN32 AND MSVC)
+    # Startup CPU check and the Optimus/PowerXpress exports (see platform/windows/host_guard_win32.cpp).
+    # Its own object library so the directory-wide /arch:AVX2 does not apply: the check must not itself
+    # run an instruction that the CPU it is checking for might lack.
+    add_library(vcs_host_guard OBJECT platform/windows/host_guard_win32.cpp)
+    set_target_properties(vcs_host_guard PROPERTIES COMPILE_OPTIONS "" INTERPROCEDURAL_OPTIMIZATION OFF)
+    if(PSPRECOMP_NATIVE_AVX2)
+        target_compile_definitions(vcs_host_guard PRIVATE VCS_REQUIRE_AVX2=1)
+    else()
+        target_compile_definitions(vcs_host_guard PRIVATE VCS_REQUIRE_AVX2=0)
+    endif()
+    list(APPEND VCS_GENERATED_FOR_EXE $<TARGET_OBJECTS:vcs_host_guard>)
+endif()
+
 add_executable(VCSNative
     ${VCS_APP_RESOURCES}
     host/main.cpp
-    ${VCS_HOST_SOURCES}
-    ${VCS_GENERATED}
+    ${VCS_HOST_SOURCES_EXE}
+    ${VCS_GENERATED_FOR_EXE}
 )
+if(VCS_CLANG_AOT)
+    foreach(VCS_AOT_SHARD RANGE 0 ${VCS_AOT_SHARD_LAST})
+        if(TARGET vcs_aot_${VCS_AOT_SHARD})
+            add_dependencies(VCSNative vcs_aot_${VCS_AOT_SHARD})
+        endif()
+    endforeach()
+    add_dependencies(VCSNative vcs_host_clang)
+endif()
 vcs_target_common(VCSNative)
 vcs_set_runtime_output(VCSNative)
+if(WIN32)
+    # Per-monitor DPI awareness (see the manifest). Link-only: no translation unit is recompiled.
+    target_sources(VCSNative PRIVATE "${VCS_PROFILE_DIR}/platform/windows/VCSNative.manifest")
+    # The launcher (launcher/windows) is built with the game and lands next to VCSNative.exe. It is a
+    # WPF app compiled with the Roslyn compiler that ships with Visual Studio; if that compiler is not
+    # found the build says so and carries on without a launcher.
+    set(VCS_PF86 "$ENV{ProgramFiles\(x86\)}")
+    set(VCS_CSC_HINTS)
+    if(CMAKE_VS_MSBUILD_COMMAND)
+        get_filename_component(VCS_MSBUILD_DIR "${CMAKE_VS_MSBUILD_COMMAND}" DIRECTORY)
+        list(APPEND VCS_CSC_HINTS "${VCS_MSBUILD_DIR}/Roslyn")
+    endif()
+    foreach(VCS_VS_EDITION BuildTools Community Professional Enterprise)
+        list(APPEND VCS_CSC_HINTS
+            "${VCS_PF86}/Microsoft Visual Studio/2022/${VCS_VS_EDITION}/MSBuild/Current/Bin/Roslyn"
+            "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/${VCS_VS_EDITION}/MSBuild/Current/Bin/Roslyn")
+    endforeach()
+    find_program(VCS_CSC NAMES csc.exe HINTS ${VCS_CSC_HINTS} NO_DEFAULT_PATH)
+    if(VCS_CSC)
+        set(VCS_LAUNCHER_SRC "${VCS_PROFILE_DIR}/launcher/windows")
+        add_custom_target(VCSLauncher
+            COMMAND ${CMAKE_COMMAND} "-DCSC=${VCS_CSC}" "-DSRC_DIR=${VCS_LAUNCHER_SRC}"
+                    "-DICON=${VCS_PROFILE_DIR}/resources/vcsnative.ico" "-DOUT=$<TARGET_FILE_DIR:VCSNative>"
+                    -P "${VCS_LAUNCHER_SRC}/build_launcher.cmake"
+            SOURCES "${VCS_LAUNCHER_SRC}/VCSLauncher.cs" "${VCS_LAUNCHER_SRC}/build_launcher.cmake"
+            COMMENT "Building VCSLauncher.exe"
+            VERBATIM)
+        add_dependencies(VCSNative VCSLauncher)
+    else()
+        message(WARNING "Roslyn csc.exe not found: VCSLauncher.exe will not be built.")
+    endif()
+    if(MSVC)
+        # A symbol file for profiling and crash triage. /OPT:REF and /OPT:ICF are stated explicitly
+        # because /DEBUG would otherwise switch them off; code generation is unchanged.
+        target_link_options(VCSNative PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+    endif()
+endif()
 if(MSVC)
     # /Ob3 must stay off the target: target_compile_options lands in the vcxproj
     # AdditionalOptions, which cl.exe sees *after* the per-source

@@ -624,6 +624,19 @@ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept;
 // native GPU swapchain. The caller must not present the window in that case.
 [[nodiscard]] bool ge_gpu_backend_presents_directly() noexcept;
 
+// True while the backend owns the window through a native swapchain (Vulkan on Windows/macOS with
+// the swapchain present enabled). The platform layer must then not draw into that window itself
+// (no GDI paints, no second presenter), or it fights the presentation engine.
+[[nodiscard]] bool ge_gpu_backend_owns_window() noexcept;
+
+// Shows a frame the GPU backend did not render (intro videos, screens the game draws straight into
+// guest RAM) through the same swapchain, so the window never has two owners. `rgba` is width*height
+// RGBA8 bytes, top row first. `aspect_locked` forces the aspect ratio to be preserved. Returns true
+// when the frame was handled (shown, or intentionally skipped because the window has no drawable
+// area); false means the caller must present it another way.
+[[nodiscard]] bool ge_gpu_backend_present_rgba(std::span<const std::byte> rgba, std::uint32_t width,
+                                               std::uint32_t height, bool aspect_locked) noexcept;
+
 // Framebuffer address (masked to VRAM) whose image the GPU rendered and put on
 // screen last, or 0 when the GPU owns nothing. Rasterizing that surface again
 // on the CPU produces pixels no one reads.

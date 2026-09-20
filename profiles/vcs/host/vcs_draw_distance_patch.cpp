@@ -11,7 +11,7 @@
 // LOD = 1.50
 //
 // 1.0 = original PSP distance. Values below 1.0 are clamped to 1.0.
-// World is allowed up to 6.0; Vehicles/NPCs up to 2.0 (higher despawns them); LOD up to 6.0.
+// World and LOD are capped at 3.0 (more costs frame time and thins out car spawns); Vehicles/NPCs stay at 1.0.
 // For mission compatibility, keep Vehicles/NPCs <= 2.0 unless tested.
 // LOD has no such caveat -- it only controls the distance at which an
 // entity (vehicle/ped) switches from its low-poly to high-poly model, a
@@ -218,12 +218,14 @@ DrawDistanceConfig load_config(const std::filesystem::path &path) {
         }
     }
 
-    cfg.world = std::clamp(cfg.world, 1.0f, 6.0f);
-    cfg.vehicles = std::clamp(cfg.vehicles, 1.0f, 2.0f);
-    cfg.npcs = std::clamp(cfg.npcs, 1.0f, 2.0f);
+    cfg.world = std::clamp(cfg.world, 1.0f, 3.0f);
+    // Vehicle and pedestrian range stays at the game's own value: the further it is pushed, the fewer of
+    // them spawn. Whatever an older ini says, these two are not scaled.
+    cfg.vehicles = 1.0f;
+    cfg.npcs = 1.0f;
     // No population-density downside to this one (see the field comment),
     // so it's allowed a much wider range than Vehicles/NPCs.
-    cfg.lod = std::clamp(cfg.lod, 1.0f, 6.0f);
+    cfg.lod = std::clamp(cfg.lod, 1.0f, 3.0f);
     return cfg;
 }
 

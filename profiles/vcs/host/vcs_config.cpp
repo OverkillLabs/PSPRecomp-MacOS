@@ -1,6 +1,7 @@
 #include "vcs_config.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cerrno>
@@ -159,7 +160,7 @@ void load_proper_shaders_configuration(VcsConfiguration &config,
             continue;
         }
         if (section == "dither" || section == "cas" || section == "vhs" ||
-            section == "timeofdaygrade" || section == "skypalette" || section == "reliefshading") {
+            section == "timeofdaygrade" || section == "skypalette") {
             const std::size_t eq = line.find('=');
             if (eq == std::string::npos) continue;
             const std::string k = lowercase_copy(trim_copy(line.substr(0u, eq)));
@@ -171,7 +172,6 @@ void load_proper_shaders_configuration(VcsConfiguration &config,
                            : section == "cas"     ? fx.cas_enabled
                            : section == "timeofdaygrade" ? fx.time_of_day_enabled
                            : section == "skypalette" ? fx.sky_palette_enabled
-                           : section == "reliefshading" ? fx.relief_enabled
                                                   : fx.vhs_enabled;
                 ok = parse_bool(v, flag);
             } else if (section == "dither" && k == "strength") {
@@ -182,8 +182,6 @@ void load_proper_shaders_configuration(VcsConfiguration &config,
                 ok = parse_float(v, 0.0f, 1.0f, fx.sky_palette_strength);
             } else if (section == "timeofdaygrade" && k == "strength") {
                 ok = parse_float(v, 0.0f, 1.0f, fx.time_of_day_strength);
-            } else if (section == "reliefshading" && k == "strength") {
-                ok = parse_float(v, 0.0f, 1.0f, fx.relief_strength);
             } else if (section == "vhs" && k == "wiggle") {
                 ok = parse_float(v, 0.0f, 1.5f, fx.vhs_wiggle);
             } else if (section == "vhs" && k == "smear") {
@@ -733,8 +731,18 @@ void set_environment_value(const char *name, const std::string &value) {
 
 } // namespace
 
+namespace {
+// Written by the window/UI thread (publish_live_display_surface), read by the guest and GE threads.
+std::atomic<std::uint32_t> g_live_surface_width{0u};
+std::atomic<std::uint32_t> g_live_surface_height{0u};
+} // namespace
+
 DisplaySurfaceDimensions resolve_display_surface_dimensions(
     const DisplayConfiguration &configuration) noexcept {
+    // The size the game is really being shown at, once the platform layer has published it.
+    const std::uint32_t live_width = g_live_surface_width.load(std::memory_order_acquire);
+    if (live_width != 0u)
+        return {live_width, g_live_surface_height.load(std::memory_order_relaxed)};
     switch (configuration.resolution_mode) {
     case DisplayResolutionMode::PspNative:
         return {480u, 272u};
@@ -1094,39 +1102,33 @@ float widescreen_stretch_factor(const VcsConfiguration &configuration,
     // Clamping keeps a typo in ForceAspectRatio from collapsing the interface
     // into a sliver or pushing it entirely off screen.
     //
-    // The floor used to be 0.5, which is backwards for any surface narrower
-    // than kGameNativeAspectRatio (16:9) -- factor comes out below 1.0 there,
-    // and the caller's correction is vertex.x = center + (vertex.x - center)
-    // / shrink, so a shrink below 1.0 divides by a fraction and EXPANDS the
-    // HUD outward instead of pulling it in. Confirmed directly on a 1.6:1
-    // MacBook display (narrower than 16:9): the money counter and radar got
-    // MORE cut off, not less, once resolve_display_surface_dimensions()
-    // started reporting the real (narrower) aspect instead of a fake 16:9-
-    // ish default that happened to keep factor above 1.0 by accident. A
-    // surface at or narrower than 16:9 needs no *extra* outward correction --
-    // 16:9 is the baseline the HUD is already sized for -- but the floor
-    // below is not 1.0 (a true no-op): even a plain 16:9, 1:1-scale render
-    // (PSP-native 480x272, no widescreen stretch involved at all) still
-    // shows the interface running past the true right/bottom edge with no
-    // correction whatsoever. VCS composites its HUD into a GE framebuffer
-    // allocated at the PSP's routine 512-wide VRAM stride (480 visible + 32
-    // padding columns -- confirmed live from the GE draw state itself, not
-    // inferred) rather than exactly 480 wide, and nothing upstream of this
-    // crops that padding away before it reaches the screen. 512/480 is that
-    // same, real ratio -- not a tuned fudge factor -- pulling every
-    // interface element in by exactly the fraction of the buffer that was
-    // never meant to be visible. Below this floor is the DX12-matching
-    // wider-than-16:9 case computed above; this is the floor under it.
-    // 512/480 (1.0667) was the VRAM-stride-derived first estimate; live
-    // measurement against the reference layout showed it was not enough --
-    // the widest interface element (the money-counter frame, vertices
-    // reaching x=520 in native space) needs (520-240)/240 =~ 1.167 to land
-    // back at the true edge, not 1.0667. The frame's own 520 is itself
-    // already past the 512 stride, so 512 was never the whole story; 1.2
-    // covers that element (and the minimap, symmetric at the opposite
-    // corner) with a little room rather than landing exactly on the edge.
-    constexpr float kHudSafeAreaFloor = 1.15f;
-    return std::clamp(factor, kHudSafeAreaFloor, 4.0f);
+    // This is the exact ratio against the game's own 16:9 (1.0 on a 16:9 surface) and nothing else. It
+    // used to carry a 1.15 floor "for the HUD"; because the guest reads this same value to widen its
+    // projection, that floor also widened the 3D view by 15% on a plain 16:9 screen and then forced
+    // per-edge fudge factors into the interface to hide it. The original repository has no floor and
+    // its HUD sits exactly where the game puts it. The interface, which must never be pushed
+    // outwards, uses widescreen_hud_factor() instead.
+    return std::clamp(factor, 0.5f, 4.0f);
+}
+
+float widescreen_hud_factor(const VcsConfiguration &configuration,
+                            std::uint32_t surface_width,
+                            std::uint32_t surface_height) noexcept {
+    // A surface narrower than 16:9 narrows the guest's projection (factor < 1); dividing interface
+    // coordinates by a factor under 1 would expand them past the screen edges. 16:9 is the layout the
+    // interface is authored for, so anything narrower keeps it untouched.
+    return std::max(1.0f, widescreen_stretch_factor(configuration, surface_width, surface_height));
+}
+
+void publish_live_display_surface(std::uint32_t width, std::uint32_t height) noexcept {
+    if (width == 0u && height == 0u) {  // explicit reset: back to the configured size
+        g_live_surface_width.store(0u, std::memory_order_release);
+        return;
+    }
+    // Anything implausibly small (a window being minimised reports 0 or 1) keeps the last real size.
+    if (width < 16u || height < 16u) return;
+    g_live_surface_height.store(height, std::memory_order_relaxed);
+    g_live_surface_width.store(width, std::memory_order_release);
 }
 
 } // namespace vcs

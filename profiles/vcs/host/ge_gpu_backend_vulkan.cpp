@@ -121,6 +121,32 @@ constexpr VkFormat kColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
 // setting turns into actual extra pixels for free.
 constexpr float kPspWidth = 480.0f;
 constexpr float kPspHeight = 272.0f;
+
+// The guest composes each frame into a 512 x 320 area (the display's 512-pixel stride and the rows
+// below it) and its world and interface geometry is positioned in that space, the top-left 480 x 272
+// of it being what a PSP's screen shows. The original DirectX 12 renderer presents the whole frame
+// (it tracks the logical extent of the target it presents), so the world and the interface both sit
+// inside the picture. Mapping only 480 x 272 of it to the output crops the frame and magnifies it by
+// 512/480 horizontally and 320/272 vertically: the interface ran off the right and bottom edges and
+// the field of view came out narrower. Every conversion between guest screen space and the render
+// target therefore uses this size. PSPRECOMP_VULKAN_FRAME=480x272 restores the cropped mapping.
+struct FrameExtent {
+    float width;
+    float height;
+};
+FrameExtent frame_extent() noexcept {
+    static const FrameExtent extent = [] {
+        FrameExtent value{512.0f, 320.0f};
+        if (const char *text = VCS_ENV("PSPRECOMP_VULKAN_FRAME"); text != nullptr && *text != '\0') {
+            unsigned w = 0u;
+            unsigned h = 0u;
+            if (std::sscanf(text, "%ux%u", &w, &h) == 2 && w >= 240u && w <= 2048u && h >= 136u && h <= 2048u)
+                value = {static_cast<float>(w), static_cast<float>(h)};
+        }
+        return value;
+    }();
+    return extent;
+}
 constexpr VkDeviceSize kInitialVertexBytes = 8u * 1024u * 1024u;
 
 // Vice City time-of-day palette weights from the in-game clock: `golden` peaks
@@ -574,6 +600,19 @@ struct VulkanGeState {
     // fixed separately in display_window.cpp, but did not fully explain the
     // missing videos on its own).
     bool swapchain_presented_this_call{false};
+    // Frames the GPU backend did not render (intro videos, screens drawn straight into guest RAM)
+    // are shown through the same swapchain: uploaded to sw_image and drawn by the present pass.
+    VkImage sw_image{VK_NULL_HANDLE};
+    VkDeviceMemory sw_image_memory{VK_NULL_HANDLE};
+    VkImageView sw_view{VK_NULL_HANDLE};
+    VkDescriptorSet sw_descriptor_set{VK_NULL_HANDLE};
+    std::uint32_t sw_width{0u};
+    std::uint32_t sw_height{0u};
+    bool sw_image_in_use{false};  // has been through a layout transition (contents defined)
+    VkBuffer sw_staging{VK_NULL_HANDLE};
+    VkDeviceMemory sw_staging_memory{VK_NULL_HANDLE};
+    void *sw_staging_mapped{nullptr};
+    VkDeviceSize sw_staging_capacity{0u};
     VkFence present_fence{VK_NULL_HANDLE};
     bool present_fence_pending{false};
 
@@ -834,6 +873,8 @@ struct VulkanGeState {
     // budget in apply_texture_replacements() further replacements are skipped and the original,
     // small texture stays, so unexpected content can never exhaust the machine's memory.
     std::uint64_t replaced_bytes{0};
+    // Most video memory the replacement textures may hold (set from the GPU at start-up).
+    std::uint64_t replacement_budget{3ull << 30};
     std::unordered_map<std::uint64_t, VkSampler> samplers;
     TextureEntry dummy_texture{};
     // Cache capacity actually enforced at runtime -- sized from
@@ -1869,14 +1910,27 @@ void destroy_backend(VulkanGeState &s) noexcept {
         case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: score = 1; break;
         default: score = 0; break;
         }
+        // Same type, more device-local memory wins: on a machine with two discrete GPUs the
+        // bigger one is the faster one in practice (the type still dominates the ordering).
+        {
+            VkPhysicalDeviceMemoryProperties memory{};
+            vkGetPhysicalDeviceMemoryProperties(devices[index], &memory);
+            VkDeviceSize best_heap = 0u;
+            for (std::uint32_t heap = 0u; heap < memory.memoryHeapCount; ++heap)
+                if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0u)
+                    best_heap = std::max(best_heap, memory.memoryHeaps[heap].size);
+            score = score * 1000 + static_cast<int>(std::min<VkDeviceSize>(best_heap >> 30u, 500u));
+        }
         if (override_text != nullptr && *override_text != '\0') {
             char *end = nullptr;
             const unsigned long wanted_index = std::strtoul(override_text, &end, 10);
-            const bool by_index = end != override_text && *end == '\0';
+            // A number is an index only when it names a device that exists; otherwise it is part of
+            // the GPU's name ("2070", "5070 Ti").
+            const bool by_index = end != override_text && *end == '\0' && wanted_index < devices.size();
             const bool matches = by_index
                 ? wanted_index == index
                 : lowered(properties.deviceName).find(lowered(override_text)) != std::string::npos;
-            if (matches) score = 100;
+            if (matches) score = 1'000'000;
         }
         if (score > chosen_score) {
             chosen_score = score;
@@ -1955,6 +2009,34 @@ void destroy_backend(VulkanGeState &s) noexcept {
     std::vector<VkPhysicalDevice> devices(device_count);
     vkEnumeratePhysicalDevices(s.instance, &device_count, devices.data());
     s.physical_device = pick_physical_device(devices);
+    // Size the replacement-texture budget from the GPU instead of assuming 3 GiB fits. On a 4 GB card
+    // 3 GiB of replacements plus the render targets overcommits video memory, which Windows answers by
+    // paging to system RAM (stutter) or the driver by failing allocations. A discrete GPU may use 40% of
+    // its device-local heap, an integrated one (whose "video memory" is system RAM) 25% and at most 1 GiB.
+    // Apple's unified-memory GPUs keep the fixed 3 GiB they have always had: this only refines Windows
+    // and other platforms.
+    if (std::strcmp(vkplat::platform_name(), "macos") != 0) {
+        VkPhysicalDeviceMemoryProperties memory{};
+        vkGetPhysicalDeviceMemoryProperties(s.physical_device, &memory);
+        VkDeviceSize local_heap = 0u;
+        for (std::uint32_t heap = 0u; heap < memory.memoryHeapCount; ++heap)
+            if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0u)
+                local_heap = std::max(local_heap, memory.memoryHeaps[heap].size);
+        VkPhysicalDeviceProperties budget_properties{};
+        vkGetPhysicalDeviceProperties(s.physical_device, &budget_properties);
+        constexpr std::uint64_t kMiB = 1ull << 20;
+        const bool integrated = budget_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        if (local_heap != 0u) {
+            std::uint64_t budget = integrated ? local_heap / 4u : local_heap / 5u * 2u;
+            budget = std::clamp<std::uint64_t>(budget, integrated ? 256u * kMiB : 512u * kMiB,
+                                               integrated ? 1024u * kMiB : 3072u * kMiB);
+            s.replacement_budget = budget;
+            std::fprintf(stderr, "[vulkan] video memory %llu MB (%s), texture replacement budget %llu MB\n",
+                         static_cast<unsigned long long>(local_heap / kMiB),
+                         integrated ? "integrated" : "discrete",
+                         static_cast<unsigned long long>(budget / kMiB));
+        }
+    }
     s.report.physical_device_count = device_count;
 
     std::uint32_t family_count = 0u;
@@ -4079,9 +4161,10 @@ void destroy_swapchain_targets(VulkanGeState &s) noexcept {
         return false;
     }
 
-    const VkDescriptorPoolSize present_pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u};
+    // Two sets: one for the GPU frame, one for software-rendered frames (see present_software_frame).
+    const VkDescriptorPoolSize present_pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u};
     VkDescriptorPoolCreateInfo present_pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    present_pool_info.maxSets = 1u;
+    present_pool_info.maxSets = 2u;
     present_pool_info.poolSizeCount = 1u;
     present_pool_info.pPoolSizes = &present_pool_size;
     if (vkCreateDescriptorPool(s.device, &present_pool_info, nullptr,
@@ -4097,6 +4180,10 @@ void destroy_swapchain_targets(VulkanGeState &s) noexcept {
     if (vkAllocateDescriptorSets(s.device, &present_allocate, &s.present_descriptor_set) !=
         VK_SUCCESS) {
         error = "vkAllocateDescriptorSets failed for the present pass";
+        return false;
+    }
+    if (vkAllocateDescriptorSets(s.device, &present_allocate, &s.sw_descriptor_set) != VK_SUCCESS) {
+        error = "vkAllocateDescriptorSets failed for the software-frame present set";
         return false;
     }
     // s.color_view never changes address for the life of the backend (no
@@ -4331,24 +4418,11 @@ void destroy_swapchain_targets(VulkanGeState &s) noexcept {
 
 [[nodiscard]] std::uint32_t packed_texture_control(const GeGpuDrawDescriptor &draw,
                                                    bool enabled) noexcept {
-    // Sun-lit relief: bit 7 of the second byte switches it on, and the third
-    // byte's upper seven bits carry where the sun is across the sky (0 = east
-    // horizon, 127 = west), which the shader turns into a light direction.
-    std::uint32_t relief_bit = 0u, sun_bits = 0u;
-    const VcsConfiguration &cfg = vcs_configuration();
-    if (cfg.postfx.relief_enabled && !draw.through) {
-        const float hour = vcs::game_clock_hours();
-        if (hour >= 5.5f && hour <= 19.5f) {
-            const float t = std::clamp((hour - 6.0f) / 13.0f, 0.0f, 1.0f);
-            sun_bits = static_cast<std::uint32_t>(std::lround(t * 127.0f)) << 1u;
-            relief_bit = 0x80u;
-        }
-    }
     return (draw.texture_function & 0xFFu) |
            ((static_cast<std::uint32_t>(draw.texture_use_alpha ? 1u : 0u) |
              (texture_scale_shift(draw) << 4u) |
-             ((!draw.through && vcs_configuration().textures.detail) ? 0x40u : 0u) | relief_bit) << 8u) |
-           ((static_cast<std::uint32_t>(draw.texture_double_color ? 1u : 0u) | sun_bits) << 16u) |
+             ((!draw.through && vcs_configuration().textures.detail) ? 0x40u : 0u)) << 8u) |
+           (static_cast<std::uint32_t>(draw.texture_double_color ? 1u : 0u) << 16u) |
            (static_cast<std::uint32_t>(enabled ? 1u : 0u) << 24u);
 }
 
@@ -4446,8 +4520,8 @@ CloudUniforms cloud_present_constants(const VulkanGeState &s, std::uint32_t targ
 
     GeCloudCameraFrame frame{};
     if (!ge_cloud_camera_frame_from_view(camera->view, frame)) return out;
-    const float logical_width = static_cast<float>(std::max<std::uint32_t>(1u, kPspWidth));
-    const float logical_height = static_cast<float>(std::max<std::uint32_t>(1u, kPspHeight));
+    const float logical_width = frame_extent().width;
+    const float logical_height = frame_extent().height;
     const float x_a = camera->viewport[0] * (2.0f / logical_width);
     const float y_a = camera->viewport[1] * (2.0f / logical_height);
     const float x_b =
@@ -5013,11 +5087,11 @@ GeGpuWidescreenHud ge_gpu_backend_widescreen_hud(const GeGpuDrawDescriptor &) no
     if (!config.initialized || !config.widescreen.enabled) return hud;
 
     const DisplaySurfaceDimensions output = resolve_display_surface_dimensions(config.display);
-    const float shrink = widescreen_stretch_factor(config, output.width, output.height);
+    const float shrink = widescreen_hud_factor(config, output.width, output.height);
     if (!std::isfinite(shrink) || shrink <= 0.0f || std::abs(shrink - 1.0f) < 1.0e-5f)
         return hud;
 
-    constexpr float kReferenceWidth = kPspWidth;  // 480 -- see kPspWidth's definition above.
+    const float kReferenceWidth = frame_extent().width;  // the logical frame, see frame_extent().
     hud.shrink = shrink;
     hud.display_scale_x = 1.0f;  // logical_width == kReferenceWidth with no per-target override.
     hud.source_center = kReferenceWidth * 0.5f;
@@ -5313,12 +5387,12 @@ void ge_gpu_backend_accumulate_color_triangles(
     const auto clip_y = row(1u);
     const auto clip_z = row(2u);
     const auto clip_w = row(3u);
-    const float x_a = hw.viewport_scale_x * (2.0f / kPspWidth);
-    const float x_b = (hw.viewport_center_x - hw.viewport_offset_x) * (2.0f / kPspWidth) - 1.0f;
+    const float x_a = hw.viewport_scale_x * (2.0f / frame_extent().width);
+    const float x_b = (hw.viewport_center_x - hw.viewport_offset_x) * (2.0f / frame_extent().width) - 1.0f;
     // No negation here (see header comment) -- Vulkan's y-down NDC wants the
     // natural sign, unlike D3D's y-up.
-    const float y_a = hw.viewport_scale_y * (2.0f / kPspHeight);
-    const float y_b = (hw.viewport_center_y - hw.viewport_offset_y) * (2.0f / kPspHeight) - 1.0f;
+    const float y_a = hw.viewport_scale_y * (2.0f / frame_extent().height);
+    const float y_b = (hw.viewport_center_y - hw.viewport_offset_y) * (2.0f / frame_extent().height) - 1.0f;
     constexpr float inv_depth = 1.0f / 65535.0f;
     const float z_a = hw.viewport_scale_z * inv_depth;
     const float z_b = hw.viewport_center_z * inv_depth;
@@ -5841,10 +5915,10 @@ void apply_texture_replacements(VulkanGeState &s) noexcept {
             b.has_carry = true;
             break;
         }
-        // Safety net: leave the original texture in place once replacements hold this much.
-        constexpr std::uint64_t kReplacedTextureBudget = 3ull << 30;
+        // Safety net: leave the original texture in place once replacements hold this much. The limit
+        // follows the GPU's memory (see the budget set next to device selection).
         const std::uint64_t estimated_bytes = byte_size * 4u / 3u;
-        if (s.replaced_bytes + estimated_bytes > kReplacedTextureBudget) continue;
+        if (s.replaced_bytes + estimated_bytes > s.replacement_budget) continue;
         PendingUploadItem item;
         item.key = r.key;
         item.sampler = old.sampler;
@@ -6001,9 +6075,18 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
                         present_render_begin.pClearValues = &present_clear;
                         vkCmdBeginRenderPass(s.present_command_buffer, &present_render_begin,
                                              VK_SUBPASS_CONTENTS_INLINE);
+                        // Stretch fills the window; Preserve / IntegerScale letterbox the picture
+                        // (the render pass clear paints the bars). The same rectangle is what the
+                        // platform layer publishes for the widescreen correction.
+                        const DisplayConfiguration &present_display = vcs_configuration().display;
+                        const PresentationRectangle present_rect = calculate_presentation_rectangle(
+                            s.swapchain_extent.width, s.swapchain_extent.height, s.width, s.height,
+                            present_display.aspect_mode, present_display.integer_scale);
                         VkViewport present_viewport{};
-                        present_viewport.width = static_cast<float>(s.swapchain_extent.width);
-                        present_viewport.height = static_cast<float>(s.swapchain_extent.height);
+                        present_viewport.x = static_cast<float>(present_rect.x);
+                        present_viewport.y = static_cast<float>(present_rect.y);
+                        present_viewport.width = static_cast<float>(std::max(1, present_rect.width));
+                        present_viewport.height = static_cast<float>(std::max(1, present_rect.height));
                         present_viewport.maxDepth = 1.0f;
                         vkCmdSetViewport(s.present_command_buffer, 0, 1, &present_viewport);
                         VkRect2D present_scissor{{0, 0}, s.swapchain_extent};
@@ -6345,8 +6428,8 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
 
     // PSP screen space -> internal target. Vertex positions scale through the
     // viewport automatically; only the scissor rectangle needs converting.
-    const float scale_x = static_cast<float>(s.width) / kPspWidth;
-    const float scale_y = static_cast<float>(s.height) / kPspHeight;
+    const float scale_x = static_cast<float>(s.width) / frame_extent().width;
+    const float scale_y = static_cast<float>(s.height) / frame_extent().height;
 
     const std::size_t batches_before_coalesce = winner->batches.size();
     std::uint64_t batches_merged_away = 0u;
@@ -6443,9 +6526,9 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
         const std::int32_t x0 = std::max<std::int32_t>(0, batch.scissor[0]);
         const std::int32_t y0 = std::max<std::int32_t>(0, batch.scissor[1]);
         const std::int32_t x1 =
-            std::min<std::int32_t>(static_cast<std::int32_t>(kPspWidth) - 1, batch.scissor[2]);
+            std::min<std::int32_t>(static_cast<std::int32_t>(frame_extent().width) - 1, batch.scissor[2]);
         const std::int32_t y1 =
-            std::min<std::int32_t>(static_cast<std::int32_t>(kPspHeight) - 1, batch.scissor[3]);
+            std::min<std::int32_t>(static_cast<std::int32_t>(frame_extent().height) - 1, batch.scissor[3]);
         if (x1 < x0 || y1 < y0) continue;
         VkRect2D scissor{};
         // GE scissor bounds are inclusive on both ends.
@@ -6462,8 +6545,8 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
         vkCmdSetBlendConstants(s.command_buffer, batch.blend_constants.data());
 
         PushConstants push{};
-        push.inverse_viewport[0] = 2.0f / kPspWidth;
-        push.inverse_viewport[1] = 2.0f / kPspHeight;
+        push.inverse_viewport[0] = 2.0f / frame_extent().width;
+        push.inverse_viewport[1] = 2.0f / frame_extent().height;
         push.framebuffer_format = batch.framebuffer_format;
         vkCmdPushConstants(s.command_buffer, s.pipeline_layout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
@@ -6497,9 +6580,9 @@ static bool finish_color_frame_impl(std::uint64_t vblank) noexcept {
             const std::int32_t x0 = std::max<std::int32_t>(0, batch.scissor[0]);
             const std::int32_t y0 = std::max<std::int32_t>(0, batch.scissor[1]);
             const std::int32_t x1 =
-                std::min<std::int32_t>(static_cast<std::int32_t>(kPspWidth) - 1, batch.scissor[2]);
+                std::min<std::int32_t>(static_cast<std::int32_t>(frame_extent().width) - 1, batch.scissor[2]);
             const std::int32_t y1 =
-                std::min<std::int32_t>(static_cast<std::int32_t>(kPspHeight) - 1, batch.scissor[3]);
+                std::min<std::int32_t>(static_cast<std::int32_t>(frame_extent().height) - 1, batch.scissor[3]);
             if (x1 < x0 || y1 < y0) continue;
             VkRect2D scissor{};
             scissor.offset = {static_cast<std::int32_t>(static_cast<float>(x0) * scale_x),
@@ -6817,6 +6900,206 @@ bool ge_gpu_backend_copy_game_frame_rgba(std::span<std::byte> destination) noexc
     if (!s.frame_valid || destination.size() < s.frame_rgba.size()) return false;
     std::memcpy(destination.data(), s.frame_rgba.data(), s.frame_rgba.size());
     return true;
+}
+
+// Shows one CPU-rendered frame through the swapchain. Called from the platform's present functions
+// (display_window_present*) on the vblank thread. Mirrors the swapchain branch of
+// finish_color_frame_impl(), but samples a small upload texture instead of the GPU's own frame and
+// never touches present_color_read_done (no GPU render target is read, so the next render has no
+// dependency on this present).
+static bool present_software_frame(VulkanGeState &s, std::span<const std::byte> rgba,
+                                   std::uint32_t width, std::uint32_t height,
+                                   bool aspect_locked) noexcept {
+    const std::size_t bytes = static_cast<std::size_t>(width) * height * 4u;
+    if (width == 0u || height == 0u || rgba.size() < bytes) return false;
+
+    // Everything below shares present_command_buffer / present_fence with the GPU-frame present.
+    vkWaitForFences(s.device, 1, &s.present_fence, VK_TRUE, 5'000'000'000ull);
+
+    if (vkplat::surface_extent_can_change() && !s.swapchain_needs_recreate) {
+        VkSurfaceCapabilitiesKHR surface_caps{};
+        if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s.physical_device, s.diagnostic_surface,
+                                                       &surface_caps) == VK_SUCCESS &&
+            surface_caps.currentExtent.width != 0xFFFFFFFFu &&
+            (surface_caps.currentExtent.width != s.swapchain_extent.width ||
+             surface_caps.currentExtent.height != s.swapchain_extent.height))
+            s.swapchain_needs_recreate = true;
+    }
+    if (s.swapchain_needs_recreate && !recreate_present_swapchain(s)) {
+        // Minimised (nothing to draw into): handled, the frame is simply not shown. If the swapchain
+        // itself is gone the caller has to present another way.
+        return s.swapchain != VK_NULL_HANDLE;
+    }
+
+    // Upload staging buffer, grown on demand.
+    if (s.sw_staging == VK_NULL_HANDLE || s.sw_staging_capacity < bytes) {
+        if (s.sw_staging_mapped != nullptr) vkUnmapMemory(s.device, s.sw_staging_memory);
+        if (s.sw_staging != VK_NULL_HANDLE) vkDestroyBuffer(s.device, s.sw_staging, nullptr);
+        if (s.sw_staging_memory != VK_NULL_HANDLE) vkFreeMemory(s.device, s.sw_staging_memory, nullptr);
+        s.sw_staging = VK_NULL_HANDLE;
+        s.sw_staging_memory = VK_NULL_HANDLE;
+        s.sw_staging_mapped = nullptr;
+        s.sw_staging_capacity = 0u;
+        const VkDeviceSize capacity = std::max<VkDeviceSize>(bytes, 1024u * 1024u);
+        if (!create_buffer(s, capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                           s.sw_staging, s.sw_staging_memory) ||
+            vkMapMemory(s.device, s.sw_staging_memory, 0, capacity, 0, &s.sw_staging_mapped) != VK_SUCCESS)
+            return false;
+        s.sw_staging_capacity = capacity;
+    }
+
+    // Upload image, replaced when the source size changes.
+    if (s.sw_image == VK_NULL_HANDLE || s.sw_width != width || s.sw_height != height) {
+        if (s.sw_view != VK_NULL_HANDLE) vkDestroyImageView(s.device, s.sw_view, nullptr);
+        if (s.sw_image != VK_NULL_HANDLE) vkDestroyImage(s.device, s.sw_image, nullptr);
+        if (s.sw_image_memory != VK_NULL_HANDLE) vkFreeMemory(s.device, s.sw_image_memory, nullptr);
+        s.sw_view = VK_NULL_HANDLE;
+        s.sw_image = VK_NULL_HANDLE;
+        s.sw_image_memory = VK_NULL_HANDLE;
+        s.sw_image_in_use = false;
+        VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        image_info.extent = {width, height, 1u};
+        image_info.mipLevels = 1u;
+        image_info.arrayLayers = 1u;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(s.device, &image_info, nullptr, &s.sw_image) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        vkGetImageMemoryRequirements(s.device, s.sw_image, &requirements);
+        std::uint32_t type_index = 0u;
+        if (!find_memory_type(s.physical_device, requirements.memoryTypeBits,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, type_index))
+            return false;
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.allocationSize = requirements.size;
+        allocate.memoryTypeIndex = type_index;
+        if (vkAllocateMemory(s.device, &allocate, nullptr, &s.sw_image_memory) != VK_SUCCESS ||
+            vkBindImageMemory(s.device, s.sw_image, s.sw_image_memory, 0) != VK_SUCCESS)
+            return false;
+        VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view_info.image = s.sw_image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        view_info.subresourceRange.levelCount = 1u;
+        view_info.subresourceRange.layerCount = 1u;
+        if (vkCreateImageView(s.device, &view_info, nullptr, &s.sw_view) != VK_SUCCESS) return false;
+        s.sw_width = width;
+        s.sw_height = height;
+        VkDescriptorImageInfo image_descriptor{};
+        image_descriptor.sampler = s.present_sampler;
+        image_descriptor.imageView = s.sw_view;
+        image_descriptor.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = s.sw_descriptor_set;
+        write.descriptorCount = 1u;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &image_descriptor;
+        vkUpdateDescriptorSets(s.device, 1, &write, 0, nullptr);
+    }
+
+    std::uint32_t image_index = 0u;
+    const VkResult acquired = vkAcquireNextImageKHR(s.device, s.swapchain, 5'000'000'000ull,
+                                                    s.present_image_acquired, VK_NULL_HANDLE,
+                                                    &image_index);
+    if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+        s.swapchain_needs_recreate = true;
+        return true;  // the next frame recreates the swapchain; one skipped frame is invisible
+    }
+    if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return false;
+    vkResetFences(s.device, 1, &s.present_fence);
+
+    std::memcpy(s.sw_staging_mapped, rgba.data(), bytes);
+    vkResetCommandBuffer(s.present_command_buffer, 0);
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(s.present_command_buffer, &begin) != VK_SUCCESS) return false;
+    transition_image(s.present_command_buffer, s.sw_image,
+                     s.sw_image_in_use ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                       : VK_IMAGE_LAYOUT_UNDEFINED,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0u, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1u;
+    region.imageExtent = {width, height, 1u};
+    vkCmdCopyBufferToImage(s.present_command_buffer, s.sw_staging, s.sw_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    transition_image(s.present_command_buffer, s.sw_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    s.sw_image_in_use = true;
+
+    VkClearValue clear{};
+    clear.color = VkClearColorValue{{0.0f, 0.0f, 0.0f, 1.0f}};
+    VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    pass.renderPass = s.present_render_pass;
+    pass.framebuffer = s.swapchain_framebuffers[image_index];
+    pass.renderArea.extent = s.swapchain_extent;
+    pass.clearValueCount = 1u;
+    pass.pClearValues = &clear;  // the clear paints the letterbox bars
+    vkCmdBeginRenderPass(s.present_command_buffer, &pass, VK_SUBPASS_CONTENTS_INLINE);
+    const DisplayConfiguration &display = vcs_configuration().display;
+    const PresentationRectangle rect = calculate_presentation_rectangle(
+        s.swapchain_extent.width, s.swapchain_extent.height, width, height,
+        aspect_locked ? DisplayAspectMode::Preserve : display.aspect_mode, display.integer_scale);
+    VkViewport viewport{};
+    viewport.x = static_cast<float>(rect.x);
+    viewport.y = static_cast<float>(rect.y);
+    viewport.width = static_cast<float>(std::max(1, rect.width));
+    viewport.height = static_cast<float>(std::max(1, rect.height));
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(s.present_command_buffer, 0, 1, &viewport);
+    const VkRect2D scissor{{0, 0}, s.swapchain_extent};
+    vkCmdSetScissor(s.present_command_buffer, 0, 1, &scissor);
+    vkCmdBindPipeline(s.present_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s.present_pipeline);
+    vkCmdBindDescriptorSets(s.present_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            s.present_pipeline_layout, 0, 1, &s.sw_descriptor_set, 0, nullptr);
+    vkCmdDraw(s.present_command_buffer, 3u, 1u, 0u, 0u);
+    vkCmdEndRenderPass(s.present_command_buffer);
+    if (vkEndCommandBuffer(s.present_command_buffer) != VK_SUCCESS) return false;
+
+    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.waitSemaphoreCount = 1u;
+    submit.pWaitSemaphores = &s.present_image_acquired;
+    submit.pWaitDstStageMask = &wait_stage;
+    submit.commandBufferCount = 1u;
+    submit.pCommandBuffers = &s.present_command_buffer;
+    submit.signalSemaphoreCount = 1u;
+    submit.pSignalSemaphores = &s.present_render_finished;
+    if (vkQueueSubmit(s.graphics_queue, 1, &submit, s.present_fence) != VK_SUCCESS) return false;
+    VkPresentInfoKHR present_info{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    present_info.waitSemaphoreCount = 1u;
+    present_info.pWaitSemaphores = &s.present_render_finished;
+    present_info.swapchainCount = 1u;
+    present_info.pSwapchains = &s.swapchain;
+    present_info.pImageIndices = &image_index;
+    const VkResult presented = vkQueuePresentKHR(s.graphics_queue, &present_info);
+    if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR)
+        s.swapchain_needs_recreate = true;
+    return true;
+}
+
+bool ge_gpu_backend_owns_window() noexcept {
+    const VulkanGeState &s = state();
+    return s.enabled && s.swapchain_migration_enabled && s.swapchain != VK_NULL_HANDLE;
+}
+
+bool ge_gpu_backend_present_rgba(std::span<const std::byte> rgba, std::uint32_t width,
+                                 std::uint32_t height, bool aspect_locked) noexcept {
+    VulkanGeState &s = state();
+    if (!ge_gpu_backend_owns_window()) return false;
+    // Serialised with the GE worker and finish_color_frame (the lock is recursive).
+    std::lock_guard<std::recursive_mutex> guard(backend_mutex());
+    if (!ge_gpu_backend_owns_window()) return false;
+    return present_software_frame(s, rgba, width, height, aspect_locked);
 }
 
 bool ge_gpu_backend_presents_directly() noexcept {

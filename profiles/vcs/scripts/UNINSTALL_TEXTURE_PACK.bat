@@ -1,8 +1,10 @@
 @echo off
 setlocal EnableExtensions
 rem Removes a texture pack installed by INSTALL_TEXTURE_PACK.bat (only the files it installed).
+rem Optional argument: the Textures folder to remove from (default: Textures beside this script).
 
 set "DEST=%~dp0Textures"
+if not "%~1"=="" set "DEST=%~1"
 if not exist "%DEST%\.installed-texture-pack" (
   echo No installed texture pack found in %DEST%
   exit /b 1

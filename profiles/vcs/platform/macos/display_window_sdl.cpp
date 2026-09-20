@@ -4,6 +4,7 @@
 #include "display_window.hpp"
 #include "dx12_presenter.hpp"
 #include "ge_gpu_backend.hpp"
+#include "vcs_camera_input.hpp"
 #include "vcs_config.hpp"
 #include "vcs_env.hpp"
 #include "vcs_key_prompts.hpp"
@@ -111,6 +112,25 @@ struct WindowState {
 WindowState &window_state() {
     static WindowState state;
     return state;
+}
+
+// Tells the widescreen code (the guest's projection and the interface correction) how big the game
+// picture really is on screen: the whole drawable when it is stretched, the letterboxed rectangle when
+// its proportions are kept. Called once the renderer exists and on every resize, so any display or
+// window shape gets a projection and an interface that match. Same rules as the Windows layer and the
+// GPU present pass. Must run on the thread that owns the SDL renderer (the main thread).
+void publish_output_surface(const WindowState &state) {
+    if (state.renderer == nullptr) return;
+    int output_w = 0;
+    int output_h = 0;
+    SDL_GetRendererOutputSize(state.renderer, &output_w, &output_h);
+    if (output_w <= 0 || output_h <= 0) return;
+    const InternalResolutionDimensions source = resolve_internal_resolution(vcs_configuration().rendering);
+    const PresentationRectangle picture = calculate_presentation_rectangle(
+        static_cast<std::uint32_t>(output_w), static_cast<std::uint32_t>(output_h), source.width, source.height,
+        state.configuration.aspect_mode, state.configuration.integer_scale);
+    publish_live_display_surface(static_cast<std::uint32_t>(std::max(1, picture.width)),
+                                 static_cast<std::uint32_t>(std::max(1, picture.height)));
 }
 
 bool key_down(const std::uint8_t *keys, SDL_Scancode code) noexcept { return keys[code] != 0; }
@@ -321,6 +341,7 @@ void display_window_start() {
 
     state.window = window;
     state.renderer = renderer;
+    publish_output_surface(state);
     state.ready.store(true, std::memory_order_release);
 }
 
@@ -464,15 +485,12 @@ HostInputState display_window_input() {
     }
 
     const ControlsConfiguration &controls = vcs_configuration().controls;
-    const int sensitivity = static_cast<int>(controls.mouse_sensitivity);
-    const auto camera_response = [sensitivity](std::int32_t delta) {
-        const double scaled = std::abs(delta) * (sensitivity / 12.0);
-        const double magnitude = 127.0 * scaled / (scaled + 12.0);
-        return static_cast<int>(std::lround(delta < 0 ? -magnitude : magnitude));
-    };
-    input.camera_x = camera_response(mouse_dx);
-    input.camera_y = camera_response(-mouse_dy);
-    if (controls.invert_camera_y) input.camera_y = -input.camera_y;
+    // The mouse is deliberately not turned into an axis here. This poll runs about eleven times per
+    // frame and each one only sees the motion since the previous poll, so a per-poll axis was
+    // overwritten with zero by the next poll before the game read it and most movement was lost. The
+    // SDL_MOUSEMOTION handler adds raw motion to the camera's own accumulator instead
+    // (vcs_camera_add_mouse_motion), which converts it once per frame when the game reads the axis.
+    // Only a deflected controller stick is forwarded from here.
 
     if (SDL_GameController *pad = state.controller.load(std::memory_order_acquire);
         pad != nullptr && SDL_GameControllerGetAttached(pad)) {
@@ -589,11 +607,15 @@ void display_window_pump_events() {
             } else if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                 state.focused.store(false, std::memory_order_relaxed);
                 SDL_SetRelativeMouseMode(SDL_FALSE);
+            } else if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                       event.window.event == SDL_WINDOWEVENT_RESIZED) {
+                publish_output_surface(state);
             }
             break;
         case SDL_MOUSEMOTION:
             state.mouse_dx.fetch_add(event.motion.xrel, std::memory_order_relaxed);
             state.mouse_dy.fetch_add(event.motion.yrel, std::memory_order_relaxed);
+            vcs_camera_add_mouse_motion(event.motion.xrel, event.motion.yrel);
             break;
         case SDL_MOUSEWHEEL:
             state.wheel.fetch_add(event.wheel.y, std::memory_order_relaxed);

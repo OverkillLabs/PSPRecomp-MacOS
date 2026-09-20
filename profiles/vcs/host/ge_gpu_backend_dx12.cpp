@@ -3257,7 +3257,7 @@ GeGpuWidescreenHud ge_gpu_backend_widescreen_hud(
     // target to still produce a correct 21:9/32:9 camera and HUD.
     const DisplaySurfaceDimensions output =
         resolve_display_surface_dimensions(config.display);
-    const float shrink = widescreen_stretch_factor(config, output.width, output.height);
+    const float shrink = widescreen_hud_factor(config, output.width, output.height);
     if (!std::isfinite(shrink) || shrink <= 0.0f ||
         std::abs(shrink - 1.0f) < 1.0e-5f)
         return hud;
@@ -4191,6 +4191,9 @@ bool ge_gpu_backend_presents_directly() noexcept {
     const Dx12GeState &s = state();
     return s.enabled && s.swapchain != nullptr && s.direct_present_ok;
 }
+// DX12 presents through its own presenter; the Vulkan-swapchain arbitration does not apply.
+bool ge_gpu_backend_owns_window() noexcept { return false; }
+bool ge_gpu_backend_present_rgba(std::span<const std::byte>, std::uint32_t, std::uint32_t, bool) noexcept { return false; }
 std::uint32_t ge_gpu_backend_owned_framebuffer() noexcept {
     const Dx12GeState &s = state();
     return s.enabled && s.swapchain != nullptr && s.direct_present_ok
@@ -4259,6 +4262,8 @@ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept { st
 bool ge_gpu_backend_finish_color_frame(std::uint64_t) noexcept { return false; }
 bool ge_gpu_backend_copy_game_frame_rgba(std::span<std::byte>) noexcept { return false; }
 bool ge_gpu_backend_presents_directly() noexcept { return false; }
+bool ge_gpu_backend_owns_window() noexcept { return false; }
+bool ge_gpu_backend_present_rgba(std::span<const std::byte>, std::uint32_t, std::uint32_t, bool) noexcept { return false; }
 std::uint32_t ge_gpu_backend_owned_framebuffer() noexcept { return 0u; }
 std::uint32_t ge_gpu_backend_display_framebuffer() noexcept { return state().display_framebuffer; }
 std::uint32_t ge_gpu_backend_last_winner_target() noexcept { return state().report.presented_framebuffer_target; }

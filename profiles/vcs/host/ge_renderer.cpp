@@ -4940,9 +4940,9 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
     {
         PhaseTimer vertex_timer(g_ge_vertex_decode_ns);
         vertices.clear();
-        vertices.reserve(count);
         const IndexStreamReader draw_indices =
             make_index_reader(memory, index_address, layout.index_type, count);
+        vertices.reserve(count);
         for (std::uint32_t i = 0u; i < count; ++i) {
             const std::uint32_t index = draw_indices(i);
             Vertex vertex{};
@@ -4977,19 +4977,24 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         }
         ge_gpu_backend_note_through_extent(gpu_draw, max_x, max_y);
 
-        // Full-screen splash and loading art (512-wide 8-bit textures) is drawn
-        // by the game into a 512x320 rectangle, but only the top 272 rows are
-        // visible, so the bottom of the picture was cut off and the logo ended
-        // up under the loading bar. Fit the quad into the visible area.
-        if (gpu_draw.through && gpu_draw.texture_enabled && gpu_draw.texture_width == 512u &&
-            gpu_draw.texture_format == 5u && (max_x - min_x) >= 400.0f && max_y > 280.0f &&
-            max_y <= 340.0f) {
-            const float fit = 272.0f / max_y;
-            for (Vertex &vertex : vertices) vertex.y *= fit;
-            max_y = 272.0f;
-        }
+        // Full-screen splash and loading art (512-wide 8-bit textures) is drawn by the game into a
+        // 512x320 rectangle. Nothing has to be done about that here: the presented frame is the whole
+        // 512x320 logical frame (see frame_extent() in ge_gpu_backend_vulkan.cpp), so the picture and
+        // its logo are complete and in the place the game put them, as in the original renderer. An
+        // earlier version squeezed this quad into 272 rows to compensate for a mapping that cropped
+        // the frame; with the cropped mapping gone that squeeze would shrink loading screens.
 
         const GeGpuWidescreenHud hud = ge_gpu_backend_widescreen_hud(gpu_draw);
+        if (static const bool hud_diag = VCS_ENV("PSPRECOMP_HUD_DIAG") != nullptr; hud_diag &&
+            (max_x > 481.0f || max_y > 273.0f)) {
+            // Where the guest really draws 2D interface: anything past 480x272 is off the PSP's screen.
+            static int lines = 0;
+            if (lines++ < 80)
+                std::fprintf(stderr, "[hud] through prim=%u min=(%.1f,%.1f) max=(%.1f,%.1f) tex=%d w=%u h=%u shrink=%.3f\n",
+                             static_cast<unsigned>(primitive), min_x, 0.0f, max_x, max_y,
+                             gpu_draw.texture_enabled ? 1 : 0, gpu_draw.texture_width,
+                             gpu_draw.texture_height, hud.shrink);
+        }
         // Full-width draws are backdrops, fades and letterbox bars: they have to
         // keep covering the screen, so they stay stretched. Measured against the
         // real 480 px display, not against this target's own size.
@@ -5032,34 +5037,23 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             // world. Shrinking them would pillarbox the picture and undo the
             // widened frustum instead of complementing it.
             hud_world_effect_exclusion) {
-            // ThirteenAG's original correction is X-only and symmetric around
-            // the screen's centre -- his target was PC monitors, which widen
-            // a 4:3/16:9 game horizontally (and only ever that direction).
-            // The safe-area problem this session is fixing is different:
-            // interface geometry runs past the true edge on specific
-            // corners, not symmetrically. A single symmetric factor strong
-            // enough to pull the far corner (further from centre, needing
-            // more correction) back on screen over-corrects the near side
-            // too, pushing already-correctly-placed elements too far toward
-            // the middle -- confirmed live, directly against reference
-            // screenshots: the top-right HUD's own X was already right, but
-            // a shared symmetric Y pulled it down away from the top edge,
-            // and the bottom-left minimap's own Y was already right, but the
-            // same shared X pulled it away from the left edge. Each edge
-            // gets its own factor instead: near (weak, ~a no-op) for the
-            // side that was already correct, matching the direction that
-            // needed the real correction for the other.
-            constexpr float kPspCenterY = 272.0f * 0.5f;
-            constexpr float kHudShrinkLeft = 1.02f;   // near-corner X (minimap side)
-            const float kHudShrinkRight = hud.shrink;  // far-corner X (money/weapon frame)
-            constexpr float kHudShrinkTop = 1.02f;    // near-corner Y (money/weapon HUD side)
-            constexpr float kHudShrinkBottom = 1.35f;  // far-corner Y (minimap)
-            for (Vertex &vertex : vertices) {
-                const float shrink_x = vertex.x < hud.source_center ? kHudShrinkLeft : kHudShrinkRight;
-                const float shrink_y = vertex.y < kPspCenterY ? kHudShrinkTop : kHudShrinkBottom;
-                vertex.x = hud.source_center + (vertex.x - hud.source_center) / shrink_x;
-                vertex.y = kPspCenterY + (vertex.y - kPspCenterY) / shrink_y;
-            }
+            // ThirteenAG's correction: X only, symmetric around the middle of the
+            // screen. The world is drawn with a projection widened by hud.shrink,
+            // so the interface (authored in a fixed 480-wide space that is then
+            // stretched across the whole output) has to be pulled in by the same
+            // factor for its proportions and its position to come out as the
+            // game intends: on a 16:9 screen hud.shrink is exactly 1 and nothing
+            // moves, on 21:9 it is 1.31 and the interface stays inside the 16:9
+            // area in the middle. Y is never touched.
+            //
+            // An earlier version of this block used a separate hand-tuned factor
+            // per edge (and a vertical squeeze). Those numbers were fitted to one
+            // Mac display and put the interface in the wrong place everywhere
+            // else; the single factor above is what the original renderer uses and
+            // it is correct at any resolution because it is derived from the real
+            // output size (see publish_live_display_surface()).
+            for (Vertex &vertex : vertices)
+                vertex.x = hud.source_center + (vertex.x - hud.source_center) / hud.shrink;
             // The clip rectangle has to move with the geometry, or the radar
             // keeps being masked where the radar used to be. Both renderers read
             // their scissor from here.
@@ -5069,28 +5063,16 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             // That slack showed as a one-pixel column of the radar map leaking
             // out either side of the radar's circular frame. Losing a pixel of
             // an edge that a mask covers anyway is the harmless direction.
-            const auto shrink_toward = [&](std::int32_t value, float center, float shrink,
-                                          bool leading) {
-                const float moved = center + (static_cast<float>(value) - center) / shrink;
+            const auto shrink_scissor = [&](std::int32_t value, bool leading) {
+                const float moved = hud.source_center +
+                    (static_cast<float>(value) - hud.source_center) / hud.shrink;
                 return static_cast<std::int32_t>(leading ? std::ceil(moved)
                                                          : std::floor(moved));
             };
-            setup.scissor_x0 = shrink_toward(setup.scissor_x0, hud.source_center,
-                                             static_cast<float>(setup.scissor_x0) < hud.source_center
-                                                 ? kHudShrinkLeft : kHudShrinkRight, true);
-            setup.scissor_x1 = shrink_toward(setup.scissor_x1, hud.source_center,
-                                             static_cast<float>(setup.scissor_x1) < hud.source_center
-                                                 ? kHudShrinkLeft : kHudShrinkRight, false);
-            setup.scissor_y0 = shrink_toward(setup.scissor_y0, kPspCenterY,
-                                             static_cast<float>(setup.scissor_y0) < kPspCenterY
-                                                 ? kHudShrinkTop : kHudShrinkBottom, true);
-            setup.scissor_y1 = shrink_toward(setup.scissor_y1, kPspCenterY,
-                                             static_cast<float>(setup.scissor_y1) < kPspCenterY
-                                                 ? kHudShrinkTop : kHudShrinkBottom, false);
+            setup.scissor_x0 = shrink_scissor(setup.scissor_x0, true);
+            setup.scissor_x1 = shrink_scissor(setup.scissor_x1, false);
             gpu_draw.scissor_x0 = setup.scissor_x0;
             gpu_draw.scissor_x1 = setup.scissor_x1;
-            gpu_draw.scissor_y0 = setup.scissor_y0;
-            gpu_draw.scissor_y1 = setup.scissor_y1;
             gpu_draw.widescreen_hud = true;
         }
     }

@@ -43,9 +43,11 @@ VkResult create_surface(VkInstance instance, void *native_window, VkSurfaceKHR &
     return create_win32_surface(instance, &surface_info, nullptr, &surface);
 }
 
-// OFF until verified on a real Windows machine. Set PSPRECOMP_VULKAN_SWAPCHAIN=1 to try it; once
-// it is confirmed to present correctly and resize cleanly, change this to return true.
-bool swapchain_default_enabled() noexcept { return false; }
+// ON: verified on Windows 11 (RTX 2070 SUPER / RTX 5070 Ti). Present costs ~0.3 ms against ~150 ms
+// for the CPU readback + GDI path at 4K; resize, maximise, minimise/restore, show-desktop and rapid
+// resizes recreate the swapchain with no failures; intro videos and loading screens go through it
+// via ge_gpu_backend_present_rgba(). PSPRECOMP_VULKAN_SWAPCHAIN=0 forces the readback path.
+bool swapchain_default_enabled() noexcept { return true; }
 
 // Windows users resize windows and toggle fullscreen, so the extent is re-checked every frame.
 bool surface_extent_can_change() noexcept { return true; }

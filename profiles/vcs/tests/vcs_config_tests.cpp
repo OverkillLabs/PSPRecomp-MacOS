@@ -44,7 +44,7 @@ int main() {
                    << "ExperimentalGpuColorPreview=true\nGeometryDebugColors=true\n"
                    << "DumpGpuFrameVblank=2200\n"
                    << "[Timing]\n"
-                   << "FrameRate=200\n"
+                   << "FrameRate=60\n"
                    << "RealtimeSpeedDiagnostics=true\n"
                    << "RealtimeSpeedIntervalVblanks=90\n"
                    << "[Diagnostics]\n"
@@ -121,7 +121,7 @@ int main() {
                 "custom internal resolution was computed incorrectly");
         require(config.timing.realtime_speed_diagnostics,
                 "timing diagnostics were not parsed");
-        require(config.timing.frame_rate == 200u,
+        require(config.timing.frame_rate == 60u,
                 "Timing.FrameRate was not parsed");
         require(config.timing.realtime_speed_interval_vblanks == 90u,
                 "timing interval was not parsed");
@@ -221,13 +221,38 @@ int main() {
             require(std::abs(vcs::widescreen_stretch_factor(config, 1920u, 1080u) -
                              (21.0f / 9.0f) / (16.0f / 9.0f)) < 0.0001f,
                     "the stretch factor must be the ratio against the game's own 16:9");
-            require(vcs::widescreen_stretch_factor(automatic, 1920u, 1080u) == 1.0f,
+            require(std::abs(vcs::widescreen_stretch_factor(automatic, 1920u, 1080u) - 1.0f) < 0.0001f,
                     "a 16:9 surface must need no correction at all");
             vcs::VcsConfiguration absurd = config;
             absurd.widescreen.aspect_x = 1000u;
             absurd.widescreen.aspect_y = 1u;
             require(vcs::widescreen_stretch_factor(absurd, 1920u, 1080u) == 4.0f,
                     "an out-of-range ratio must be clamped, not obeyed");
+
+            // The interface is never pushed outwards: a surface narrower than 16:9 narrows the
+            // projection (factor below 1) but leaves the interface where it is.
+            require(vcs::widescreen_stretch_factor(automatic, 1440u, 1080u) < 1.0f,
+                    "a 4:3 surface must narrow the projection");
+            require(vcs::widescreen_hud_factor(automatic, 1440u, 1080u) == 1.0f,
+                    "the interface must not be expanded on a surface narrower than 16:9");
+            require(vcs::widescreen_hud_factor(automatic, 1920u, 1080u) == 1.0f,
+                    "the interface must not move on a 16:9 surface");
+            require(std::abs(vcs::widescreen_hud_factor(automatic, 3440u, 1440u) -
+                             (3440.0f / 1440.0f) / (16.0f / 9.0f)) < 0.0001f,
+                    "the interface must follow the surface's aspect on an ultrawide");
+
+            // Once the platform layer publishes the real output size, it wins over the configured
+            // one, so the projection and the interface follow a resized or unusual window.
+            vcs::publish_live_display_surface(2560u, 1080u);
+            vcs::publish_live_display_surface(1u, 1u);   // a minimised window: ignored
+            const vcs::DisplaySurfaceDimensions live =
+                vcs::resolve_display_surface_dimensions(config.display);
+            require(live.width == 2560u && live.height == 1080u,
+                    "the published live surface size must override the configured size");
+            require(std::abs(vcs::widescreen_hud_factor(automatic, live.width, live.height) -
+                             (2560.0f / 1080.0f) / (16.0f / 9.0f)) < 0.0001f,
+                    "the interface factor must follow the live surface");
+            vcs::publish_live_display_surface(0u, 0u);   // reset, so later checks see the configuration
         }
 
         require(!missing.loaded_from_file, "missing INI was reported as loaded");

@@ -318,6 +318,10 @@ struct ContentView: View {
 
     // Timing / widescreen / addons
     private var keyboardPrompts: Binding<Bool> { doc.binding("Controls", "KeyboardPrompts", default: true) }
+    private var cameraStick: Binding<Bool> { doc.binding("Controls", "CameraStick", default: true) }
+    private var invertCameraY: Binding<Bool> { doc.binding("Controls", "InvertCameraY", default: false) }
+    private var mouseSensitivity: Binding<Int> { doc.binding("Controls", "MouseSensitivity", default: 50) }
+    private var camUpLimit: Binding<Int> { doc.binding("Controls", "PedCameraUpLimitDegrees", default: 40) }
     private var widescreen: Binding<Bool> { doc.binding("Widescreen", "Enabled", default: true) }
     private var project2dfx: Binding<Bool> { doc.binding("Project2DFX", "Enabled", default: false) }
 
@@ -343,7 +347,6 @@ struct ContentView: View {
     private var casSharpness: Binding<Double> { properShadersDoc.binding("CAS", "Sharpness", default: 0.5) }
     private var skyPaletteEnabled: Binding<Bool> { properShadersDoc.binding("SkyPalette", "Enabled", default: true) }
     private var todGradeEnabled: Binding<Bool> { properShadersDoc.binding("TimeOfDayGrade", "Enabled", default: true) }
-    private var reliefEnabled: Binding<Bool> { properShadersDoc.binding("ReliefShading", "Enabled", default: false) }
     private var vhsEnabled: Binding<Bool> { properShadersDoc.binding("VHS", "Enabled", default: false) }
     private var cloudsEnabled: Binding<Bool> {
         properShadersDoc.binding("VolumetricClouds", "Enabled", default: true)
@@ -361,8 +364,6 @@ struct ContentView: View {
     // Draw distance
     private var drawDistanceEnabled: Binding<Bool> { doc.binding("DrawDistance", "Enabled", default: true) }
     private var drawDistanceWorld: Binding<Double> { doc.binding("DrawDistance", "World", default: 1.00) }
-    private var drawDistanceVehicles: Binding<Double> { doc.binding("DrawDistance", "Vehicles", default: 1.00) }
-    private var drawDistanceNPCs: Binding<Double> { doc.binding("DrawDistance", "NPCs", default: 1.00) }
     private var drawDistanceLOD: Binding<Double> { doc.binding("DrawDistance", "LOD", default: 1.00) }
 
     var body: some View {
@@ -633,8 +634,6 @@ struct ContentView: View {
                         .help("Replaces the game's flat sky and distance-fog color with a Vice City palette that follows the clock: pink-magenta dawn and dusk, teal-cyan days, violet nights. Weather is preserved (grey skies stay grey). Strength is in ProperShaders.ini [SkyPalette]. Off by default.")
                     Toggle("Time-of-day grade", isOn: todGradeEnabled)
                         .help("Warms and saturates the picture around sunrise and sunset and cools it at night, following the in-game clock. A color grade only; the game's own lighting is unchanged. Strength is in ProperShaders.ini [TimeOfDayGrade]. Off by default.")
-                    Toggle("Sun-lit surface relief (experimental)", isOn: reliefEnabled)
-                        .help("Raised detail in walls, roads and bricks catches the sun as it moves across the sky during the day, giving surfaces some depth. Derived from the textures themselves. Off by default; strength is in ProperShaders.ini [ReliefShading].")
                     Toggle("VHS filter", isOn: vhsEnabled)
                         .help("Optional stylistic VHS look: tape wiggle and horizontal color smear across the whole frame, HUD included. Off by default.")
                 }
@@ -681,34 +680,19 @@ struct ContentView: View {
                         .help("Scales up how far away world objects, vehicles and pedestrians render/despawn, instead of the PSP's original short pop-in range. A real patch to the game's own LOD/culling code, verified live.")
                     if drawDistanceEnabled.wrappedValue {
                         LabeledContent("World objects") {
-                            Slider(value: drawDistanceWorld, in: 1.0...6.0, step: 0.25)
+                            Slider(value: drawDistanceWorld, in: 1.0...3.0, step: 0.25)
                                 .frame(width: 160)
                             Text(String(format: "%.2f×", drawDistanceWorld.wrappedValue))
                                 .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
                         }
-                        .help("Multiplies world/scenery draw distance and the game's far clip plane. 1.0 = original PSP distance, up to 6.0×.")
-                        LabeledContent("Vehicles") {
-                            Slider(value: drawDistanceVehicles, in: 1.0...2.0, step: 0.25)
-                                .frame(width: 160)
-                            Text(String(format: "%.2f×", drawDistanceVehicles.wrappedValue))
-                                .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
-                        }
-                        .help("Multiplies vehicle spawn/despawn range, up to 2.0×; higher values make vehicles and pedestrians despawn, so it is capped.")
-                        LabeledContent("Pedestrians") {
-                            Slider(value: drawDistanceNPCs, in: 1.0...2.0, step: 0.25)
-                                .frame(width: 160)
-                            Text(String(format: "%.2f×", drawDistanceNPCs.wrappedValue))
-                                .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
-                        }
-                        .help("Multiplies pedestrian spawn/population range, up to 2.0×; higher values make vehicles and pedestrians despawn, so it is capped.")
-                        Note(text: "Vehicles and pedestrians are capped at 2.0× to keep them from despawning.")
+                        .help("Multiplies world/scenery draw distance and the game's far clip plane. 1.0 = original PSP distance, up to 3.0×.")
                         LabeledContent("Model detail switch") {
-                            Slider(value: drawDistanceLOD, in: 1.0...6.0, step: 0.5)
+                            Slider(value: drawDistanceLOD, in: 1.0...3.0, step: 0.5)
                                 .frame(width: 160)
                             Text(String(format: "%.2f×", drawDistanceLOD.wrappedValue))
                                 .foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
                         }
-                        .help("Distance at which a vehicle/pedestrian switches from its low-poly to high-poly model — purely visual, no population-density downside (unlike Vehicles/Pedestrians above), so this can go much higher safely. Fixes the \"low-poly blob snapping to a full model a few meters away\" pop-in. Up to 6.0×.")
+                        .help("Distance at which a vehicle/pedestrian switches from its low-poly to high-poly model — purely visual, no population-density downside (unlike Vehicles/Pedestrians above), so this can go much higher safely. Fixes the \"low-poly blob snapping to a full model a few meters away\" pop-in. Up to 3.0×.")
                     }
                 }
 
@@ -784,10 +768,35 @@ struct ContentView: View {
                     Note(text: "In-game prompts switch automatically between these keyboard and mouse controls and the controller layout, depending on which you used last.")
                 }
 
+                Section("Camera") {
+                    Toggle("Camera on right stick", isOn: cameraStick)
+                        .help("Aim and look with the controller's right stick.")
+                    Toggle("Invert camera Y", isOn: invertCameraY)
+                        .help("Flips vertical camera movement.")
+                    LabeledContent("Mouse sensitivity") {
+                        Slider(value: Binding(get: { Double(mouseSensitivity.wrappedValue) },
+                                              set: { mouseSensitivity.wrappedValue = Int($0.rounded()) }),
+                               in: 1...100, step: 1)
+                            .frame(width: 160)
+                        Text("\(mouseSensitivity.wrappedValue)")
+                            .foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                    }
+                    .help("Mouse look speed. Higher turns the camera further for the same movement.")
+                    LabeledContent("Look-up limit") {
+                        Slider(value: Binding(get: { Double(camUpLimit.wrappedValue) },
+                                              set: { camUpLimit.wrappedValue = Int($0.rounded()) }),
+                               in: 10...45, step: 1)
+                            .frame(width: 160)
+                        Text("\(camUpLimit.wrappedValue)°")
+                            .foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                    }
+                    .help("How far the on-foot camera may tilt up, in degrees. The game itself stops at 45.")
+                }
+
                 Section("Prompts") {
                     Toggle("Show control names in prompts", isOn: keyboardPrompts)
                         .help("Rewrites the game's button prompts so they name your actual controls. They follow the device you used last: keyboard and mouse names while you play with keyboard and mouse, and controller (Xbox) names as soon as you touch the controller, switching back when you use the keyboard or mouse again. Turn off to see the original PSP button names.")
-                    Note(text: "Gamepads also work. The mouse look and the modern control scheme are set in the Rendering and Performance pages.")
+                    Note(text: "Gamepads also work. Mouse look speed and the camera options are in the Camera section above.")
                 }
             }
             .formStyle(.grouped)

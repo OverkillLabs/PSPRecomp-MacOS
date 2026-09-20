@@ -249,8 +249,6 @@ struct PostFxConfiguration {
     float sky_palette_strength{0.85f}; // [SkyPalette] Strength
     bool time_of_day_enabled{false};   // [TimeOfDayGrade] Enabled
     float time_of_day_strength{0.35f};  // [TimeOfDayGrade] Strength
-    bool relief_enabled{false};        // [ReliefShading] Enabled
-    float relief_strength{0.5f};       // [ReliefShading] Strength
 };
 
 // Standalone ProperShaders.ini feature. Values normally supplied by the San
@@ -305,7 +303,7 @@ struct ControlsConfiguration {
     // every difference in how fast you moved is thrown away, which reads as the
     // camera stepping rather than sweeping. 12 keeps a normal flick
     // proportional; the ceiling on turn speed is the game's, not this number's.
-    std::uint32_t mouse_sensitivity{12u};
+    std::uint32_t mouse_sensitivity{50u};
     bool invert_camera_y{false};
     // Safe stop for upward input on the outdoor on-foot camera. Stock VCS's
     // actual clamp remains at 45 degrees; this prevents reaching it without
@@ -383,5 +381,21 @@ void initialize_vcs_configuration(const std::filesystem::path &executable_direct
 [[nodiscard]] float widescreen_stretch_factor(
     const VcsConfiguration &configuration,
     std::uint32_t surface_width, std::uint32_t surface_height) noexcept;
+
+// How far the 2D interface is pulled in towards the middle of the screen. This is the stretch factor
+// above, but never below 1: a surface narrower than 16:9 narrows the guest's projection, and dividing
+// the interface by a factor under 1 would push it outwards, off the screen.
+[[nodiscard]] float widescreen_hud_factor(
+    const VcsConfiguration &configuration,
+    std::uint32_t surface_width, std::uint32_t surface_height) noexcept;
+
+// The area of the window the game picture really occupies (the whole client area when the picture is
+// stretched, the letterboxed rectangle when its proportions are kept), in pixels. The platform layer
+// publishes it whenever the window is created or resized, and every widescreen calculation (the
+// guest's projection and the interface correction) reads it through resolve_display_surface_dimensions(),
+// so both follow the real output instead of a size guessed from the configuration. Until the first
+// publish (and after publishing 0 x 0, which clears it) the configured size is used. Sizes too small
+// to be a real window are ignored, so a minimised window keeps the last real size.
+void publish_live_display_surface(std::uint32_t width, std::uint32_t height) noexcept;
 
 } // namespace vcs

@@ -39,9 +39,9 @@ echo ================================================================
   -DPSPRECOMP_BUILD_TESTS=ON ^
   -DPSPRECOMP_BUILD_PROFILE_TESTS=ON
 if errorlevel 1 goto :FAIL
-"%CMAKE_EXE%" --build "%BUILD%" --config Release --parallel 1 --target ^
+"%CMAKE_EXE%" --build "%BUILD%" --config Release --parallel %JOBS% --target ^
   VCSNative psprecomp_tests vcs_config_tests audio_resampler_tests vcs_bootstrap_paths_tests vcs_dx12_probe vcs_dx12_ge_probe ^
-  -- /m:1
+  -- /m:%JOBS%
 if errorlevel 1 goto :FAIL
 copy /Y "%REPO%\profiles\vcs\config\VCSNative.ini" "%BUILD%\bin\Release\VCSNative.ini" >nul
 echo BUILD FAST OK: %BUILD%\bin\Release\VCSNative.exe

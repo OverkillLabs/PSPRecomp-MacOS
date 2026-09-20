@@ -48,6 +48,8 @@ constexpr std::uint64_t kMixSafetyFrames = 1024u;
 // channel lapping the ring during normal realtime play.
 constexpr std::size_t kRingFrames = kSampleRate * 2u;
 constexpr std::size_t kGuestChannels = 9u;
+// Sealed audio further behind the guest timeline than this (about 140 ms) is dropped; see advance_locked.
+constexpr std::uint64_t kMaxLagFrames = 6144u;
 // A genuine discontinuity (a new track starting, a station change, a seek)
 // moves a channel's schedule by a whole buffer or more. 64 frames (1.45 ms)
 // is tighter than the ~2048-frame block the guest submits at a time, so
@@ -62,6 +64,8 @@ constexpr std::size_t kGuestChannels = 9u;
 // timeline itself does not drift -- so the fix is tolerance, not a resync
 // mechanism.
 constexpr std::uint64_t kChannelDiscontinuityFrames = 8192u;
+// A channel that has fallen this far (about 23 ms) behind its own schedule is moved up to it.
+constexpr std::uint64_t kGapSnapFrames = 1024u;
 
 struct Block {
     WAVEHDR header{};
@@ -94,6 +98,7 @@ struct AudioState {
     std::uint64_t queued_blocks{};
     std::uint64_t underrun_rebuffers{};
     std::uint64_t timeline_resyncs{};
+    std::uint64_t lag_resyncs{};
     std::uint64_t submit_calls{};
     std::uint64_t submit_cpu_ns{};
     std::uint64_t submit_cpu_max_ns{};
@@ -346,6 +351,30 @@ void advance_locked(AudioState &state, std::uint64_t guest_time_us) {
         ? 0u : kMixSafetyFrames;
     const std::uint64_t sealed_frame = guest_frame > safety_frames
         ? guest_frame - safety_frames : 0u;
+    // Keep the sound on the picture. While waveOut is paused for a rebuffer (or the guest hitches) the
+    // guest timeline keeps moving but nothing is played, and once playback resumes it continues from
+    // where it stopped, so the gap becomes a permanent delay: seconds after a few stalls. When the
+    // audio has fallen further behind than a few blocks, throw the stale part away and restart from
+    // the present with a fresh prebuffer; a short dropout is far better than sound that is late.
+    if (sealed_frame > state.output_frame + kMaxLagFrames) {
+        (void)waveOutReset(state.device);  // hands every queued block back
+        const std::uint64_t skipped = sealed_frame - state.output_frame;
+        if (skipped >= kRingFrames) {
+            std::fill(state.ring.begin(), state.ring.end(), 0);
+        } else {
+            for (std::uint64_t f = state.output_frame; f < sealed_frame; ++f) {
+                const std::size_t slot = static_cast<std::size_t>(f % kRingFrames) * kOutputChannels;
+                state.ring[slot] = 0;
+                state.ring[slot + 1u] = 0;
+            }
+        }
+        state.output_frame = sealed_frame;
+        (void)waveOutPause(state.device);
+        state.playback_started = false;
+        state.recovering_from_underrun = false;
+        ++state.lag_resyncs;
+        outstanding = 0u;
+    }
     while (sealed_frame >= state.output_frame + kBlockFrames) {
         if (!queue_one_block(state)) break;
     }
@@ -418,6 +447,13 @@ void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames
                       << previous_cursor << " scheduled=" << scheduled << "\n";
     }
 
+    // A stream that is contiguous from one buffer to the next but whose schedule has moved on (the guest
+    // thread ran late, so the buffer really started later than the previous one ended) must follow the
+    // schedule: on the hardware that is a gap of silence. Ignoring it left the cursor drifting further
+    // and further behind the timeline until the mixer had already sealed the region the next buffer was
+    // written to, and those buffers were thrown away as late -- audible as stuttering that got worse
+    // over time. Moving the cursor forward inserts the gap instead. No resampler reset, so no click.
+    if (stream.active && scheduled > stream.cursor + kGapSnapFrames) stream.cursor = scheduled;
     if (stream.cursor < state.output_frame) {
         state.late_frames_dropped += state.output_frame - stream.cursor;
         stream.cursor = state.output_frame;
@@ -451,6 +487,17 @@ void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames
             ++stream.cursor;
         });
 
+    static const bool submit_diag = std::getenv("PSPRECOMP_AUDIO_SUBMIT_DIAG") != nullptr;
+    if (submit_diag) {
+        int peak = 0;
+        for (std::size_t i = 0u; i < needed; ++i) peak = std::max(peak, std::abs(static_cast<int>(pcm[i])));
+        std::cerr << "[audio-submit] ch=" << channel << " frames=" << frames << " rate=" << source_rate
+                  << " peak=" << peak << " scheduled=" << scheduled << " cursor_before=" << previous_cursor
+                  << " cursor_after=" << stream.cursor << " output_frame=" << state.output_frame
+                  << " late=" << state.late_frames_dropped << " real_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch()).count() << "\n";
+    }
     stream.last_guest_time_us = guest_time_us;
     // A submission can make enough older samples complete to fill another
     // device block, so try once more after mixing it.
@@ -487,6 +534,7 @@ void audio_output_advance(std::uint64_t guest_time_us) {
              << " recovering=" << state.recovering_from_underrun
              << " underrun_rebuffers=" << state.underrun_rebuffers
              << " resyncs=" << state.timeline_resyncs
+             << " lag_resyncs=" << state.lag_resyncs
              << " late_frames=" << state.late_frames_dropped
              << " overrun_frames=" << state.overrun_frames_dropped
              << " submit_calls=" << state.submit_calls

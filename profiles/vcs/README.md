@@ -78,6 +78,24 @@ For an uncapped CPU/GE measurement, use `profiles\vcs\scripts\bench.bat`.
 
 The generated VCS corpus is intentionally excluded from MSVC whole-program IR in the normal release build. Later AOT cross-unit optimizations make whole-program analysis of all generated units unnecessarily expensive in linker memory. This does not disable per-unit `/Ox`; it only prevents those generated units from being deferred to link-time code generation. Host/runtime LTCG remains available, and the release linker prints LTCG status while it runs.
 
+## Windows: Vulkan build, launcher and texture pack
+
+`BUILD_VCS.bat` picks everything itself: the Vulkan backend when the Vulkan SDK (`glslc`) is installed (otherwise the
+older DirectX 12 backend with a warning), and **clang-cl for the generated AOT corpus and the software geometry
+pipeline** when the ClangCL toolset of Visual Studio is present (otherwise plain MSVC). Clang matters: MSVC's per-function
+inline limit leaves the enormous generated functions full of real calls for every guest load/store, which costs about
+2.5x in frame time (18-22 ms vs 7 ms per frame on the same machine). `-DPSPRECOMP_VCS_CLANG_AOT=OFF` forces MSVC.
+Install the "C++ Clang tools for Windows" component to get it.
+
+The build also produces **`VCSLauncher.exe`** next to `VCSNative.exe` (a self-contained WPF app, no dependencies beyond
+the .NET Framework 4.8 that ships with Windows; built with the Roslyn compiler from the same Visual Studio install, sources
+in `launcher/windows`). It edits `VCSNative.ini` and `ProperShaders.ini` in place, installs and removes the texture pack,
+and starts the game with the chosen GPU, present mode, swapchain and worker-thread switches. Keep it in the same folder as
+`VCSNative.exe`; `PSP_DATA` goes there too (or the launcher asks for it).
+
+Texture pack: `scripts\INSTALL_TEXTURE_PACK.bat <VCSNative-TexturePack.zip> [<Textures folder>]` (or the launcher's Quality page).
+Details, measurements and the verification list are in [`../../docs/WINDOWS_VULKAN.md`](../../docs/WINDOWS_VULKAN.md).
+
 ## Resolution configuration
 
 `profiles/vcs/config/VCSNative.ini` exposes both the presentation resolution and the internal render resolution.

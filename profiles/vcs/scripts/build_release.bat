@@ -26,12 +26,15 @@ if not exist "!CTEST_EXE!" set "CTEST_EXE=ctest.exe"
 
 rem MSBuild /m and cl.exe /MP multiply: keep MSBuild serial across projects and
 rem let /MP%JOBS% be the single source of compile parallelism.
+rem Exception: the generated AOT corpus is built by the ClangCL toolset in separate projects (see
+rem PSPRECOMP_VCS_CLANG_AOT), which MSBuild parallelises across projects, so the game target is built
+rem with /m:%JOBS%. Only one project compiles host files at a time, so there is no /MP multiplication.
 set "CMAKE_BUILD_PARALLEL_LEVEL=1"
 echo ================================================================
 echo VCS - PERFORMANCE INCREMENTAL BUILD
 echo Build pipeline restored to the last known-good pre-reorganization behavior.
 echo CMake: !CMAKE_EXE!
-echo Compile workers: %JOBS% ^| AOT /MP%JOBS% ^| MSBuild /m:1
+echo Compile workers: %JOBS% ^| generated AOT: clang-cl shards in parallel ^(MSBuild /m:%JOBS%^), or cl.exe /MP%JOBS%
 echo AOT inlining: /Ob3 hot measured units ^| /Ob0 cold units
 echo Link: host/core LTCG only ^| generated AOT /GL- ^| LTCG status visible
 echo Build dir preserved: %BUILD%
@@ -66,7 +69,7 @@ if errorlevel 1 goto :FAIL
 
 echo [2/7] Building VCS executable first...
 echo       The generated AOT units compile normally; the final link no longer receives their LTCG IR.
-"%CMAKE_EXE%" --build "%BUILD%" --config Release --parallel 1 --target VCSNative -- /m:1
+"%CMAKE_EXE%" --build "%BUILD%" --config Release --parallel %JOBS% --target VCSNative -- /m:%JOBS%
 if errorlevel 1 goto :FAIL
 
 echo [2b/7] Building tests and probes...

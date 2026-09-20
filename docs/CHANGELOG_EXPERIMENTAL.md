@@ -6,6 +6,9 @@
 - **macOS: settings, saves and textures** are kept in `~/Library/Application Support/VCSNative`, so the app itself stays sealed and updating it never touches your saves.
 - **Windows: no runtime to install.** The Visual C++ runtime is included in the download, so the game starts on a PC that has never had it installed.
 - **Build from source, ready to play:** on macOS `profiles/vcs/scripts/build_macos.sh` builds everything and outputs the finished app and a zip; on Windows `BUILD_VCS.bat` outputs a folder with every DLL the game needs.
+- **PC controls (keyboard and mouse).** Play the whole game with keyboard and mouse: WASD to move, mouse to look and aim, left/right/middle mouse to fire, target and look behind, Space to sprint, Left Shift to jump, F or Return to enter and exit vehicles, Q/E or the mouse wheel to change weapon and radio station, and matching driving and menu keys. A full controls reference is on the launcher's Controls page (macOS and Windows). Gamepads (Xbox layout) work too, and you can switch between them at any time.
+- **Control prompts that match your device.** The game's on-screen button prompts show your real keyboard and mouse controls, or Xbox button names when you use a controller, and switch automatically as you change device. Turn it off with "Show control names in prompts" to get the original PSP button names.
+- **Graphics on their own thread (Vulkan).** Display lists now run on a separate thread by default and texture uploads no longer stall the game, which keeps busy scenes inside the frame budget.
 - **Windows Vulkan build**, with a new single-exe Windows launcher (`VCSLauncher.exe`) that needs no dependencies.
 - **Windows launcher pages:** Window, Rendering, Quality, Controls, Addons and Performance. It edits `VCSNative.ini` and `ProperShaders.ini` in place, keeps comments and line endings, and lets you choose the GPU, present mode, swapchain and worker threads.
 - **Texture pack:** install and uninstall from the Windows launcher, with validation. It asks for the PSP_DATA folder if it's missing and warns if the display refresh rate isn't a multiple of 60.
@@ -25,6 +28,8 @@
 - **HUD at every aspect ratio** (16:9, 21:9, 32:9, 4:3, 16:10, 5:4, tall): the widescreen factor is restored to the original clamp and the HUD uses the original symmetric X correction. The layout follows window resizes.
 - **Windows audio drift:** if audio falls more than about 140 ms behind, the sink drops the stale part and restarts. Lagging streams snap forward with a short gap instead of drifting.
 - **Sun-lit surface relief** option removed everywhere (shader, config, both launchers) because it looked broken.
-- **Controllers:** a deflected stick always wins over the mouse.
+- **Controllers:** a deflected stick always wins over the mouse, and stick handling is more accurate (proper dead zone).
+- **Black screen with the texture pack.** A texture that animates its palette was stored again every frame, so graphics memory grew to 10 GB or more within a couple of minutes and the picture went black. Identical textures are now shared and replacement-texture memory is capped, so memory stays flat.
+- **Windows: cursor escaping the game.** The mouse pointer could drift onto a second monitor during play, and the next click landed on another window. It is now kept inside the game window while the game is in front.
 - **Draw distance:** the macOS launcher shows only World objects and Model detail switch.
 - **macOS: "damaged" message on downloaded builds.** The app now carries a valid signature seal, so macOS no longer reports a downloaded copy as damaged.

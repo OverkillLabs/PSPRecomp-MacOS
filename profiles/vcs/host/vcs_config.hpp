@@ -120,9 +120,24 @@ struct RenderingConfiguration {
     // PSP textures, persistent framebuffer feedback, direct swapchain present,
     // depth precision selection and native MSAA/resolve.
     bool dx12_ge_color{false};
-    // SMAA 1x, the spatial variant. The temporal ones need per-pixel motion
-    // vectors, which this port has no way to produce. Off keeps PSP parity.
+    // Confirmed a permanent no-op on the Vulkan backend previously (DX12-
+    // only, and DX12's own implementation was never real either -- see
+    // ge_gpu_backend_vulkan.cpp's SMAA comment history). Now drives a real,
+    // working single-pass FXAA implementation instead -- genuinely simpler
+    // and safer than true SMAA (which needs precomputed area/search lookup
+    // textures and three render passes), for a similar practical result
+    // (smoothed jagged polygon edges). Kept under the same key/field name
+    // for config compatibility; the .ini and launcher UI both label it FXAA
+    // now so it isn't misrepresented as the real SMAA algorithm.
     bool smaa{false};
+    // Unsharp-mask sharpening of the final composited frame (see the same
+    // shaders/color_grade.frag pass ColorGrading uses -- this and color
+    // grading share one GPU pass; either alone is enough to trigger it,
+    // and each is applied independent of the other being on). 0 = off/
+    // identity. Real, but PSP textures being genuinely low-resolution
+    // means this can only sharpen existing detail, not invent missing
+    // detail that was never captured.
+    float sharpen{0.0f};
     bool experimental_gpu_color_preview{false};
     bool gpu_geometry_debug_colors{false};
     std::uint64_t dump_gpu_frame_vblank{0u};
@@ -146,7 +161,8 @@ struct TimingConfiguration {
     // Native VCS renders every other 59.94 Hz vblank (30 FPS). 60 removes that
     // skip; 120/240 also raise the virtual display cadence so they are real
     // game-frame targets rather than duplicated presentation frames.
-    std::uint32_t frame_rate{240u};
+    // Locked to 60 -- see apply_timing_key() in vcs_config.cpp.
+    std::uint32_t frame_rate{60u};
     bool realtime_speed_diagnostics{false};
     std::uint64_t realtime_speed_interval_vblanks{120u};
 };
@@ -173,6 +189,70 @@ struct WidescreenConfiguration {
     std::uint32_t aspect_y{0u};
 };
 
+// Experimental single-pass bloom on the Vulkan backend (see
+// ge_gpu_backend_vulkan.cpp's bloom_* state). [SimulateHDR] previously only
+// existed as a DX12 placeholder (vcs_hdr_post_dx12_stub.cpp is a permanent
+// no-op there) -- Threshold/Intensity are new keys, parsed here rather than
+// through hdr_post_configure() so a genuinely working implementation isn't
+// gated behind a stub that always reports disabled.
+struct BloomConfiguration {
+    bool enabled{false};
+    // Fraction of luminance (0..1) above which a pixel starts contributing
+    // to the glow; higher = only the brightest highlights bloom.
+    float threshold{0.8f};
+    // Multiplies the extracted/blurred glow before it's added back. Kept
+    // moderate by default -- this is additive light, easy to blow out.
+    float intensity{0.6f};
+};
+
+// Parametric color grading (see shaders/color_grade.frag) -- not a real
+// LUT-texture lookup (no .cube/strip asset exists in this project), but
+// reaches the same practical goal via brightness/contrast/saturation/tint
+// math. Defaults are all identity (no visual change) so turning Enabled on
+// with no other tuning is a genuine no-op, same convention has_saved
+// elsewhere in this file.
+struct ColorGradingConfiguration {
+    bool enabled{false};
+    float saturation{1.0f};
+    float contrast{1.0f};
+    float brightness{0.0f};
+    float tint_r{1.0f};
+    float tint_g{1.0f};
+    float tint_b{1.0f};
+};
+
+// Texture replacement and upscaling. Replacement PNGs live in <directory> named
+// <content hash>.png and must be exactly 2x/4x/8x the game's texture size.
+struct TexturesConfiguration {
+    bool mipmaps{true};           // generate a full mip chain for every texture
+    bool replacement{true};
+    bool detail{true};            // procedural sub-texel detail where a texture is heavily magnified
+    bool dump_originals{false};   // write each new game texture to <directory>/originals
+    bool upscale{false};          // conservative built-in upscaler for textures without a replacement
+    std::uint32_t upscale_scale{0u};   // 0 = automatic by texture size
+    float upscale_sharpen{0.25f};
+    std::string directory{"Textures"};
+};
+
+// Color-only ProperShaders-style post effects, all read from ProperShaders.ini
+// and all off by default. They ride the existing grading pass.
+struct PostFxConfiguration {
+    bool dither_enabled{false};    // [Dither] Enabled
+    float dither_strength{1.0f};   // [Dither] Strength
+    bool cas_enabled{false};       // [CAS] Enabled
+    float cas_sharpness{0.3f};     // [CAS] Sharpness
+    bool vhs_enabled{false};       // [VHS] Enabled
+    float vhs_wiggle{0.03f};
+    float vhs_smear{1.0f};
+    float vhs_speed{25.0f};
+    bool sky_palette_enabled{false};   // [SkyPalette] Enabled
+    float sky_palette_strength{0.85f}; // [SkyPalette] Strength
+    bool time_of_day_enabled{false};   // [TimeOfDayGrade] Enabled
+    float time_of_day_strength{0.35f};  // [TimeOfDayGrade] Strength
+    bool relief_enabled{false};        // [ReliefShading] Enabled
+    float relief_strength{0.5f};       // [ReliefShading] Strength
+};
+
 // Standalone ProperShaders.ini feature. Values normally supplied by the San
 // Andreas timecycle/weather integration remain explicit placeholders until the
 // equivalent VCS guest hooks exist. Keeping the inputs separate is important:
@@ -183,9 +263,9 @@ struct VolumetricCloudsConfiguration {
     std::uint32_t downscale_div{2u};
     std::uint32_t layers{2u};
     std::uint32_t shadow_steps{8u};
-    float coverage_low{0.35f};
-    float coverage_mid{0.25f};
-    float coverage_high{0.18f};
+    float coverage_low{0.52f};
+    float coverage_mid{0.34f};
+    float coverage_high{0.20f};
     float opacity{1.0f};
     float speed{0.0f};
     float brightness{1.0f};
@@ -194,16 +274,16 @@ struct VolumetricCloudsConfiguration {
     float sun_direction_y{-0.28f};
     float sun_direction_z{0.88f};
     float sun_color_r{1.0f};
-    float sun_color_g{0.97f};
-    float sun_color_b{0.88f};
-    float cloud_base_color_r{0.70f};
-    float cloud_base_color_g{0.70f};
-    float cloud_base_color_b{0.70f};
+    float sun_color_g{0.94f};
+    float sun_color_b{0.86f};
+    float cloud_base_color_r{0.86f};
+    float cloud_base_color_g{0.82f};
+    float cloud_base_color_b{0.90f};
     float atmosphere_density{0.0f};
     float mist{0.50f};
-    float fog_color_r{0.58f};
-    float fog_color_g{0.68f};
-    float fog_color_b{0.78f};
+    float fog_color_r{0.72f};
+    float fog_color_g{0.80f};
+    float fog_color_b{0.92f};
     float fog_start{4500.0f};
     float day_progression{0.88f};
     float temporal_blend{0.50f};
@@ -239,17 +319,27 @@ struct ControlsConfiguration {
     // off is the San Andreas-parity setting and turning it on is the GTA IV/V
     // one. The original PSP configuration also leaves it disabled.
     bool modern_control_scheme{false};
+    // Rewrite the game's control prompts ("press X", "L button") into the
+    // keyboard and mouse controls bound to those buttons.
+    bool keyboard_prompts{true};
 };
 
 struct VcsConfiguration {
     ControlsConfiguration controls{};
+    TexturesConfiguration textures{};
     DisplayConfiguration display{};
     RenderingConfiguration rendering{};
     AudioConfiguration audio{};
     TimingConfiguration timing{};
     DiagnosticsConfiguration diagnostics{};
     WidescreenConfiguration widescreen{};
+    BloomConfiguration bloom{};
+    ColorGradingConfiguration color_grading{};
     VolumetricCloudsConfiguration volumetric_clouds{};
+    // ProperShaders.ini [SMAA] Enabled: real three-pass SMAA 1x (Vulkan backend),
+    // replacing FXAA. Off by default.
+    bool smaa_1x{false};
+    PostFxConfiguration postfx{};
     std::filesystem::path source_path{};
     // Where the executable lives. Saves go beside it rather than into the game
     // data, so a player who points the runtime at a read-only or shared copy of

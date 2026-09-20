@@ -81,6 +81,12 @@ struct HostInputState {
 // True once the user closed the window or pressed Escape.
 [[nodiscard]] bool display_window_close_requested();
 
+// True exactly once per F9 press (edge-triggered, not held-down-repeating).
+// Diagnostic-only: lets a debug dump (see PSPRECOMP_GE_GPU_DUMP_VBLANK in
+// vcs_profile.cpp) be requested at the exact moment something looks wrong on
+// screen, instead of guessing which vblank count will land there.
+[[nodiscard]] bool display_window_debug_dump_requested();
+
 void display_window_shutdown();
 
 // Native window handle (HWND on Windows, nullptr elsewhere or before the window
@@ -94,5 +100,21 @@ struct DisplayWindowSurface {
     std::uint32_t height{};
 };
 [[nodiscard]] DisplayWindowSurface display_window_surface();
+
+#if defined(__APPLE__)
+// Cocoa/SDL2 require window creation and the event loop to run on the
+// process's main thread; a background "UI thread" the way the Win32 path uses
+// one either never receives events or crashes outright. On Apple platforms
+// the PSP interpreter therefore runs on a worker thread (see main.cpp) and
+// the real main() thread calls this in a loop instead of runtime.run()
+// blocking it directly.
+//
+// Drains pending SDL events, updates input/focus/close state, and presents
+// the most recent frame if one is waiting. Returns quickly either way; the
+// caller is expected to call this repeatedly (e.g. once per vsync) until
+// display_window_close_requested() is true or the guest stops on its own.
+// No-op stub on other platforms so callers do not need to guard the call.
+void display_window_pump_events();
+#endif
 
 } // namespace vcs

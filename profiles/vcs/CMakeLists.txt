@@ -112,20 +112,161 @@ if(MSVC AND PSPRECOMP_NATIVE_AVX2)
         COMPILE_OPTIONS "/arch:AVX")
 endif()
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    set_source_files_properties("${VCS_PROFILE_DIR}/host/vcs_profile.cpp" PROPERTIES COMPILE_OPTIONS "-O2")
-endif()
+        # vcs_profile.cpp used to be force-built at -O2 here (undocumented,
+        # no comment explaining why) even in Release, silently downgrading
+        # the exact file containing the hot GE display-list interpreter
+        # (execute_ge_list, the per-vertex/per-command switch loop) below
+        # whatever CMAKE_BUILD_TYPE=Release would otherwise give it (-O3 for
+        # Clang/GCC). Confirmed building fine at Release's normal level;
+        # removed rather than kept as a stale, unexplained downgrade.
 
-set(VCS_GPU_BACKEND_SOURCE host/ge_gpu_backend_dx12.cpp)
+# Graphics backend and platform layer are chosen automatically from the machine doing the build:
+#
+#   macOS    -> Vulkan (MoltenVK) + platform/macos
+#   Windows  -> Vulkan + platform/windows when the Vulkan SDK (glslc) is installed, because that is
+#               the backend that carries the whole graphics stack, texture pack and performance
+#               work; otherwise DirectX 12 (the older, smaller backend) so a build never fails just
+#               for lack of the SDK
+#   other    -> Vulkan + platform/generic (CPU readback present)
+#
+# PSPRECOMP_VCS_GE_BACKEND=VULKAN or DX12 overrides the choice on Windows.
+# (PSPRECOMP_VCS_WIN32_VULKAN=ON is still accepted and means VULKAN.)
+set(PSPRECOMP_VCS_GE_BACKEND "AUTO" CACHE STRING
+    "GE backend: AUTO, VULKAN or DX12 (DX12 only exists on Windows)")
+set_property(CACHE PSPRECOMP_VCS_GE_BACKEND PROPERTY STRINGS AUTO VULKAN DX12)
+if(PSPRECOMP_VCS_WIN32_VULKAN)
+    set(PSPRECOMP_VCS_GE_BACKEND "VULKAN")
+endif()
+if(NOT WIN32)
+    set(VCS_BACKEND_CHOICE "VULKAN")
+elseif(PSPRECOMP_VCS_GE_BACKEND STREQUAL "DX12" OR PSPRECOMP_VCS_GE_BACKEND STREQUAL "VULKAN")
+    set(VCS_BACKEND_CHOICE "${PSPRECOMP_VCS_GE_BACKEND}")
+else()
+    find_package(Vulkan QUIET)
+    find_program(VCS_GLSLC_PROBE NAMES glslc HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
+    if(Vulkan_FOUND AND VCS_GLSLC_PROBE)
+        set(VCS_BACKEND_CHOICE "VULKAN")
+    else()
+        set(VCS_BACKEND_CHOICE "DX12")
+        message(WARNING "Vulkan SDK (with glslc) not found: building the DirectX 12 backend, which "
+                "does NOT include the graphics stack or texture pack. Install the Vulkan SDK "
+                "(https://vulkan.lunarg.com/) and reconfigure for the full build.")
+    endif()
+endif()
+message(STATUS "VCS graphics backend: ${VCS_BACKEND_CHOICE}")
+
+if(VCS_BACKEND_CHOICE STREQUAL "DX12")
+    set(VCS_GPU_BACKEND_SOURCE host/ge_gpu_backend_dx12.cpp)
+    set(VCS_USE_VULKAN_BACKEND FALSE)
+else()
+    set(VCS_GPU_BACKEND_SOURCE host/ge_gpu_backend_vulkan.cpp)
+    set(VCS_USE_VULKAN_BACKEND TRUE)
+    # The Vulkan backend is platform-neutral; exactly one platform layer is compiled with it.
+    if(APPLE)
+        set(VCS_VULKAN_PLATFORM_SOURCE platform/macos/vulkan_platform_metal.cpp)
+    elseif(WIN32)
+        set(VCS_VULKAN_PLATFORM_SOURCE platform/windows/vulkan_platform_win32.cpp)
+    else()
+        set(VCS_VULKAN_PLATFORM_SOURCE platform/generic/vulkan_platform_stub.cpp)
+    endif()
+    find_package(Vulkan REQUIRED)
+
+    # GLSL -> SPIR-V -> C header, compiled at build time. glslc ships with the
+    # Vulkan SDK and with Homebrew's shaderc formula. The LunarG Windows SDK
+    # installer sets VULKAN_SDK with capital "Bin" (vs. Homebrew's lowercase
+    # "bin" on macOS) -- both hints are listed so this works on either.
+    find_program(VCS_GLSLC NAMES glslc
+        HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin" /opt/homebrew/bin /usr/local/bin)
+    if(NOT VCS_GLSLC)
+        message(FATAL_ERROR
+            "glslc not found; it compiles the Vulkan GE shaders. Install it with "
+            "`brew install shaderc`, or from the Vulkan SDK (https://vulkan.lunarg.com/, "
+            "sets VULKAN_SDK automatically on Windows), or set VCS_GLSLC.")
+    endif()
+
+    set(VCS_SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/vcs_shaders")
+    file(MAKE_DIRECTORY "${VCS_SHADER_OUTPUT_DIR}")
+    set(VCS_SHADER_HEADERS)
+    # (source stem, glslc stage extension, generated symbol) triples, kept in
+    # step with the #includes in ge_gpu_backend_vulkan.cpp. psp_ge_hw and
+    # psp_ge_hw_packed0115 are the GPU hardware-transform vertex shaders
+    # (model->clip transform done on the GPU instead of ge_renderer.cpp's CPU
+    # loop); both share psp_ge.frag unchanged, so only new vertex stages are
+    # needed here.
+    # bloom.vert/frag: the experimental single-pass bright-pass/blur post
+    # process (see [SimulateHDR] in the .ini and ge_gpu_backend_vulkan.cpp's
+    # bloom_* state) -- same build-time GLSL->SPIR-V->header pipeline as the
+    # GE shaders above, just two more entries.
+    # present.frag: the native-swapchain migration's plain blit/upscale
+    # fragment shader (see ge_gpu_backend_vulkan.cpp's swapchain_* state) --
+    # shares bloom.vert's fullscreen-triangle vertex stage, no new one needed.
+    # fxaa.frag: single-pass FXAA anti-aliasing (Rendering.SMAA/AntiAliasing
+    # in the .ini), same fullscreen-triangle vertex stage too.
+    # color_grade.frag: parametric color grading ([ColorGrading] in the
+    # .ini), same fullscreen-triangle vertex stage.
+    # cloud_march/cloud_resolve/cloud_composite.frag: the CloudWorks
+    # volumetric cloud port ([VolumetricClouds] in ProperShaders.ini, see
+    # ge_cloudworks_present_shader.hpp for the HLSL source of truth) -- share
+    # bloom.vert's fullscreen-triangle vertex stage too (they read
+    # gl_FragCoord directly, never the vertex-interpolated UV).
+    set(VCS_SHADER_STEMS psp_ge psp_ge psp_ge_hw psp_ge_hw_packed0115 bloom bloom present fxaa
+        color_grade cloud_march cloud_resolve cloud_composite smaa_edge smaa_weights smaa_blend sky_palette)
+    set(VCS_SHADER_EXTS vert frag vert vert vert frag frag frag frag frag frag frag frag frag frag frag)
+    set(VCS_SHADER_SYMBOLS kPspGeVertSpv kPspGeFragSpv kPspGeHwVertSpv kPspGeHwPacked0115VertSpv
+        kBloomVertSpv kBloomFragSpv kPresentFragSpv kFxaaFragSpv kColorGradeFragSpv
+        kCloudMarchFragSpv kCloudResolveFragSpv kCloudCompositeFragSpv
+        kSmaaEdgeFragSpv kSmaaWeightsFragSpv kSmaaBlendFragSpv kSkyPaletteFragSpv)
+    list(LENGTH VCS_SHADER_STEMS VCS_SHADER_COUNT)
+    math(EXPR VCS_SHADER_LAST "${VCS_SHADER_COUNT} - 1")
+    foreach(VCS_SHADER_INDEX RANGE ${VCS_SHADER_LAST})
+        list(GET VCS_SHADER_STEMS ${VCS_SHADER_INDEX} VCS_SHADER_STEM)
+        list(GET VCS_SHADER_EXTS ${VCS_SHADER_INDEX} VCS_SHADER_EXT)
+        list(GET VCS_SHADER_SYMBOLS ${VCS_SHADER_INDEX} VCS_SHADER_SYMBOL)
+        set(VCS_SHADER_SOURCE "${VCS_PROFILE_DIR}/host/shaders/${VCS_SHADER_STEM}.${VCS_SHADER_EXT}")
+        set(VCS_SHADER_HEADER "${VCS_SHADER_OUTPUT_DIR}/${VCS_SHADER_STEM}_${VCS_SHADER_EXT}_spv.h")
+        add_custom_command(
+            OUTPUT "${VCS_SHADER_HEADER}"
+            COMMAND "${VCS_GLSLC}" -O
+                    -mfmt=c
+                    --target-env=vulkan1.1
+                    -I "${VCS_PROFILE_DIR}/host/shaders"
+                    -o "${VCS_SHADER_HEADER}.inc"
+                    "${VCS_SHADER_SOURCE}"
+            # -mfmt=c emits a bare {0x07230203, ...} initializer list; wrap it
+            # in a declaration so the backend can include it directly.
+            COMMAND ${CMAKE_COMMAND} -E echo "#pragma once" > "${VCS_SHADER_HEADER}"
+            COMMAND ${CMAKE_COMMAND} -E echo "#include <cstdint>" >> "${VCS_SHADER_HEADER}"
+            COMMAND ${CMAKE_COMMAND} -E echo
+                    "static const std::uint32_t ${VCS_SHADER_SYMBOL}[] =" >> "${VCS_SHADER_HEADER}"
+            COMMAND ${CMAKE_COMMAND} -E cat "${VCS_SHADER_HEADER}.inc" >> "${VCS_SHADER_HEADER}"
+            COMMAND ${CMAKE_COMMAND} -E echo ";" >> "${VCS_SHADER_HEADER}"
+            DEPENDS "${VCS_SHADER_SOURCE}" "${VCS_PROFILE_DIR}/host/shaders/SMAA.h"
+            COMMENT "Compiling ${VCS_SHADER_STEM}.${VCS_SHADER_EXT} to SPIR-V"
+            VERBATIM)
+        list(APPEND VCS_SHADER_HEADERS "${VCS_SHADER_HEADER}")
+    endforeach()
+    add_custom_target(vcs_ge_shaders DEPENDS ${VCS_SHADER_HEADERS})
+endif()
+# Each platform has its own window/input/present layer (and, with Vulkan, its own surface layer).
+# Exactly one is compiled, chosen by the machine doing the build.
+if(WIN32)
+    set(VCS_DISPLAY_WINDOW_SOURCE platform/windows/display_window_win32.cpp)
+elseif(APPLE)
+    set(VCS_DISPLAY_WINDOW_SOURCE platform/macos/display_window_sdl.cpp)
+else()
+    set(VCS_DISPLAY_WINDOW_SOURCE platform/generic/display_window_stub.cpp)
+endif()
 set(VCS_HDR_POST_SOURCE host/vcs_hdr_post_dx12_stub.cpp)
 set(VCS_HOST_SOURCES
     host/vcs_bootstrap_paths.cpp
     host/vcs_profile.cpp
     host/vcs_native_fast_paths.cpp
     host/framebuffer_capture.cpp
-    host/display_window.cpp
+    ${VCS_DISPLAY_WINDOW_SOURCE}
     host/audio_output.cpp
     host/vcs_config.cpp
+    host/vcs_texture_replace.cpp
+    host/vcs_key_prompts.cpp
     host/vcs_camera_input.cpp
     host/vcs_vehicle_input.cpp
     host/vcs_fps_overlay.cpp
@@ -137,8 +278,15 @@ set(VCS_HOST_SOURCES
     ${VCS_HDR_POST_SOURCE}
     host/ge_renderer.cpp
     ${VCS_GPU_BACKEND_SOURCE}
+    ${VCS_VULKAN_PLATFORM_SOURCE}
     host/dx12_presenter.cpp
 )
+if(APPLE)
+    # Objective-C++: lets Metal HUD report the game's real internal render
+    # resolution instead of the display's, by setting the SDL-created
+    # CAMetalLayer's drawableSize explicitly. See metal_drawable_size.h.
+    list(APPEND VCS_HOST_SOURCES platform/macos/metal_drawable_size.mm)
+endif()
 
 function(vcs_target_common target)
     target_include_directories(${target} PRIVATE
@@ -146,12 +294,64 @@ function(vcs_target_common target)
         "${VCS_PROFILE_DIR}/generated"
         "${VCS_PROFILE_DIR}/third_party/ffmpeg/include")
     target_link_libraries(${target} PRIVATE psprecomp_core ${CMAKE_DL_LIBS})
+    if(APPLE)
+        target_include_directories(${target} PRIVATE "${VCS_PROFILE_DIR}/platform/macos")
+    endif()
+    # Link whichever GE backend was actually selected above (VCS_USE_VULKAN_BACKEND),
+    # not just "not Windows" -- PSPRECOMP_VCS_WIN32_VULKAN can select Vulkan on
+    # Windows too, and DX12 libs must not be linked in that case (nothing in
+    # the source needs them when ge_gpu_backend_dx12.cpp isn't compiled in).
+    if(VCS_USE_VULKAN_BACKEND)
+        target_link_libraries(${target} PRIVATE Vulkan::Vulkan)
+        target_include_directories(${target} PRIVATE "${VCS_SHADER_OUTPUT_DIR}")
+        add_dependencies(${target} vcs_ge_shaders)
+    else()
+        target_link_libraries(${target} PRIVATE d3d12 dxgi d3dcompiler dxguid)
+    endif()
     if(WIN32)
         foreach(VCS_FFMPEG_LIB avcodec avformat avutil swresample swscale)
             target_link_libraries(${target} PRIVATE
                 "${VCS_PROFILE_DIR}/third_party/ffmpeg/lib/${VCS_FFMPEG_LIB}.lib")
         endforeach()
-        target_link_libraries(${target} PRIVATE winmm d3d12 dxgi d3dcompiler dxguid)
+        # winmm is used by the Windows audio/timer path regardless of which
+        # GE backend is selected.
+        target_link_libraries(${target} PRIVATE winmm)
+    elseif(APPLE)
+        # /opt/homebrew (Apple Silicon) is not on CMake's default search path;
+        # /usr/local covers Intel Macs and anyone who relocated Homebrew there.
+        list(APPEND CMAKE_PREFIX_PATH /opt/homebrew /usr/local)
+        # metal_drawable_size.mm sets CAMetalLayer.drawableSize directly.
+        find_library(VCS_QUARTZCORE QuartzCore REQUIRED)
+        target_link_libraries(${target} PRIVATE ${VCS_QUARTZCORE})
+        # vcs_config.cpp's InternalResolutionMode::Desktop case queries the
+        # real display via CGDisplayPixelsWide/High (CoreGraphics) instead of
+        # silently falling back to whatever InternalWidth/InternalHeight the
+        # .ini happens to have -- confirmed that fallback was firing on every
+        # Mac regardless of actual display size.
+        find_library(VCS_COREGRAPHICS CoreGraphics REQUIRED)
+        target_link_libraries(${target} PRIVATE ${VCS_COREGRAPHICS})
+
+        # display_window.cpp/audio_output.cpp's Apple branch is SDL2-based.
+        find_package(SDL2 REQUIRED)
+        if(TARGET SDL2::SDL2)
+            target_link_libraries(${target} PRIVATE SDL2::SDL2)
+        else()
+            # Older Homebrew SDL2 casks/FindSDL2 modules without the modern
+            # SDL2::SDL2 CMake package config target.
+            target_include_directories(${target} PRIVATE ${SDL2_INCLUDE_DIRS})
+            target_link_libraries(${target} PRIVATE ${SDL2_LIBRARIES})
+        endif()
+
+        # Homebrew's FFmpeg ships plain .dylib names, but its prefix (Apple
+        # Silicon vs Intel) is not always on CMake's default search path.
+        set(VCS_FFMPEG_HOMEBREW_HINTS /opt/homebrew/lib /usr/local/lib)
+        foreach(VCS_FFMPEG_LIB avcodec avformat avutil swresample swscale)
+            find_library(VCS_SYSTEM_${VCS_FFMPEG_LIB}
+                NAMES ${VCS_FFMPEG_LIB}
+                HINTS ${VCS_FFMPEG_HOMEBREW_HINTS}
+                REQUIRED)
+            target_link_libraries(${target} PRIVATE ${VCS_SYSTEM_${VCS_FFMPEG_LIB}})
+        endforeach()
     else()
         # The profile vendors FFmpeg 7 headers. Some validation hosts install only
         # the versioned runtime sonames (without development symlinks), so accept
@@ -211,6 +411,36 @@ if(MSVC)
     endif()
 endif()
 
+if(APPLE)
+    # Game Mode (macOS Sonoma+) needs LSApplicationCategoryType visible to
+    # Launch Services -- confirmed with `mdls`: a bare executable with the
+    # category merely embedded in its __TEXT,__info_plist section reads back
+    # kMDItemAppStoreCategoryType = (null), so Game Mode never sees it. A real
+    # .app bundle is what Launch Services actually indexes.
+    #
+    # PSP_DATA and the .ini files are not built by this project -- the user
+    # places PSP_DATA beside the executable themselves -- and main.cpp finds
+    # them by looking beside its own binary. Bundling moves the real binary
+    # to VCSNative.app/Contents/MacOS/VCSNative, which would orphan an
+    # existing PSP_DATA one directory below the bundle. A symlink from inside
+    # the bundle back out to that existing PSP_DATA (created post-build, see
+    # below) keeps "beside the executable" true without copying or moving
+    # several gigabytes of extracted game data.
+    set_target_properties(VCSNative PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_INFO_PLIST "${VCS_PROFILE_DIR}/resources/Info.plist")
+    # PSP_DATA lives beside the bundle itself (the same place the flat
+    # executable used to sit): $<TARGET_FILE_DIR:VCSNative> resolves to
+    # .../VCSNative.app/Contents/MacOS, so three levels up is that directory.
+    # Recreated every build so it survives a PSP_DATA the user adds or moves
+    # after the first configure.
+    add_custom_command(TARGET VCSNative POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -f "$<TARGET_FILE_DIR:VCSNative>/PSP_DATA"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            "../../../PSP_DATA" "$<TARGET_FILE_DIR:VCSNative>/PSP_DATA"
+        COMMENT "Linking PSP_DATA into the app bundle")
+endif()
+
 if(WIN32)
     add_custom_command(TARGET VCSNative POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -237,6 +467,52 @@ add_custom_command(TARGET VCSNative POST_BUILD
         "${VCS_PROFILE_DIR}/third_party/cloudworks/ATTRIBUTION.md"
         "$<TARGET_FILE_DIR:VCSNative>/CLOUDWORKS_ATTRIBUTION.md")
 
+if(APPLE)
+    # VCSLauncher: a small native SwiftUI settings GUI for VCSNative.ini,
+    # built and bundled here so a normal build of this project produces it
+    # alongside VCSNative.app rather than it only existing on whatever
+    # machine last ran swiftc by hand. Swift isn't enabled as a CMake
+    # language project-wide (that needs a much newer CMake minimum than the
+    # rest of this project requires), so this drives swiftc directly with a
+    # custom command instead -- the same compiler invocation, one target.
+    #
+    # -target arm64-apple-macosx13.0 matters, not just as a floor: leaving it
+    # off lets swiftc default to whatever SDK macosx version happens to be
+    # newest on the build machine (confirmed: a beta/future SDK on this one),
+    # which produces a binary macOS itself then refuses to launch with "You
+    # can't use this version of the application" -- unrelated-looking
+    # launch failures traced back to this same missing flag.
+    find_program(VCS_SWIFTC_EXECUTABLE swiftc)
+    if(VCS_SWIFTC_EXECUTABLE)
+        set(VCS_LAUNCHER_SRC "${VCS_PROFILE_DIR}/launcher/VCSLauncher.swift")
+        set(VCS_LAUNCHER_PLIST "${VCS_PROFILE_DIR}/launcher/Info.plist")
+        # $<TARGET_FILE_DIR:VCSNative> is .../VCSNative.app/Contents/MacOS;
+        # the launcher's own bundle is a sibling of VCSNative.app, so three
+        # levels up from there is the actual bin/$<CONFIG> directory.
+        set(VCS_LAUNCHER_APP_DIR
+            "$<TARGET_FILE_DIR:VCSNative>/../../../VCSLauncher.app")
+        set(VCS_LAUNCHER_BIN_DIR "${VCS_LAUNCHER_APP_DIR}/Contents/MacOS")
+        add_custom_command(
+            OUTPUT "${CMAKE_BINARY_DIR}/vcs_launcher_stamp"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${VCS_LAUNCHER_BIN_DIR}"
+            COMMAND "${VCS_SWIFTC_EXECUTABLE}" -O -parse-as-library
+                    -target arm64-apple-macosx13.0
+                    "${VCS_LAUNCHER_SRC}"
+                    -o "${VCS_LAUNCHER_BIN_DIR}/VCSLauncher"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${VCS_LAUNCHER_PLIST}" "${VCS_LAUNCHER_APP_DIR}/Contents/Info.plist"
+            COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/vcs_launcher_stamp"
+            DEPENDS "${VCS_LAUNCHER_SRC}" "${VCS_LAUNCHER_PLIST}"
+            COMMENT "Building VCSLauncher.app (Swift settings GUI)"
+            VERBATIM)
+        add_custom_target(vcs_launcher ALL DEPENDS "${CMAKE_BINARY_DIR}/vcs_launcher_stamp")
+    else()
+        message(WARNING
+            "swiftc not found -- VCSLauncher.app will not be built. "
+            "Install Xcode or the Swift toolchain to get the settings GUI.")
+    endif()
+endif()
+
 # Profile-specific generator. The root psp_recomp target stays game-neutral.
 add_executable(vcs_recomp tools/vcs_codegen_main.cpp)
 target_link_libraries(vcs_recomp PRIVATE psprecomp_core)
@@ -257,6 +533,14 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
         host/vcs_camera_input.cpp
         host/vcs_vehicle_input.cpp)
     target_include_directories(vcs_config_tests PRIVATE host)
+    if(APPLE)
+        # vcs_config.cpp's InternalResolutionMode::Desktop case calls
+        # CGDisplayPixelsWide/High (CoreGraphics) -- this target compiles
+        # that file standalone rather than through vcs_target_common(), so
+        # it needs the same framework linked here directly.
+        find_library(VCS_CONFIG_TESTS_COREGRAPHICS CoreGraphics REQUIRED)
+        target_link_libraries(vcs_config_tests PRIVATE ${VCS_CONFIG_TESTS_COREGRAPHICS})
+    endif()
     add_test(NAME vcs_config_tests COMMAND vcs_config_tests)
 
     add_executable(audio_resampler_tests tests/audio_resampler_tests.cpp)
@@ -293,3 +577,7 @@ if(WIN32)
     target_link_libraries(vcs_dx12_ge_probe PRIVATE d3d12 dxgi d3dcompiler dxguid)
     vcs_set_runtime_output(vcs_dx12_ge_probe)
 endif()
+
+# Offline texture tool: same classify/upscale code as the game, for evaluation and pack building.
+add_executable(vcs_texture_tool tools/texture_tool.cpp host/vcs_texture_replace.cpp)
+target_include_directories(vcs_texture_tool PRIVATE host)

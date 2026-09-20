@@ -6,6 +6,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Single-config generators (Ninja/Make) build unoptimized, no-flags code with
+# no CMAKE_BUILD_TYPE at all -- default to Release rather than leaving a
+# fresh `cmake -G Ninja ..` producing a debug-speed VCSNative binary. Only
+# applies when the generator actually has one build type to pick (multi-
+# config generators, Xcode/Visual Studio, choose per-build with --config
+# instead, so this must not override that).
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+        "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
+endif()
+
 option(PSPRECOMP_BUILD_TESTS "Build reusable PSPRecomp tests" ON)
 option(PSPRECOMP_BUILD_PROFILE_TESTS "Build tests supplied by the selected profile" ON)
 set(PSPRECOMP_PROFILE "" CACHE STRING "Profile to build from profiles/<name>; empty builds only the framework")

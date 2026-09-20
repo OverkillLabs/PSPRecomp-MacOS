@@ -1,6 +1,26 @@
-# PSPRecomp
+# PSPRecomp (macOS / Apple Silicon fork)
 
-PSPRecomp is a static recompilation framework for PSP software. It reads an Allegrex/MIPS executable, analyzes guest code, emits C++ translation units, and runs them through a native host runtime instead of shipping a PSP interpreter or JIT.
+This is a fork of [jessicanataliagta/PSPRecomp](https://github.com/jessicanataliagta/PSPRecomp),
+the original PSPRecomp created by **Jessica Natalia**
+([@jessicanataliagta](https://github.com/jessicanataliagta)), adding a
+**native macOS ARM (Apple Silicon) port of the VCS profile** (GTA:
+Vice City Stories) alongside the original Windows/DirectX12 build. None of
+this port would exist without her original recompiler, VCS profile and
+DX12 host to build on top of — all credit for the framework and the game
+profile itself belongs to her. The two builds share the same recompiler
+framework and profile; only the GE (graphics) backend and host platform
+layer differ.
+
+On macOS, VCSNative runs through a native **Vulkan/MoltenVK** GE backend
+(`profiles/vcs/host/ge_gpu_backend_vulkan.cpp`) instead of DirectX12, real
+CoreGraphics-based display/resolution handling, and a native SwiftUI
+settings launcher (`VCSLauncher.app`, built alongside `VCSNative.app`) for
+editing `VCSNative.ini` without hand-editing the file.
+
+PSPRecomp itself is a static recompilation framework for PSP software. It
+reads an Allegrex/MIPS executable, analyzes guest code, emits C++
+translation units, and runs them through a native host runtime instead of
+shipping a PSP interpreter or JIT.
 
 The repository is split between a reusable framework and game-specific profiles. The first working profile is GTA: Vice City Stories (`profiles/vcs`).
 
@@ -22,7 +42,10 @@ Game-specific addresses, HLE behavior, native fast paths, renderer integration a
 
 - CMake 3.20 or newer
 - A C++20 compiler
-- Visual Studio 2022 for the current Windows/DX12 VCS build
+- Visual Studio 2022 for the Windows/DX12 VCS build
+- macOS 13+ on Apple Silicon, Xcode command line tools (for `swiftc`, used
+  to build `VCSLauncher.app`), and `brew install vulkan-headers
+  vulkan-loader molten-vk shaderc` for the Vulkan/MoltenVK VCS build
 
 ## Build the framework only
 
@@ -44,6 +67,11 @@ cmake --build out/vcs --config Release
 ```
 
 Windows users working on the VCS profile can use the maintained scripts in `profiles/vcs/scripts`.
+
+On macOS this produces `VCSNative.app` and `VCSLauncher.app` side by side
+in `out/vcs/bin/Release/`. Launch `VCSLauncher.app` first to edit display,
+rendering and addon settings (it edits `VCSNative.app`'s bundled
+`VCSNative.ini` directly); its Play button launches `VCSNative.app`.
 
 ## Create another profile
 

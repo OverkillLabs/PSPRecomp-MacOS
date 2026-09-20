@@ -1,7 +1,9 @@
 #include "ge_renderer.hpp"
 #include "ge_gpu_backend.hpp"
 #include "vcs_config.hpp"
+#include "vcs_env.hpp"
 #include "vcs_project2dfx.hpp"
+#include "vcs_sky_palette.hpp"
 #include "vcs_fps_overlay.hpp"
 
 #include "psprecomp/common.hpp"
@@ -15,6 +17,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -23,6 +26,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -30,6 +34,13 @@
 #define PSPRECOMP_GE_X86_SIMD 1
 #else
 #define PSPRECOMP_GE_X86_SIMD 0
+#endif
+
+#if defined(__aarch64__) || defined(__ARM_NEON) || defined(_M_ARM64)
+#include <arm_neon.h>
+#define PSPRECOMP_GE_ARM_SIMD 1
+#else
+#define PSPRECOMP_GE_ARM_SIMD 0
 #endif
 
 namespace vcs {
@@ -143,7 +154,7 @@ inline void divide4_same_denominator(float n0, float n1, float n2, float n3,
 // directly.  The GE list runs on one thread, so plain counters suffice; the
 // clock reads are only taken when the diagnostic is on.
 bool ge_phase_diag_enabled() noexcept {
-    static const bool enabled = std::getenv("PSPRECOMP_GE_PHASE_DIAG") != nullptr;
+    static const bool enabled = VCS_ENV("PSPRECOMP_GE_PHASE_DIAG") != nullptr;
     return enabled;
 }
 std::uint64_t g_ge_pixel_ns{};
@@ -187,7 +198,7 @@ struct PhaseTimer {
 // 1 to restore it for an A/B or for the transfer self-test.
 bool legacy_vertex_staging_enabled() noexcept {
     static const bool enabled = [] {
-        const char *text = std::getenv("PSPRECOMP_GE_GPU_STAGE_VERTICES");
+        const char *text = VCS_ENV("PSPRECOMP_GE_GPU_STAGE_VERTICES");
         return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
     }();
     return enabled;
@@ -198,8 +209,22 @@ bool gpu_hardware_transform_enabled() noexcept {
     // Rendering.HardwareTransform decides; the environment variable still wins
     // when set, so an A/B in one binary stays possible.
     static const bool enabled = [] {
-        const char *text = std::getenv("PSPRECOMP_GE_GPU_HW_TRANSFORM");
+        const char *text = VCS_ENV("PSPRECOMP_GE_GPU_HW_TRANSFORM");
         if (text != nullptr && *text != '\0') return std::strcmp(text, "0") != 0;
+        // The Vulkan/MoltenVK backend's hardware-transform path (both the
+        // generic accumulate_hardware_triangles and the packed-0x0115 fast
+        // path -- see ge_gpu_backend_vulkan.cpp) is now implemented, but it
+        // is brand new, GPU-shader-level code that has not been play-tested
+        // across the game the way DX12's has. The shipped .ini defaults
+        // Rendering.HardwareTransform to true (written for DX12, where this
+        // is proven); inheriting that default here for an untested Vulkan
+        // path the moment it starts compiling would turn it on for every
+        // double-click launch with zero verification first. Kept off by
+        // default specifically for Vulkan until that verification happens;
+        // PSPRECOMP_GE_GPU_HW_TRANSFORM=1 opts in explicitly for testing (the
+        // env var above already handles that -- this default is only what
+        // happens when nothing overrides it).
+        if (ge_gpu_backend_report().active == GeGpuBackendKind::Vulkan) return false;
         const vcs::VcsConfiguration &config = vcs::vcs_configuration();
         return config.initialized && config.rendering.hardware_transform;
     }();
@@ -226,7 +251,7 @@ bool gpu_hardware_transform_enabled() noexcept {
 // PSPRECOMP_GE_GPU_HW_CULL=1 re-enables it for whoever debugs it next.
 bool gpu_hardware_cull_enabled() noexcept {
     static const bool enabled = [] {
-        const char *text = std::getenv("PSPRECOMP_GE_GPU_HW_CULL");
+        const char *text = VCS_ENV("PSPRECOMP_GE_GPU_HW_CULL");
         return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
     }();
     return enabled;
@@ -237,7 +262,7 @@ bool gpu_hardware_cull_enabled() noexcept {
 std::int64_t parallel_pixel_threshold() noexcept {
     static const std::int64_t threshold = [] {
         constexpr std::int64_t default_value = 2048;
-        const char *text = std::getenv("PSPRECOMP_RASTER_PARALLEL_PIXELS");
+        const char *text = VCS_ENV("PSPRECOMP_RASTER_PARALLEL_PIXELS");
         if (text == nullptr || *text == '\0') return default_value;
         char *end = nullptr;
         const unsigned long long value = std::strtoull(text, &end, 10);
@@ -254,11 +279,13 @@ std::int64_t parallel_pixel_threshold() noexcept {
 // by raster/texture work.  Keep small draws serial because waking participants
 // costs more than decoding a few dozen simple vertices.
 bool parallel_vertex_decode_enabled() noexcept {
-    // Stage 41+ experiment: keep opt-in until physical Windows/Vulkan parity
-    // is established against the last known-good Stage 40 run.
+    // On by default with the Vulkan backend (about 1 ms less game-thread CPU per frame in busy
+    // scenes, no visual difference); the DirectX 12 build keeps it opt-in.
+    // PSPRECOMP_GE_PARALLEL_VERTEX_DECODE=1/0 forces it either way on any backend.
     static const bool enabled = [] {
-        const char *text = std::getenv("PSPRECOMP_GE_PARALLEL_VERTEX_DECODE");
-        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0 &&
+        const char *text = VCS_ENV("PSPRECOMP_GE_PARALLEL_VERTEX_DECODE");
+        if (text == nullptr || *text == '\0') return ge_gpu_backend_is_vulkan();
+        return std::strcmp(text, "0") != 0 &&
                std::strcmp(text, "false") != 0 && std::strcmp(text, "FALSE") != 0 &&
                std::strcmp(text, "off") != 0 && std::strcmp(text, "OFF") != 0;
     }();
@@ -271,7 +298,7 @@ bool packed_0115_gpu_decode_enabled() noexcept {
     // the old parallel-decode experiment this removes CPU work instead of
     // distributing it across more host threads. Keep an A/B switch for parity.
     static const bool enabled = [] {
-        const char *text = std::getenv("PSPRECOMP_DX12_PACKED_0115");
+        const char *text = VCS_ENV("PSPRECOMP_DX12_PACKED_0115");
         if (text == nullptr || *text == '\0') return true;
         return std::strcmp(text, "0") != 0 &&
                std::strcmp(text, "false") != 0 && std::strcmp(text, "FALSE") != 0 &&
@@ -284,7 +311,7 @@ bool direct_nonindexed_gpu_draw_enabled() noexcept {
     // Stage 43 vkCmdDraw fast path is also isolated behind an explicit switch
     // while the crash fix is validated on the user's physical driver.
     static const bool enabled = [] {
-        const char *text = std::getenv("PSPRECOMP_GE_DIRECT_NONINDEXED_DRAW");
+        const char *text = VCS_ENV("PSPRECOMP_GE_DIRECT_NONINDEXED_DRAW");
         return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0 &&
                std::strcmp(text, "false") != 0 && std::strcmp(text, "FALSE") != 0 &&
                std::strcmp(text, "off") != 0 && std::strcmp(text, "OFF") != 0;
@@ -295,7 +322,7 @@ bool direct_nonindexed_gpu_draw_enabled() noexcept {
 std::size_t parallel_vertex_decode_threshold(bool expensive_vertex) noexcept {
     static const std::size_t simple_threshold = [] {
         constexpr std::size_t default_value = 256u;
-        const char *text = std::getenv("PSPRECOMP_GE_PARALLEL_VERTEX_THRESHOLD");
+        const char *text = VCS_ENV("PSPRECOMP_GE_PARALLEL_VERTEX_THRESHOLD");
         if (text == nullptr || *text == '\0') return default_value;
         char *end = nullptr;
         const unsigned long long value = std::strtoull(text, &end, 10);
@@ -317,7 +344,7 @@ unsigned parallel_vertex_decode_max_participants() noexcept {
     // A/B tuning without rebuilding.
     static const unsigned participants = [] {
         constexpr unsigned default_value = 6u;
-        const char *text = std::getenv("PSPRECOMP_GE_PARALLEL_VERTEX_MAX_WORKERS");
+        const char *text = VCS_ENV("PSPRECOMP_GE_PARALLEL_VERTEX_MAX_WORKERS");
         if (text == nullptr || *text == '\0') return default_value;
         char *end = nullptr;
         const unsigned long value = std::strtoul(text, &end, 10);
@@ -427,7 +454,7 @@ private:
         unsigned requested = std::thread::hardware_concurrency();
         if (requested == 0u) requested = 1u;
         bool explicitly_configured = false;
-        if (const char *text = std::getenv("PSPRECOMP_RASTER_THREADS")) {
+        if (const char *text = VCS_ENV("PSPRECOMP_RASTER_THREADS")) {
             char *end = nullptr;
             const unsigned long value = std::strtoul(text, &end, 10);
             if (end != text && *end == '\0' && value >= 1u && value <= kMaxThreads) {
@@ -929,29 +956,82 @@ Vec3 normalized_or_001(Vec3 value) noexcept {
     return value * inverse_length;
 }
 
+// These three are called for every single vertex the game draws (world/view
+// transform, normal transform, and the final projection) -- confirmed live
+// this session (PSPRECOMP_GE_PHASE_DIAG) as a real, measurable share of the
+// CPU cost in dense scenes (170k+ vertices/frame). NEON is always available
+// on Apple Silicon (unlike x86 SSE, which needs a runtime/compile-time
+// check), so this mirrors the existing PSPRECOMP_GE_X86_SIMD precedent
+// (lerp_color above) exactly: same signature, same inputs/outputs, just the
+// arithmetic itself vectorized. Matrix columns are 3 floats each (not
+// 4-padded in memory), so each column is loaded via vld1_f32 (2 lanes) +
+// one scalar lane instead of a single vld1q_f32, to avoid reading past the
+// 12-float array into unrelated memory.
+#if PSPRECOMP_GE_ARM_SIMD
+[[nodiscard]] float32x4_t load_matrix_column(const float *column3) noexcept {
+    float32x4_t v = vsetq_lane_f32(column3[2], vcombine_f32(vld1_f32(column3), vdup_n_f32(0.0f)), 2u);
+    return vsetq_lane_f32(0.0f, v, 3u);
+}
+#endif
+
 Vec3 transform_4x3(const std::array<float, 12> &matrix, Vec3 value) noexcept {
+#if PSPRECOMP_GE_ARM_SIMD
+    const float32x4_t col0 = load_matrix_column(&matrix[0]);
+    const float32x4_t col1 = load_matrix_column(&matrix[3]);
+    const float32x4_t col2 = load_matrix_column(&matrix[6]);
+    const float32x4_t col3 = load_matrix_column(&matrix[9]);
+    float32x4_t result = vfmaq_n_f32(col3, col0, value.x);
+    result = vfmaq_n_f32(result, col1, value.y);
+    result = vfmaq_n_f32(result, col2, value.z);
+    return {vgetq_lane_f32(result, 0u), vgetq_lane_f32(result, 1u), vgetq_lane_f32(result, 2u)};
+#else
     return {
         matrix[0] * value.x + matrix[3] * value.y + matrix[6] * value.z + matrix[9],
         matrix[1] * value.x + matrix[4] * value.y + matrix[7] * value.z + matrix[10],
         matrix[2] * value.x + matrix[5] * value.y + matrix[8] * value.z + matrix[11],
     };
+#endif
 }
 
 Vec3 transform_normal_4x3(const std::array<float, 12> &matrix, Vec3 value) noexcept {
+#if PSPRECOMP_GE_ARM_SIMD
+    const float32x4_t col0 = load_matrix_column(&matrix[0]);
+    const float32x4_t col1 = load_matrix_column(&matrix[3]);
+    const float32x4_t col2 = load_matrix_column(&matrix[6]);
+    float32x4_t result = vmulq_n_f32(col0, value.x);
+    result = vfmaq_n_f32(result, col1, value.y);
+    result = vfmaq_n_f32(result, col2, value.z);
+    return {vgetq_lane_f32(result, 0u), vgetq_lane_f32(result, 1u), vgetq_lane_f32(result, 2u)};
+#else
     return {
         matrix[0] * value.x + matrix[3] * value.y + matrix[6] * value.z,
         matrix[1] * value.x + matrix[4] * value.y + matrix[7] * value.z,
         matrix[2] * value.x + matrix[5] * value.y + matrix[8] * value.z,
     };
+#endif
 }
 
 Vec4 transform_4x4(const std::array<float, 16> &matrix, Vec3 value) noexcept {
+#if PSPRECOMP_GE_ARM_SIMD
+    // 4x4 columns are already contiguous (4 floats each), unlike the 4x3
+    // case above -- a plain vld1q_f32 is exact, no padding needed.
+    const float32x4_t col0 = vld1q_f32(&matrix[0]);
+    const float32x4_t col1 = vld1q_f32(&matrix[4]);
+    const float32x4_t col2 = vld1q_f32(&matrix[8]);
+    const float32x4_t col3 = vld1q_f32(&matrix[12]);
+    float32x4_t result = vfmaq_n_f32(col3, col0, value.x);
+    result = vfmaq_n_f32(result, col1, value.y);
+    result = vfmaq_n_f32(result, col2, value.z);
+    return {vgetq_lane_f32(result, 0u), vgetq_lane_f32(result, 1u), vgetq_lane_f32(result, 2u),
+            vgetq_lane_f32(result, 3u)};
+#else
     return {
         matrix[0] * value.x + matrix[4] * value.y + matrix[8] * value.z + matrix[12],
         matrix[1] * value.x + matrix[5] * value.y + matrix[9] * value.z + matrix[13],
         matrix[2] * value.x + matrix[6] * value.y + matrix[10] * value.z + matrix[14],
         matrix[3] * value.x + matrix[7] * value.y + matrix[11] * value.z + matrix[15],
     };
+#endif
 }
 
 
@@ -1891,22 +1971,58 @@ std::uint32_t texture_address(const std::array<std::uint32_t, 256> &commands) no
 // structural fix that removes the conditions entirely is the GPU-to-GPU path.
 bool software_raster_skipped(const std::array<std::uint32_t, 256> &commands) noexcept {
     static const bool skip_everything = [] {
-        const char *value = std::getenv("PSPRECOMP_GE_GPU_SKIP_SOFTWARE_RASTER");
+        const char *value = VCS_ENV("PSPRECOMP_GE_GPU_SKIP_SOFTWARE_RASTER");
         if (value != nullptr && *value != '\0') return *value != '0';
         // Native DX12 GE is authoritative. The first physical Stage 44.6 run
         // exposed that the old conservative policy still CPU-rasterized most
         // offscreen targets as well as submitting the same geometry to D3D12.
         // That double raster is unnecessary once DX12GEColor is enabled.
+        //
+        // Checking the *active* backend kind (not just the configured intent)
+        // matters on platforms where the requested native backend does not yet
+        // actually rasterize anything -- e.g. the macOS MoltenVK bring-up
+        // backend's headless self-test phase reports active=Vulkan without
+        // drawing a single triangle. Skipping CPU raster there would blank the
+        // game.
+        //
+        // Vulkan was excluded here for a while: unconditionally skipping
+        // every draw's CPU rasterization (tried once) also skipped
+        // composition/feedback passes -- offscreen targets some other draw
+        // later samples back as a texture (VCS uses this for water and other
+        // effects; see ge_gpu_backend_is_framebuffer_feedback_texture()'s
+        // callers above). Vulkan doesn't implement framebuffer feedback, so
+        // CPU rasterization was the only thing ever writing real pixels
+        // there, and skipping it left those textures sampling whatever
+        // garbage was already in guest RAM.
+        //
+        // Measured instead of assumed: skip_owned below only exempts the one
+        // target ge_gpu_backend_owned_framebuffer() confirms the GPU actually
+        // rendered, which turned out to still leave nearly everything on the
+        // slow path -- every OTHER target this game draws to, feedback or
+        // not, still ran the single-threaded ~10 ms full-screen CPU rect
+        // rasterizer (rasterize_rectangle, above) every single frame
+        // regardless of scene complexity, alone consuming over half of every
+        // 16.6 ms frame budget and capping cutscenes at 48-58 fps no matter
+        // how light the actual scene was. A live playthrough with this fully
+        // skipped (PSPRECOMP_GE_GPU_SKIP_SOFTWARE_RASTER=1) confirmed a
+        // clean, stable 60 fps with no visible corruption in the scenes
+        // exercised. This backend still has no real feedback-sampling path
+        // (see the function above, hard-coded false), so a scene that
+        // actually depends on one is the risk to watch for -- if a water/
+        // reflection/mirror-type effect goes wrong, that is where to look
+        // first.
         const VcsConfiguration &cfg = vcs_configuration();
         return cfg.initialized && cfg.rendering.backend == RenderingBackend::DirectX12 &&
-               cfg.rendering.dx12_ge_color;
+               cfg.rendering.dx12_ge_color &&
+               (ge_gpu_backend_report().active == GeGpuBackendKind::DirectX12 ||
+                ge_gpu_backend_report().active == GeGpuBackendKind::Vulkan);
     }();
     static const bool skip_owned = [] {
-        const char *value = std::getenv("PSPRECOMP_GE_GPU_SKIP_OWNED_RASTER");
+        const char *value = VCS_ENV("PSPRECOMP_GE_GPU_SKIP_OWNED_RASTER");
         return value == nullptr || (*value != '\0' && *value != '0');
     }();
     static const bool skip_displayed = [] {
-        const char *value = std::getenv("PSPRECOMP_GE_GPU_SKIP_DISPLAYED_RASTER");
+        const char *value = VCS_ENV("PSPRECOMP_GE_GPU_SKIP_DISPLAYED_RASTER");
         return value == nullptr || (*value != '\0' && *value != '0');
     }();
     if (!ge_gpu_backend_active()) return false;
@@ -1915,6 +2031,13 @@ bool software_raster_skipped(const std::array<std::uint32_t, 256> &commands) noe
     if (skip_owned) {
         const std::uint32_t owned = ge_gpu_backend_owned_framebuffer();
         if (owned != 0u && target == owned) return true;
+        if (VCS_ENV("PSPRECOMP_RASTER_SKIP_DIAG") != nullptr) {
+            static std::uint64_t misses = 0u;
+            if ((misses++ & 0x3FFu) == 0u)
+                std::fprintf(stderr, "[raster-skip] miss target=%s owned=%s count=%llu\n",
+                             psprecomp::hex32(target).c_str(), psprecomp::hex32(owned).c_str(),
+                             static_cast<unsigned long long>(misses));
+        }
     }
     if (skip_displayed && ge_gpu_backend_presents_directly()) {
         const std::uint32_t displayed = ge_gpu_backend_display_framebuffer();
@@ -2510,7 +2633,7 @@ bool decode_texture_rgba_into(const psprecomp::GuestMemory &memory,
     };
 
     static const bool parallel_texture_decode = [] {
-        const char *text = std::getenv("PSPRECOMP_GE_PARALLEL_TEXTURE_DECODE");
+        const char *text = VCS_ENV("PSPRECOMP_GE_PARALLEL_TEXTURE_DECODE");
         return text == nullptr || (*text != '\0' && std::strcmp(text, "0") != 0);
     }();
     RowWorkerPool &pool = RowWorkerPool::instance();
@@ -2674,13 +2797,18 @@ FragmentSetup make_fragment_setup(const std::array<std::uint32_t, 256> &commands
     return setup;
 }
 
+// Only registers consumed by make_fragment_setup participate. Most city
+// draws repeat this state for long runs, so avoid decoding it again until a
+// relevant register actually changes.
+// Namespace scope (not function-local) because the Cache local class below
+// names regs in a member declaration, and local classes may only reference
+// entities with static storage duration ([class.local]); MSVC accepted a
+// function-local constexpr there, Clang and GCC reject it.
+constexpr std::array<std::uint8_t, 23> regs{{
+    0x9D,0xD2,0x9C,0xD4,0xD5,0xD3,0x1E,0xE8,0xE9,0x9F,0x9E,0x23,
+    0xDE,0xE7,0xDF,0x21,0xE0,0xE1,0xDB,0x22,0xC9,0xCA,0x00}};
+
 FragmentSetup make_fragment_setup_cached(const std::array<std::uint32_t, 256> &commands) noexcept {
-    // Only registers consumed by make_fragment_setup participate. Most city
-    // draws repeat this state for long runs, so avoid decoding it again until a
-    // relevant register actually changes.
-    constexpr std::array<std::uint8_t, 23> regs{{
-        0x9D,0xD2,0x9C,0xD4,0xD5,0xD3,0x1E,0xE8,0xE9,0x9F,0x9E,0x23,
-        0xDE,0xE7,0xDF,0x21,0xE0,0xE1,0xDB,0x22,0xC9,0xCA,0x00}};
     struct Cache {
         std::array<std::uint32_t, regs.size()> values{};
         FragmentSetup setup{};
@@ -3352,7 +3480,8 @@ std::uint32_t pack_gpu_alpha_control(const GeGpuDrawDescriptor &draw) noexcept {
 }
 
 std::uint32_t pack_gpu_fog_control(const GeGpuDrawDescriptor &draw) noexcept {
-    return (draw.fog_color & 0x00FFFFFFu) |
+    if (draw.fog_enabled) note_game_sky_color(draw.fog_color);
+    return (remap_sky_color(draw.fog_color) & 0x00FFFFFFu) |
            (static_cast<std::uint32_t>(draw.fog_enabled ? 0xFFu : 0u) << 24u);
 }
 
@@ -3374,7 +3503,7 @@ Color gpu_draw_debug_color(const GeGpuDrawDescriptor &draw) noexcept {
 
 bool gpu_geometry_debug_colors_enabled() noexcept {
     static const bool enabled = [] {
-        const char *value = std::getenv("PSPRECOMP_GE_GPU_GEOMETRY_DEBUG_COLORS");
+        const char *value = VCS_ENV("PSPRECOMP_GE_GPU_GEOMETRY_DEBUG_COLORS");
         return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -3383,7 +3512,7 @@ bool gpu_geometry_debug_colors_enabled() noexcept {
 
 bool gpu_force_white_vertex_colors_enabled() noexcept {
     static const bool enabled = [] {
-        const char *value = std::getenv("PSPRECOMP_GE_GPU_FORCE_WHITE_VERTEX");
+        const char *value = VCS_ENV("PSPRECOMP_GE_GPU_FORCE_WHITE_VERTEX");
         return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -3498,6 +3627,18 @@ void accumulate_gpu_rectangle(const GeGpuDrawDescriptor &draw,
         ge_gpu_backend_texture_available(effective_draw);
 
     Color color = b.color;
+    if (effective_draw.clear_mode && effective_draw.clear_color) {
+        // The sky is a flat clear that matches the fog color exactly, so a
+        // clear whose color equals it is the sky (other clears stay untouched).
+        const std::uint32_t clear_abgr = static_cast<std::uint32_t>(color.r) |
+            (static_cast<std::uint32_t>(color.g) << 8u) | (static_cast<std::uint32_t>(color.b) << 16u);
+        if (clear_abgr == (draw.fog_color & 0x00FFFFFFu)) {
+            const std::uint32_t mapped = remap_sky_color(clear_abgr);
+            color.r = static_cast<std::uint8_t>(mapped & 0xFFu);
+            color.g = static_cast<std::uint8_t>((mapped >> 8u) & 0xFFu);
+            color.b = static_cast<std::uint8_t>((mapped >> 16u) & 0xFFu);
+        }
+    }
     if (!effective_draw.clear_mode && gpu_force_white_vertex_colors_enabled()) {
         color = Color{255u, 255u, 255u, 255u};
     } else if (!effective_draw.clear_mode && gpu_geometry_debug_colors_enabled()) {
@@ -4329,7 +4470,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
     // PSPRECOMP_GE_GPU_HW_LIT=0 restores the Stage 39 behaviour of refusing
     // every lit draw, for A/B in one binary.
     static const bool hw_lit_enabled = [] {
-        const char *text = std::getenv("PSPRECOMP_GE_GPU_HW_LIT");
+        const char *text = VCS_ENV("PSPRECOMP_GE_GPU_HW_LIT");
         return text == nullptr || (*text != '\0' && std::strcmp(text, "0") != 0);
     }();
     const bool lighting_on = (data24(commands[0x17u]) & 1u) != 0u;
@@ -4836,6 +4977,18 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         }
         ge_gpu_backend_note_through_extent(gpu_draw, max_x, max_y);
 
+        // Full-screen splash and loading art (512-wide 8-bit textures) is drawn
+        // by the game into a 512x320 rectangle, but only the top 272 rows are
+        // visible, so the bottom of the picture was cut off and the logo ended
+        // up under the loading bar. Fit the quad into the visible area.
+        if (gpu_draw.through && gpu_draw.texture_enabled && gpu_draw.texture_width == 512u &&
+            gpu_draw.texture_format == 5u && (max_x - min_x) >= 400.0f && max_y > 280.0f &&
+            max_y <= 340.0f) {
+            const float fit = 272.0f / max_y;
+            for (Vertex &vertex : vertices) vertex.y *= fit;
+            max_y = 272.0f;
+        }
+
         const GeGpuWidescreenHud hud = ge_gpu_backend_widescreen_hud(gpu_draw);
         // Full-width draws are backdrops, fades and letterbox bars: they have to
         // keep covering the screen, so they stay stretched. Measured against the
@@ -4850,6 +5003,17 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         // above the minimap.  Keep those auxiliary primitives in PSP coordinates
         // and only correct filled geometry (triangles/strips/fans/sprites).
         const bool widescreen_surface_primitive = primitive >= 3u && primitive <= 6u;
+        // Same three exclusions widescreen_hud already needed (see the long
+        // comments below, unchanged) -- but computed independent of whether
+        // widescreen shrink is active, since "is this real 2D interface" is a
+        // question worth answering even with widescreen off. Feeds
+        // gpu_draw.hud_candidate (see ge_gpu_backend.hpp) for the experimental
+        // HUD-at-output-resolution path; does not itself alter any vertex.
+        const bool hud_world_effect_exclusion =
+            !(setup.depth_test_enabled && !setup.depth_write_enabled) &&
+            !(setup.texture_enabled && ge_gpu_backend_is_framebuffer_feedback_texture(gpu_draw));
+        gpu_draw.hud_candidate = widescreen_surface_primitive && !setup.clear_mode && !full_width &&
+            hud_world_effect_exclusion;
         if (widescreen_surface_primitive && hud.shrink != 1.0f && !setup.clear_mode && !full_width &&
             // Additive depth-tested 2D is not interface, it is the world drawn
             // in screen space: coronas, headlight glows, lens flares. The guest
@@ -4863,13 +5027,39 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             // it left the map unshrunk inside a shrunk frame. What separates the
             // two is the blend: a glow adds light with a fixed destination
             // factor, while the radar composites with ordinary source alpha.
-            !(setup.depth_test_enabled && !setup.depth_write_enabled) &&
+            //
             // The composition quads are through-mode too, and they carry the
             // world. Shrinking them would pillarbox the picture and undo the
             // widened frustum instead of complementing it.
-            !(setup.texture_enabled && ge_gpu_backend_is_framebuffer_feedback_texture(gpu_draw))) {
-            for (Vertex &vertex : vertices)
-                vertex.x = hud.source_center + (vertex.x - hud.source_center) / hud.shrink;
+            hud_world_effect_exclusion) {
+            // ThirteenAG's original correction is X-only and symmetric around
+            // the screen's centre -- his target was PC monitors, which widen
+            // a 4:3/16:9 game horizontally (and only ever that direction).
+            // The safe-area problem this session is fixing is different:
+            // interface geometry runs past the true edge on specific
+            // corners, not symmetrically. A single symmetric factor strong
+            // enough to pull the far corner (further from centre, needing
+            // more correction) back on screen over-corrects the near side
+            // too, pushing already-correctly-placed elements too far toward
+            // the middle -- confirmed live, directly against reference
+            // screenshots: the top-right HUD's own X was already right, but
+            // a shared symmetric Y pulled it down away from the top edge,
+            // and the bottom-left minimap's own Y was already right, but the
+            // same shared X pulled it away from the left edge. Each edge
+            // gets its own factor instead: near (weak, ~a no-op) for the
+            // side that was already correct, matching the direction that
+            // needed the real correction for the other.
+            constexpr float kPspCenterY = 272.0f * 0.5f;
+            constexpr float kHudShrinkLeft = 1.02f;   // near-corner X (minimap side)
+            const float kHudShrinkRight = hud.shrink;  // far-corner X (money/weapon frame)
+            constexpr float kHudShrinkTop = 1.02f;    // near-corner Y (money/weapon HUD side)
+            constexpr float kHudShrinkBottom = 1.35f;  // far-corner Y (minimap)
+            for (Vertex &vertex : vertices) {
+                const float shrink_x = vertex.x < hud.source_center ? kHudShrinkLeft : kHudShrinkRight;
+                const float shrink_y = vertex.y < kPspCenterY ? kHudShrinkTop : kHudShrinkBottom;
+                vertex.x = hud.source_center + (vertex.x - hud.source_center) / shrink_x;
+                vertex.y = kPspCenterY + (vertex.y - kPspCenterY) / shrink_y;
+            }
             // The clip rectangle has to move with the geometry, or the radar
             // keeps being masked where the radar used to be. Both renderers read
             // their scissor from here.
@@ -4879,16 +5069,28 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             // That slack showed as a one-pixel column of the radar map leaking
             // out either side of the radar's circular frame. Losing a pixel of
             // an edge that a mask covers anyway is the harmless direction.
-            const auto shrink_scissor = [&](std::int32_t value, bool leading) {
-                const float moved = hud.source_center +
-                    (static_cast<float>(value) - hud.source_center) / hud.shrink;
+            const auto shrink_toward = [&](std::int32_t value, float center, float shrink,
+                                          bool leading) {
+                const float moved = center + (static_cast<float>(value) - center) / shrink;
                 return static_cast<std::int32_t>(leading ? std::ceil(moved)
                                                          : std::floor(moved));
             };
-            setup.scissor_x0 = shrink_scissor(setup.scissor_x0, true);
-            setup.scissor_x1 = shrink_scissor(setup.scissor_x1, false);
+            setup.scissor_x0 = shrink_toward(setup.scissor_x0, hud.source_center,
+                                             static_cast<float>(setup.scissor_x0) < hud.source_center
+                                                 ? kHudShrinkLeft : kHudShrinkRight, true);
+            setup.scissor_x1 = shrink_toward(setup.scissor_x1, hud.source_center,
+                                             static_cast<float>(setup.scissor_x1) < hud.source_center
+                                                 ? kHudShrinkLeft : kHudShrinkRight, false);
+            setup.scissor_y0 = shrink_toward(setup.scissor_y0, kPspCenterY,
+                                             static_cast<float>(setup.scissor_y0) < kPspCenterY
+                                                 ? kHudShrinkTop : kHudShrinkBottom, true);
+            setup.scissor_y1 = shrink_toward(setup.scissor_y1, kPspCenterY,
+                                             static_cast<float>(setup.scissor_y1) < kPspCenterY
+                                                 ? kHudShrinkTop : kHudShrinkBottom, false);
             gpu_draw.scissor_x0 = setup.scissor_x0;
             gpu_draw.scissor_x1 = setup.scissor_x1;
+            gpu_draw.scissor_y0 = setup.scissor_y0;
+            gpu_draw.scissor_y1 = setup.scissor_y1;
             gpu_draw.widescreen_hud = true;
         }
     }

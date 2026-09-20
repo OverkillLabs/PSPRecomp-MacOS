@@ -3,6 +3,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 
 namespace psprecomp {
@@ -7387,6 +7388,7 @@ L_08B6B650:
     return;
 L_08B6B66C:
     ctx.gpr[16] = (ctx.gpr[2] | 0u);
+    std::fprintf(stderr, "[diag-0217-660] alloc(6928)=0x%08X\n", ctx.gpr[16]);
     { const bool branch_taken = ctx.gpr[16] == 0u;
     // nop
       if (branch_taken) {

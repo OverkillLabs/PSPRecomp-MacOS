@@ -1,7 +1,12 @@
+// Windows window, input and presentation (native Win32 window, XInput, DirectX 12 presenter).
+// Split out of display_window.cpp so Windows and macOS code cannot affect each other.
+
 #include "display_window.hpp"
 #include "dx12_presenter.hpp"
 #include "ge_gpu_backend.hpp"
 #include "vcs_config.hpp"
+#include "vcs_env.hpp"
+#include "vcs_key_prompts.hpp"
 #include "vcs_runtime_log.hpp"
 #include "vcs_vehicle_input.hpp"
 
@@ -15,7 +20,6 @@
 #include <string>
 #include <vector>
 
-#if defined(_WIN32)
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -228,7 +232,7 @@ constexpr std::uint16_t kPadY = 0x8000u;
 }
 
 int legacy_configured_scale() {
-    const char *text = std::getenv("PSPRECOMP_WINDOW_SCALE");
+    const char *text = VCS_ENV("PSPRECOMP_WINDOW_SCALE");
     if (text == nullptr || *text == '\0') return 0;
     char *end = nullptr;
     const long value = std::strtol(text, &end, 10);
@@ -558,7 +562,7 @@ void ensure_window_started() {
 
 bool display_window_enabled() {
     static const bool enabled = [] {
-        const char *text = std::getenv("PSPRECOMP_WINDOW");
+        const char *text = VCS_ENV("PSPRECOMP_WINDOW");
         if (text != nullptr && *text != '\0') return std::string(text) != "0";
         const VcsConfiguration &configuration = vcs_configuration();
         return configuration.initialized && configuration.display.enabled;
@@ -786,10 +790,20 @@ HostInputState display_window_input() {
     const std::int32_t wheel = state.wheel.exchange(0, std::memory_order_relaxed);
     if (!state.focused.load(std::memory_order_relaxed)) return publish();
 
+    // Which kind of device the player is using right now, so the game's on-screen prompts can say
+    // "Press F" or "Press X" to match (see vcs_key_prompts.hpp). Mirrors the macOS build.
+    bool keyboard_or_mouse_active = std::abs(mouse_dx) + std::abs(mouse_dy) > 3 || wheel != 0 ||
+        key_down(kMoveForward) || key_down(kMoveBack) || key_down(kMoveLeft) || key_down(kMoveRight);
     for (const KeyBinding &binding : kKeyBindings)
-        if (key_down(binding.virtual_key)) input.buttons |= binding.psp_button;
+        if (key_down(binding.virtual_key)) {
+            input.buttons |= binding.psp_button;
+            keyboard_or_mouse_active = true;
+        }
     for (const KeyBinding &binding : kMouseBindings)
-        if (key_down(binding.virtual_key)) input.buttons |= binding.psp_button;
+        if (key_down(binding.virtual_key)) {
+            input.buttons |= binding.psp_button;
+            keyboard_or_mouse_active = true;
+        }
 
     // Driving and walking want opposite things from the same keys, and the
     // guest tells us which one is happening: only vehicle code reads the
@@ -883,6 +897,13 @@ HostInputState display_window_input() {
         XInputStatePacket pad{};
         if (get_state(0u, &pad) == 0u) {
             const std::uint16_t b = pad.gamepad.buttons;
+            constexpr int kActiveStick = 12000;
+            if (b != 0u || std::abs(static_cast<int>(pad.gamepad.lx)) > kActiveStick ||
+                std::abs(static_cast<int>(pad.gamepad.ly)) > kActiveStick ||
+                std::abs(static_cast<int>(pad.gamepad.rx)) > kActiveStick ||
+                std::abs(static_cast<int>(pad.gamepad.ry)) > kActiveStick ||
+                pad.gamepad.left_trigger > 64u || pad.gamepad.right_trigger > 64u)
+                vcs_prompt_note_input(true);
             // The pad follows San Andreas' console layout, which is also the
             // scheme ThirteenAG's plugin assumes: cross accelerates and
             // sprints, square brakes and jumps, triangle enters vehicles.
@@ -938,12 +959,22 @@ HostInputState display_window_input() {
             }
         }
     }
+    if (keyboard_or_mouse_active) vcs_prompt_note_input(false);
     return publish();
 }
 
 bool display_window_close_requested() {
     if (!display_window_enabled()) return false;
     return window_state().close_requested.load(std::memory_order_relaxed);
+}
+
+bool display_window_debug_dump_requested() {
+    if (!display_window_enabled()) return false;
+    static bool was_down = false;
+    const bool down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    const bool pressed_this_poll = down && !was_down;
+    was_down = down;
+    return pressed_this_poll;
 }
 
 // Keeps the last rendered frame on screen after the guest stops so the run can
@@ -956,7 +987,7 @@ void display_window_shutdown() {
     WindowState &state = window_state();
     const HWND window = state.window.load(std::memory_order_acquire);
     if (window == nullptr) return;
-    const char *hold = std::getenv("PSPRECOMP_WINDOW_HOLD");
+    const char *hold = VCS_ENV("PSPRECOMP_WINDOW_HOLD");
     if (hold != nullptr && std::string(hold) == "0") {
         dx12_presenter_shutdown();
         PostMessageW(window, WM_CLOSE, 0, 0);
@@ -971,24 +1002,3 @@ void display_window_shutdown() {
 }
 
 } // namespace vcs
-
-#else
-
-namespace vcs {
-
-bool display_window_enabled() { return false; }
-void display_window_start() {}
-void display_window_set_status(const char *) {}
-void display_window_set_aspect_lock(bool) noexcept {}
-void display_window_present(const psprecomp::GuestMemory &, const FramebufferDescription &) {}
-void display_window_present_rgba(std::span<const std::byte>, std::uint32_t, std::uint32_t) {}
-DisplayWindowSurface display_window_surface() { return {}; }
-std::uint32_t display_window_buttons() { return 0u; }
-void display_window_analog(std::uint8_t &x, std::uint8_t &y) { x = 128u; y = 128u; }
-HostInputState display_window_input() { return {}; }
-bool display_window_close_requested() { return false; }
-void display_window_shutdown() {}
-
-} // namespace vcs
-
-#endif

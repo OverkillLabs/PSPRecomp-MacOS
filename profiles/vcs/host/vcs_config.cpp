@@ -22,6 +22,14 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+// CGDisplayPixelsWide/High are plain C, no Objective-C++ needed. This is the
+// real monitor query the "Headless/non-Windows builds cannot query a monitor
+// here" comment below used to claim didn't exist -- it does, and not having
+// it meant InternalResolutionMode::Desktop silently fell back to whatever
+// InternalWidth/InternalHeight happened to be in the .ini (1920x1080 in the
+// shipped default) on every Mac, regardless of the machine's actual display.
+#include <CoreGraphics/CoreGraphics.h>
 #endif
 
 namespace vcs {
@@ -139,6 +147,53 @@ void load_proper_shaders_configuration(VcsConfiguration &config,
         if (line.empty() || line[0] == ';' || line[0] == '#') continue;
         if (line.front() == '[' && line.back() == ']') {
             section = lowercase_copy(trim_copy(line.substr(1u, line.size() - 2u)));
+            continue;
+        }
+        if (section == "smaa") {
+            const std::size_t smaa_separator = line.find('=');
+            if (smaa_separator != std::string::npos &&
+                lowercase_copy(trim_copy(line.substr(0u, smaa_separator))) == "enabled" &&
+                !parse_bool(strip_inline_comment(line.substr(smaa_separator + 1u)), config.smaa_1x)) {
+                warning(config, line_number, "ProperShaders.ini: [SMAA] Enabled expects true/false");
+            }
+            continue;
+        }
+        if (section == "dither" || section == "cas" || section == "vhs" ||
+            section == "timeofdaygrade" || section == "skypalette" || section == "reliefshading") {
+            const std::size_t eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string k = lowercase_copy(trim_copy(line.substr(0u, eq)));
+            const std::string v = strip_inline_comment(line.substr(eq + 1u));
+            PostFxConfiguration &fx = config.postfx;
+            bool ok = true;
+            if (k == "enabled") {
+                bool &flag = section == "dither"  ? fx.dither_enabled
+                           : section == "cas"     ? fx.cas_enabled
+                           : section == "timeofdaygrade" ? fx.time_of_day_enabled
+                           : section == "skypalette" ? fx.sky_palette_enabled
+                           : section == "reliefshading" ? fx.relief_enabled
+                                                  : fx.vhs_enabled;
+                ok = parse_bool(v, flag);
+            } else if (section == "dither" && k == "strength") {
+                ok = parse_float(v, 0.0f, 4.0f, fx.dither_strength);
+            } else if (section == "cas" && k == "sharpness") {
+                ok = parse_float(v, 0.0f, 1.0f, fx.cas_sharpness);
+            } else if (section == "skypalette" && k == "strength") {
+                ok = parse_float(v, 0.0f, 1.0f, fx.sky_palette_strength);
+            } else if (section == "timeofdaygrade" && k == "strength") {
+                ok = parse_float(v, 0.0f, 1.0f, fx.time_of_day_strength);
+            } else if (section == "reliefshading" && k == "strength") {
+                ok = parse_float(v, 0.0f, 1.0f, fx.relief_strength);
+            } else if (section == "vhs" && k == "wiggle") {
+                ok = parse_float(v, 0.0f, 1.5f, fx.vhs_wiggle);
+            } else if (section == "vhs" && k == "smear") {
+                ok = parse_float(v, 0.0f, 2.0f, fx.vhs_smear);
+            } else if (section == "vhs" && k == "wigglespeed") {
+                ok = parse_float(v, 0.0f, 100.0f, fx.vhs_speed);
+            } else {
+                warning(config, line_number, "ProperShaders.ini: unknown [" + section + "] key '" + k + "'");
+            }
+            if (!ok) warning(config, line_number, "ProperShaders.ini: invalid [" + section + "] " + k);
             continue;
         }
         if (section != "volumetricclouds" && section != "volumetric clouds") continue;
@@ -375,6 +430,11 @@ void apply_rendering_key(VcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.SMAA expects true/false");
         return;
     }
+    if (key == "sharpen" || key == "sharpness") {
+        if (!parse_float(value, 0.0f, 2.0f, config.rendering.sharpen))
+            warning(config, line, "Rendering.Sharpen must be between 0.0 and 2.0");
+        return;
+    }
     if (key == "anisotropicfiltering" || key == "anisotropy") {
         if (!parse_u32(value, 1u, 16u, config.rendering.anisotropic_filtering))
             warning(config, line, "Rendering.AnisotropicFiltering must be between 1 and 16");
@@ -481,6 +541,11 @@ void apply_controls_key(VcsConfiguration &config, const std::string &key,
             warning(config, line, "Controls.ModernControlScheme expects true/false");
         return;
     }
+    if (key == "keyboardprompts") {
+        if (!parse_bool(value, config.controls.keyboard_prompts))
+            warning(config, line, "Controls.KeyboardPrompts expects true/false");
+        return;
+    }
     warning(config, line, "unknown [Controls] key '" + key + "'");
 }
 
@@ -499,14 +564,113 @@ void apply_widescreen_key(VcsConfiguration &config, const std::string &key,
     warning(config, line, "unknown [Widescreen] key '" + key + "'");
 }
 
+void apply_textures_key(VcsConfiguration &config, const std::string &key,
+                        const std::string &value, std::size_t line) {
+    TexturesConfiguration &tx = config.textures;
+    if (key == "mipmaps") {
+        if (!parse_bool(value, tx.mipmaps)) warning(config, line, "Textures.Mipmaps expects true/false");
+    } else if (key == "replacement") {
+        if (!parse_bool(value, tx.replacement)) warning(config, line, "Textures.Replacement expects true/false");
+    } else if (key == "detail") {
+        if (!parse_bool(value, tx.detail)) warning(config, line, "Textures.Detail expects true/false");
+    } else if (key == "dumporiginals") {
+        if (!parse_bool(value, tx.dump_originals)) warning(config, line, "Textures.DumpOriginals expects true/false");
+    } else if (key == "upscale") {
+        if (!parse_bool(value, tx.upscale)) warning(config, line, "Textures.Upscale expects true/false");
+    } else if (key == "upscalescale") {
+        if (lowercase_copy(trim_copy(value)) == "auto") {
+            tx.upscale_scale = 0u;
+        } else {
+            std::uint32_t scale = tx.upscale_scale;
+            if (!parse_u32(value, 2u, 8u, scale)) warning(config, line, "Textures.UpscaleScale must be Auto, 2, 4 or 8");
+            else tx.upscale_scale = scale;
+        }
+    } else if (key == "upscalesharpen") {
+        if (!parse_float(value, 0.0f, 1.0f, tx.upscale_sharpen))
+            warning(config, line, "Textures.UpscaleSharpen must be between 0.0 and 1.0");
+    } else if (key == "directory") {
+        const std::string dir = trim_copy(value);
+        if (!dir.empty()) tx.directory = dir;
+    } else {
+        warning(config, line, "unknown Textures key '" + key + "'");
+    }
+}
+
+void apply_color_grading_key(VcsConfiguration &config, const std::string &key,
+                             const std::string &value, std::size_t line) {
+    if (key == "enabled") {
+        if (!parse_bool(value, config.color_grading.enabled))
+            warning(config, line, "ColorGrading.Enabled expects true/false");
+        return;
+    }
+    if (key == "saturation") {
+        if (!parse_float(value, 0.0f, 3.0f, config.color_grading.saturation))
+            warning(config, line, "ColorGrading.Saturation must be between 0.0 and 3.0");
+        return;
+    }
+    if (key == "contrast") {
+        if (!parse_float(value, 0.0f, 3.0f, config.color_grading.contrast))
+            warning(config, line, "ColorGrading.Contrast must be between 0.0 and 3.0");
+        return;
+    }
+    if (key == "brightness") {
+        if (!parse_float(value, -1.0f, 1.0f, config.color_grading.brightness))
+            warning(config, line, "ColorGrading.Brightness must be between -1.0 and 1.0");
+        return;
+    }
+    if (key == "tintr") {
+        if (!parse_float(value, 0.0f, 3.0f, config.color_grading.tint_r))
+            warning(config, line, "ColorGrading.TintR must be between 0.0 and 3.0");
+        return;
+    }
+    if (key == "tintg") {
+        if (!parse_float(value, 0.0f, 3.0f, config.color_grading.tint_g))
+            warning(config, line, "ColorGrading.TintG must be between 0.0 and 3.0");
+        return;
+    }
+    if (key == "tintb") {
+        if (!parse_float(value, 0.0f, 3.0f, config.color_grading.tint_b))
+            warning(config, line, "ColorGrading.TintB must be between 0.0 and 3.0");
+        return;
+    }
+    warning(config, line, "unknown [ColorGrading] key '" + key + "'");
+}
+
+void apply_simulate_hdr_key(VcsConfiguration &config, const std::string &key,
+                           const std::string &value, std::size_t line) {
+    if (key == "enabled") {
+        if (!parse_bool(value, config.bloom.enabled))
+            warning(config, line, "SimulateHDR.Enabled expects true/false");
+        return;
+    }
+    if (key == "threshold") {
+        if (!parse_float(value, 0.0f, 1.0f, config.bloom.threshold))
+            warning(config, line, "SimulateHDR.Threshold must be between 0.0 and 1.0");
+        return;
+    }
+    if (key == "intensity") {
+        if (!parse_float(value, 0.0f, 4.0f, config.bloom.intensity))
+            warning(config, line, "SimulateHDR.Intensity must be between 0.0 and 4.0");
+        return;
+    }
+    // Ignore unknown keys silently here rather than warning: this section
+    // still doubles as home for whatever DX12's own hdr_post_configure()
+    // eventually needs, once it is more than a permanent no-op stub.
+}
+
 void apply_timing_key(VcsConfiguration &config, const std::string &key,
                       const std::string &value, std::size_t line) {
     if (key == "framerate" || key == "fps" || key == "targetfps") {
+        // Locked to 60 -- this is the baseline this port targets and tunes
+        // for (batch coalescing, GPU timestamp diagnostics, the whole
+        // optimization pass this session), not an arbitrary default. Any
+        // other value is a config mistake, not a supported mode: warn and
+        // fall back to 60 rather than silently letting the game run
+        // uncapped or at a rate nothing has been tuned or verified against.
         std::uint32_t frame_rate = 0u;
-        if (!parse_u32(value, 30u, 240u, frame_rate) ||
-            (frame_rate != 30u && frame_rate != 60u && frame_rate != 120u &&
-             frame_rate != 200u && frame_rate != 240u)) {
-            warning(config, line, "Timing.FrameRate expects 30, 60, 120, 200 or 240");
+        if (!parse_u32(value, 30u, 240u, frame_rate) || frame_rate != 60u) {
+            warning(config, line, "Timing.FrameRate is locked to 60 in this build");
+            config.timing.frame_rate = 60u;
             return;
         }
         config.timing.frame_rate = frame_rate;
@@ -581,6 +745,32 @@ DisplaySurfaceDimensions resolve_display_surface_dimensions(
 #if defined(_WIN32)
         return {static_cast<std::uint32_t>(std::max(320, GetSystemMetrics(SM_CXSCREEN))),
                 static_cast<std::uint32_t>(std::max(180, GetSystemMetrics(SM_CYSCREEN)))};
+#elif defined(__APPLE__)
+        {
+            // Same bug, same fix, as resolve_internal_resolution()'s Desktop
+            // case above: this used to silently fall back to Display.Width/
+            // Height (1920x1080 in the shipped .ini) on every Mac regardless
+            // of the real display. This is what widescreen_stretch_factor()
+            // computes the HUD shrink amount from, so an aspect ratio this
+            // wrong under-corrected the interface enough to leave the radar
+            // and weapon HUD (near the far corners, where the error compounds
+            // most) still cut off even after resolve_internal_resolution()
+            // was fixed -- confirmed directly, this is a second, separate
+            // function with the identical unfixed bug, not a leftover from
+            // the same one.
+            const CGDirectDisplayID display = CGMainDisplayID();
+            std::uint32_t display_width = 0u;
+            std::uint32_t display_height = 0u;
+            if (CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display)) {
+                display_width = static_cast<std::uint32_t>(CGDisplayModeGetPixelWidth(mode));
+                display_height = static_cast<std::uint32_t>(CGDisplayModeGetPixelHeight(mode));
+                CGDisplayModeRelease(mode);
+            }
+            if (display_width >= 320u && display_height >= 180u)
+                return {display_width, display_height};
+            return {std::clamp(configuration.custom_width, 320u, 16384u),
+                    std::clamp(configuration.custom_height, 180u, 16384u)};
+        }
 #else
         return {std::clamp(configuration.custom_width, 320u, 16384u),
                 std::clamp(configuration.custom_height, 180u, 16384u)};
@@ -657,9 +847,36 @@ InternalResolutionDimensions resolve_internal_resolution(
         // which is not what "desktop resolution" is asked for.
         return {static_cast<std::uint32_t>(std::max(480, GetSystemMetrics(SM_CXSCREEN))),
                 static_cast<std::uint32_t>(std::max(272, GetSystemMetrics(SM_CYSCREEN)))};
+#elif defined(__APPLE__)
+        {
+            // CGDisplayPixelsWide/High report the *logical* (HiDPI-scaled)
+            // point size on a Retina display -- e.g. 1440x900 for a panel
+            // whose actual backing store is 2880x1800 -- not the real pixel
+            // count a render target needs to look sharp. CGDisplayModeGetPixelWidth/
+            // Height (from the display's current CGDisplayMode) reports the
+            // true backing-store pixel count regardless of HiDPI scaling,
+            // confirmed directly against this exact machine (2560x1600
+            // native panel, scaled desktop). Falls back to the .ini's Custom
+            // values only if no display/mode is available at all (e.g. a
+            // headless CI runner), matching the Windows branch's own
+            // "clamp to something sane" behavior on failure.
+            const CGDirectDisplayID display = CGMainDisplayID();
+            std::uint32_t display_width = 0u;
+            std::uint32_t display_height = 0u;
+            if (CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display)) {
+                display_width = static_cast<std::uint32_t>(CGDisplayModeGetPixelWidth(mode));
+                display_height = static_cast<std::uint32_t>(CGDisplayModeGetPixelHeight(mode));
+                CGDisplayModeRelease(mode);
+            }
+            if (display_width >= 480u && display_height >= 272u)
+                return {display_width, display_height};
+            return {std::clamp(configuration.internal_width, 480u, 16384u),
+                    std::clamp(configuration.internal_height, 272u, 16384u)};
+        }
 #else
-        // Headless/non-Windows builds cannot query a monitor here. Custom
-        // values provide a deterministic fallback for CI and proof tooling.
+        // Headless/non-Windows, non-Apple builds cannot query a monitor here.
+        // Custom values provide a deterministic fallback for CI and proof
+        // tooling.
         return {std::clamp(configuration.internal_width, 480u, 16384u),
                 std::clamp(configuration.internal_height, 272u, 16384u)};
 #endif
@@ -717,15 +934,20 @@ VcsConfiguration load_vcs_configuration(const std::filesystem::path &path) {
         // deliberately owns its parser so it can be compiled independently of
         // the core display/input configuration. They are nevertheless valid
         // VCSNative.ini sections and must not be reported as unknown here.
+        else if (section == "simulatehdr" || section == "simulate hdr")
+            apply_simulate_hdr_key(config, key, value, line_number);
+        else if (section == "textures")
+            apply_textures_key(config, key, value, line_number);
+        else if (section == "colorgrading" || section == "color grading")
+            apply_color_grading_key(config, key, value, line_number);
         else if (section == "project2dfx" || section == "project 2dfx" ||
                  section == "lodlights" || section == "lod lights" ||
                  section == "trafficlights" || section == "traffic lights" ||
                  section == "blinkinglights" || section == "blinking lights" ||
                  section == "skygfx" || section == "heliheight" ||
                  section == "heli height" || section == "drawdistance" ||
-                 section == "draw distance" || section == "simulatehdr" ||
-                 section == "simulate hdr") {
-            // Parsed by install_project2dfx() or hdr_post_configure().
+                 section == "draw distance") {
+            // Parsed by install_project2dfx() or vcs_draw_distance_patch.cpp.
         }
         else if (section.empty())
             warning(config, line_number, "key outside a section");
@@ -871,7 +1093,40 @@ float widescreen_stretch_factor(const VcsConfiguration &configuration,
     // A ratio far from the game's own is a configuration mistake, not a wish.
     // Clamping keeps a typo in ForceAspectRatio from collapsing the interface
     // into a sliver or pushing it entirely off screen.
-    return std::clamp(factor, 0.5f, 4.0f);
+    //
+    // The floor used to be 0.5, which is backwards for any surface narrower
+    // than kGameNativeAspectRatio (16:9) -- factor comes out below 1.0 there,
+    // and the caller's correction is vertex.x = center + (vertex.x - center)
+    // / shrink, so a shrink below 1.0 divides by a fraction and EXPANDS the
+    // HUD outward instead of pulling it in. Confirmed directly on a 1.6:1
+    // MacBook display (narrower than 16:9): the money counter and radar got
+    // MORE cut off, not less, once resolve_display_surface_dimensions()
+    // started reporting the real (narrower) aspect instead of a fake 16:9-
+    // ish default that happened to keep factor above 1.0 by accident. A
+    // surface at or narrower than 16:9 needs no *extra* outward correction --
+    // 16:9 is the baseline the HUD is already sized for -- but the floor
+    // below is not 1.0 (a true no-op): even a plain 16:9, 1:1-scale render
+    // (PSP-native 480x272, no widescreen stretch involved at all) still
+    // shows the interface running past the true right/bottom edge with no
+    // correction whatsoever. VCS composites its HUD into a GE framebuffer
+    // allocated at the PSP's routine 512-wide VRAM stride (480 visible + 32
+    // padding columns -- confirmed live from the GE draw state itself, not
+    // inferred) rather than exactly 480 wide, and nothing upstream of this
+    // crops that padding away before it reaches the screen. 512/480 is that
+    // same, real ratio -- not a tuned fudge factor -- pulling every
+    // interface element in by exactly the fraction of the buffer that was
+    // never meant to be visible. Below this floor is the DX12-matching
+    // wider-than-16:9 case computed above; this is the floor under it.
+    // 512/480 (1.0667) was the VRAM-stride-derived first estimate; live
+    // measurement against the reference layout showed it was not enough --
+    // the widest interface element (the money-counter frame, vertices
+    // reaching x=520 in native space) needs (520-240)/240 =~ 1.167 to land
+    // back at the true edge, not 1.0667. The frame's own 520 is itself
+    // already past the 512 stride, so 512 was never the whole story; 1.2
+    // covers that element (and the minimap, symmetric at the opposite
+    // corner) with a little room rather than landing exactly on the edge.
+    constexpr float kHudSafeAreaFloor = 1.15f;
+    return std::clamp(factor, kHudSafeAreaFloor, 4.0f);
 }
 
 } // namespace vcs

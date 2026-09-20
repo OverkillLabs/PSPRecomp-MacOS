@@ -45,18 +45,43 @@ struct DecodeCommon {
 
     [[nodiscard]] bool open_stream(const std::filesystem::path &path, AVMediaType type) {
         release();
-        if (avformat_open_input(&format, path.string().c_str(), nullptr, nullptr) < 0) return false;
-        if (avformat_find_stream_info(format, nullptr) < 0) return false;
+        const bool diag = std::getenv("PSPRECOMP_DECODE_DIAG") != nullptr;
+        if (avformat_open_input(&format, path.string().c_str(), nullptr, nullptr) < 0) {
+            if (diag) std::fprintf(stderr, "[decode-diag] avformat_open_input failed: %s\n", path.string().c_str());
+            return false;
+        }
+        if (avformat_find_stream_info(format, nullptr) < 0) {
+            if (diag) std::fprintf(stderr, "[decode-diag] avformat_find_stream_info failed\n");
+            return false;
+        }
+        if (diag) {
+            std::fprintf(stderr, "[decode-diag] nb_streams=%u\n", format->nb_streams);
+            for (unsigned i = 0u; i < format->nb_streams; ++i)
+                std::fprintf(stderr, "[decode-diag]   stream[%u] codec_type=%d codec_id=%d\n",
+                             i, format->streams[i]->codecpar->codec_type, format->streams[i]->codecpar->codec_id);
+        }
         const AVCodec *decoder = nullptr;
         stream_index = av_find_best_stream(format, type, -1, -1, &decoder, 0);
-        if (stream_index < 0 || decoder == nullptr) return false;
+        if (stream_index < 0 || decoder == nullptr) {
+            if (diag) std::fprintf(stderr, "[decode-diag] av_find_best_stream failed: index=%d decoder=%p\n",
+                                   stream_index, (const void *)decoder);
+            return false;
+        }
+        if (diag) std::fprintf(stderr, "[decode-diag] chosen stream_index=%d decoder=%s\n",
+                               stream_index, decoder->name ? decoder->name : "?");
         codec = avcodec_alloc_context3(decoder);
         if (codec == nullptr) return false;
-        if (avcodec_parameters_to_context(codec, format->streams[stream_index]->codecpar) < 0)
+        if (avcodec_parameters_to_context(codec, format->streams[stream_index]->codecpar) < 0) {
+            if (diag) std::fprintf(stderr, "[decode-diag] avcodec_parameters_to_context failed\n");
             return false;
-        if (avcodec_open2(codec, decoder, nullptr) < 0) return false;
+        }
+        if (avcodec_open2(codec, decoder, nullptr) < 0) {
+            if (diag) std::fprintf(stderr, "[decode-diag] avcodec_open2 failed\n");
+            return false;
+        }
         packet = av_packet_alloc();
         frame = av_frame_alloc();
+        if (diag) std::fprintf(stderr, "[decode-diag] open_stream success\n");
         return packet != nullptr && frame != nullptr;
     }
 
@@ -64,34 +89,63 @@ struct DecodeCommon {
     // `pending`. Returns false once the file and the decoder are both drained.
     template <typename Consume>
     bool decode_one(Consume &&consume) {
+        const bool diag = std::getenv("PSPRECOMP_DECODE_DIAG") != nullptr;
+        int iterations = 0;
         for (;;) {
+            ++iterations;
+            if (diag && iterations > 500) {
+                std::fprintf(stderr, "[decode-diag] decode_one: bailing after %d iterations, eof=%d\n",
+                             iterations, eof ? 1 : 0);
+                return false;
+            }
             const int received = avcodec_receive_frame(codec, frame);
             if (received == 0) {
+                if (diag) std::fprintf(stderr, "[decode-diag] frame received: nb_samples=%d\n", frame->nb_samples);
                 consume(frame);
                 av_frame_unref(frame);
                 return true;
             }
-            if (received != AVERROR(EAGAIN) && received != AVERROR_EOF) return false;
-            if (received == AVERROR_EOF) return false;
+            if (received != AVERROR(EAGAIN) && received != AVERROR_EOF) {
+                if (diag) std::fprintf(stderr, "[decode-diag] avcodec_receive_frame hard error=%d\n", received);
+                return false;
+            }
+            if (received == AVERROR_EOF) {
+                if (diag) std::fprintf(stderr, "[decode-diag] avcodec_receive_frame EOF\n");
+                return false;
+            }
             if (eof) {
                 // Flush: a decoder can be holding frames after the last packet.
-                if (avcodec_send_packet(codec, nullptr) < 0) return false;
+                if (avcodec_send_packet(codec, nullptr) < 0) {
+                    if (diag) std::fprintf(stderr, "[decode-diag] flush send_packet(null) failed\n");
+                    return false;
+                }
                 const int flushed = avcodec_receive_frame(codec, frame);
-                if (flushed < 0) return false;
+                if (flushed < 0) {
+                    if (diag) std::fprintf(stderr, "[decode-diag] flush receive_frame failed=%d\n", flushed);
+                    return false;
+                }
+                if (diag) std::fprintf(stderr, "[decode-diag] flush frame: nb_samples=%d\n", frame->nb_samples);
                 consume(frame);
                 av_frame_unref(frame);
                 return true;
             }
             const int read = av_read_frame(format, packet);
             if (read < 0) {
+                if (diag) std::fprintf(stderr, "[decode-diag] av_read_frame EOF/error=%d after %d iterations\n",
+                                       read, iterations);
                 eof = true;
                 continue;
             }
             if (packet->stream_index != stream_index) {
+                if (diag) std::fprintf(stderr, "[decode-diag] packet for stream %d (want %d), skipping\n",
+                                       packet->stream_index, stream_index);
                 av_packet_unref(packet);
                 continue;
             }
+            if (diag) std::fprintf(stderr, "[decode-diag] packet size=%d pts=%lld, sending\n",
+                                   packet->size, (long long)packet->pts);
             const int sent = avcodec_send_packet(codec, packet);
+            if (diag && sent < 0) std::fprintf(stderr, "[decode-diag] send_packet failed=%d\n", sent);
             av_packet_unref(packet);
             if (sent < 0 && sent != AVERROR(EAGAIN)) return false;
         }
@@ -128,6 +182,18 @@ struct AudioStreamDecoder::State {
     SwrContext *resampler{};
     std::uint32_t sample_rate{};
     std::uint32_t channels{};
+    // The atrac3plus decoder does not populate AVFrame::sample_rate on the
+    // frames it hands back -- it comes out as whatever garbage was already in
+    // that memory, confirmed by a direct capture: frame->sample_rate read
+    // back as -551512288. Feeding that into av_rescale_rnd (as the input rate
+    // to convert 2048 real, correctly-decoded samples from) collapsed the
+    // computed output sample count to 0 every time, so swr_convert had a
+    // zero-size destination and nothing was ever produced -- despite decode
+    // itself succeeding. The codec's own sample_rate is reliable (it is what
+    // swr_alloc_set_opts2 below was already configured with) and is the same
+    // value for every frame in the stream, so cache it here instead of
+    // trusting the per-frame field.
+    int source_sample_rate{};
 
     ~State() {
         if (resampler != nullptr) swr_free(&resampler);
@@ -153,6 +219,7 @@ bool AudioStreamDecoder::open(const std::filesystem::path &path, std::uint32_t s
     if (!state_->common.open_stream(path, AVMEDIA_TYPE_AUDIO)) return false;
     state_->sample_rate = sample_rate;
     state_->channels = channels;
+    state_->source_sample_rate = state_->common.codec->sample_rate;
 
     // Always resample: ATRAC3+ decodes to planar float, and the guest wants
     // interleaved signed 16-bit at the rate its own header declares.
@@ -187,9 +254,11 @@ std::size_t AudioStreamDecoder::read(std::span<std::uint8_t> output) {
     State &state = *state_;
     return state.common.drain(output, [&state]() -> bool {
         return state.common.decode_one([&state](AVFrame *frame) {
+            // frame->sample_rate is NOT source_sample_rate here on purpose --
+            // see the comment on source_sample_rate above.
             const int out_samples = static_cast<int>(av_rescale_rnd(
-                swr_get_delay(state.resampler, frame->sample_rate) + frame->nb_samples,
-                static_cast<std::int64_t>(state.sample_rate), frame->sample_rate, AV_ROUND_UP));
+                swr_get_delay(state.resampler, state.source_sample_rate) + frame->nb_samples,
+                static_cast<std::int64_t>(state.sample_rate), state.source_sample_rate, AV_ROUND_UP));
             const std::size_t bytes =
                 static_cast<std::size_t>(out_samples) * state.channels * sizeof(std::int16_t);
             state.common.pending.resize(bytes);

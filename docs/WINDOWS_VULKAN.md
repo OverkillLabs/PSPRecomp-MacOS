@@ -266,3 +266,23 @@ is active. Until this exists, test the swapchain with intro videos and loading s
 the first frames to exercise this.)
 
 The CPU-readback path (the Windows default for now) is unaffected: there the backend never owns the window.
+
+## Fixed after the first push: texture-cache memory blow-up (affects every platform)
+
+Symptom (reported by the owner on macOS with the texture pack installed): after a few minutes of play performance
+degraded, then the screen flickered to permanent black while the game kept running. Root cause: the Vulkan
+texture cache key is `address + format + palette checksum`, not pixels. A texture whose palette is rewritten every
+frame (one 256x256 palette-indexed texture at guest address 0x08706bf0 in the opening area) produced a new key each
+frame even when the decoded pixels were identical, and with the pack each copy got its own multi-megabyte replacement
+image: the process reached 10-12 GB of GPU memory within about two minutes and then lost its GPU frames.
+
+Fix (in `ge_gpu_backend_vulkan.cpp`): a new key whose pixels, size and sampler match a resident entry is **aliased** to
+that entry (`texture_alias`, `texture_content`, `find_texture()`), so identical content exists once. Verified: process
+memory footprint flat at about 850 MB over four minutes (was 10 GB+), about 1,000 resident textures instead of 3,000+,
+GPU submissions healthy. A safety net also caps total replacement-image memory at 3 GB (`replaced_bytes`); past it
+the original small texture is kept. Also fixed: a replaced entry now keeps its content signature.
+
+**Windows must soak-test this**: run at least 5 minutes with the pack installed, idle in the opening area, and watch
+the process's *GPU/committed* memory (Task Manager Details > GPU memory, or `dxdiag`/PIX). It must stay flat. On
+macOS the memory shows under `vmmap -summary <pid>` as "owned unmapped (graphics)" and in "Physical footprint"; a plain
+RSS number hides it. Also watch that `PSPRECOMP_FRAME_TIME_DIAG=1` frame times do not drift upward over the soak.

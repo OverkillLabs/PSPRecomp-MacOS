@@ -823,6 +823,17 @@ struct VulkanGeState {
     VkDeviceSize staging_capacity{};
 
     std::unordered_map<std::uint64_t, TextureEntry> textures;
+    // Cache keys are address + format + palette checksum, not pixels, so a texture whose palette is
+    // rewritten every frame produces a new key each frame even when the decoded pixels do not
+    // change. Those extra keys are aliased to the one entry holding the same pixels instead of each
+    // getting an image of their own (with the texture pack each copy was a multi-megabyte
+    // replacement image: gigabytes within two minutes).
+    std::unordered_map<std::uint64_t, std::uint64_t> texture_alias;    // key -> key of the entry that holds its pixels
+    std::unordered_map<std::uint64_t, std::uint64_t> texture_content;  // pixel content -> key of the entry holding it
+    // Estimated GPU bytes held by replacement (texture pack / upscaled) images. A safety net: past the
+    // budget in apply_texture_replacements() further replacements are skipped and the original,
+    // small texture stays, so unexpected content can never exhaust the machine's memory.
+    std::uint64_t replaced_bytes{0};
     std::unordered_map<std::uint64_t, VkSampler> samplers;
     TextureEntry dummy_texture{};
     // Cache capacity actually enforced at runtime -- sized from
@@ -1057,6 +1068,10 @@ void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout from, Vk
 // previous frame's descriptor -- no multi-frame-in-flight retirement list
 // like DX12's is needed here.
 void destroy_texture_entry(VulkanGeState &s, TextureEntry &entry) noexcept {
+    if (entry.scale_shift != 0u && entry.image != VK_NULL_HANDLE) {
+        const std::uint64_t bytes = std::uint64_t{entry.width} * entry.height * 4u * 4u / 3u;
+        s.replaced_bytes -= std::min(s.replaced_bytes, bytes);
+    }
     if (entry.descriptor != VK_NULL_HANDLE) {
         vkFreeDescriptorSets(s.device, s.descriptor_pool, 1, &entry.descriptor);
     }
@@ -4277,10 +4292,40 @@ void destroy_swapchain_targets(VulkanGeState &s) noexcept {
 // branch never runs, and every draw shows its raw (often white/unused,
 // since REPLACE-mode geometry doesn't care about vertex color) vertex color
 // instead -- which is exactly the flat white screen this was chasing.
+// Resolves a cache key to the entry that holds its pixels, following an alias if there is one.
+[[nodiscard]] auto find_texture(VulkanGeState &s, std::uint64_t key) noexcept {
+    auto found = s.textures.find(key);
+    if (found != s.textures.end()) return found;
+    if (const auto alias = s.texture_alias.find(key); alias != s.texture_alias.end()) {
+        found = s.textures.find(alias->second);
+        if (found != s.textures.end()) return found;
+        s.texture_alias.erase(alias);  // the entry it pointed at was evicted
+    }
+    return s.textures.end();
+}
+[[nodiscard]] auto find_texture(const VulkanGeState &s, std::uint64_t key) noexcept {
+    auto found = s.textures.find(key);
+    if (found != s.textures.end()) return found;
+    if (const auto alias = s.texture_alias.find(key); alias != s.texture_alias.end())
+        return s.textures.find(alias->second);
+    return s.textures.end();
+}
+
+[[nodiscard]] std::uint64_t texture_content_key(std::uint64_t signature, std::uint32_t width,
+                                                std::uint32_t height, VkSampler sampler) noexcept {
+    std::uint64_t hash = 1469598103934665603ull;
+    for (const std::uint64_t v : {signature, std::uint64_t{width}, std::uint64_t{height},
+                                  static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(sampler))}) {
+        hash ^= v;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
 [[nodiscard]] std::uint32_t texture_scale_shift(const GeGpuDrawDescriptor &draw) noexcept {
     if (!draw.texture_enabled) return 0u;
     const VulkanGeState &s = state();
-    const auto found = s.textures.find(texture_key(draw));
+    const auto found = find_texture(s, texture_key(draw));
     return found == s.textures.end() ? 0u : found->second.scale_shift;
 }
 
@@ -4918,7 +4963,7 @@ bool ge_gpu_backend_stage_vertices(const GeGpuDrawDescriptor &,
 bool ge_gpu_backend_texture_needed(const GeGpuDrawDescriptor &draw) noexcept {
     VulkanGeState &s = state();
     if (!s.enabled || !draw.texture_enabled) return false;
-    return s.textures.find(texture_key(draw)) == s.textures.end();
+    return find_texture(s, texture_key(draw)) == s.textures.end();
 }
 
 void ge_gpu_backend_prepare_texture_keys(GeGpuDrawDescriptor &draw) noexcept {
@@ -4994,7 +5039,7 @@ bool ge_gpu_backend_texture_available(const GeGpuDrawDescriptor &draw) noexcept 
     // refresh its LRU stamp here and could be evicted out from under active
     // geometry the moment the cache fills. Stamping on the lookup itself
     // (not just on upload) is what makes "least recently *drawn*" true.
-    const auto found = s.textures.find(texture_key(draw));
+    const auto found = find_texture(s, texture_key(draw));
     if (found == s.textures.end()) return false;
     found->second.last_used_epoch = s.frame_epoch;
     return true;
@@ -5006,10 +5051,26 @@ bool ge_gpu_backend_upload_decoded_texture(const GeGpuDrawDescriptor &draw, std:
     VulkanGeState &s = state();
     if (!s.enabled || width == 0u || height == 0u || rgba8.empty()) return false;
     const std::uint64_t key = texture_key(draw);
-    if (const auto found = s.textures.find(key); found != s.textures.end()) {
+    if (const auto found = find_texture(s, key); found != s.textures.end()) {
         found->second.last_used_epoch = s.frame_epoch;
         ++s.report.texture_cache_hits;
         return true;
+    }
+    // A new key whose pixels (and sampler) match an entry already resident shares that entry.
+    const VkSampler sampler = get_sampler(s, draw);
+    if (sampler == VK_NULL_HANDLE) return false;
+    const std::uint64_t signature = vcs::texture_signature(rgba8);
+    const std::uint64_t content = texture_content_key(signature, width, height, sampler);
+    if (const auto known = s.texture_content.find(content); known != s.texture_content.end()) {
+        const auto canonical = s.textures.find(known->second);
+        if (canonical != s.textures.end() && canonical->second.source_signature == signature &&
+            canonical->second.sampler == sampler) {
+            s.texture_alias[key] = known->second;
+            canonical->second.last_used_epoch = s.frame_epoch;
+            ++s.report.texture_cache_hits;
+            if (s.texture_alias.size() > 262144u) s.texture_alias.clear();  // they re-resolve on next upload
+            return true;
+        }
     }
     if (s.textures.size() >= s.texture_capacity) {
         // Evict the least-recently-used entry not touched this frame (same
@@ -5032,15 +5093,13 @@ bool ge_gpu_backend_upload_decoded_texture(const GeGpuDrawDescriptor &draw, std:
         s.textures.erase(victim);
         ++s.report.texture_cache_evictions;
     }
-    const VkSampler sampler = get_sampler(s, draw);
-    if (sampler == VK_NULL_HANDLE) return false;
     TextureEntry entry{};
     if (!create_texture(s, width, height, rgba8, sampler, entry)) {
         ++s.report.rejected_texture_decodes;
         return false;
     }
     entry.sampler = sampler;
-    entry.source_signature = vcs::texture_signature(rgba8);
+    entry.source_signature = signature;
     // Hand the decoded texture to the background pipeline (dump / replacement /
     // upscale); a finished result is swapped in at a later frame boundary.
     std::uint32_t usage = 0u;
@@ -5054,6 +5113,8 @@ bool ge_gpu_backend_upload_decoded_texture(const GeGpuDrawDescriptor &draw, std:
     vcs::texture_pipeline_submit(key, rgba8, width, height, usage);
     entry.last_used_epoch = s.frame_epoch;
     s.textures.emplace(key, entry);
+    if (s.texture_content.size() > 100000u) s.texture_content.clear();
+    s.texture_content[content] = key;
     ++s.report.texture_images_created;
     ++s.report.decoded_texture_uploads;
     s.report.decoded_texture_bytes += static_cast<std::uint64_t>(width) * height * 4u;
@@ -5094,7 +5155,7 @@ void ge_gpu_backend_accumulate_color_triangles(
 
     VkDescriptorSet descriptor = s.dummy_texture.descriptor;
     if (draw.texture_enabled) {
-        const auto found = s.textures.find(texture_key(draw));
+        const auto found = find_texture(s, texture_key(draw));
         if (found == s.textures.end()) {
             // The renderer has not decoded this texture yet. Drawing it with
             // the white dummy would paint untextured geometry over the frame,
@@ -5303,7 +5364,7 @@ void ge_gpu_backend_accumulate_color_triangles(
     if (draw.scissor_x1 < draw.scissor_x0 || draw.scissor_y1 < draw.scissor_y0) return false;
     descriptor = s.dummy_texture.descriptor;
     if (draw.texture_enabled) {
-        const auto found = s.textures.find(texture_key(draw));
+        const auto found = find_texture(s, texture_key(draw));
         if (found == s.textures.end()) {
             ++s.report.game_textured_draws_without_texture;
             return false;
@@ -5717,6 +5778,7 @@ void finalize_upload_batch(VulkanGeState &s, UploadBatch &b, bool gpu_ok) noexce
         if (gpu_ok && found != s.textures.end() && found->second.scale_shift == 0u &&
             finish_texture_entry(s, fresh, item.sampler, item.mip_levels)) {
             fresh.last_used_epoch = found->second.last_used_epoch;
+            fresh.source_signature = found->second.source_signature;  // still the same pixels
             b.retired.push_back(found->second);
             found->second = fresh;
             swapped = true;
@@ -5779,6 +5841,10 @@ void apply_texture_replacements(VulkanGeState &s) noexcept {
             b.has_carry = true;
             break;
         }
+        // Safety net: leave the original texture in place once replacements hold this much.
+        constexpr std::uint64_t kReplacedTextureBudget = 3ull << 30;
+        const std::uint64_t estimated_bytes = byte_size * 4u / 3u;
+        if (s.replaced_bytes + estimated_bytes > kReplacedTextureBudget) continue;
         PendingUploadItem item;
         item.key = r.key;
         item.sampler = old.sampler;
@@ -5816,6 +5882,7 @@ void apply_texture_replacements(VulkanGeState &s) noexcept {
         fresh.width = r.texture.width;
         fresh.height = r.texture.height;
         fresh.scale_shift = r.texture.scale_shift;
+        s.replaced_bytes += estimated_bytes;
         if (b.cmd == VK_NULL_HANDLE) {
             b.cmd = begin_one_shot(s);
             if (b.cmd == VK_NULL_HANDLE) { destroy_texture_entry(s, fresh); break; }
